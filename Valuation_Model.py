@@ -138,12 +138,26 @@ def get_net_debt(fundamentals: dict):
     except Exception:
         return None
 
+def pick_first_non_null(row: dict, candidates):
+    """
+    Retourne la première valeur non nulle trouvée parmi les clés candidates dans `row`.
+    Si rien n'est trouvé, renvoie None.
+    """
+    for key in candidates:
+        if key in row and row[key] is not None:
+            try:
+                return float(row[key])
+            except (TypeError, ValueError):
+                continue
+    return None
 
 def build_historical_table(fundamentals: dict, max_years: int = 5) -> pd.DataFrame:
     """
     Construit un tableau historique multi-lignes sur les dernières années :
-    CA, EBIT, Net Income, Operating CF, Capex, FCF calculé.
-    On reste sur du yearly pour la lisibilité.
+    CA, EBIT, Net Income, Operating CF, Capex, FCF approx.
+    On reste sur du yearly.
+
+    On gère plusieurs variantes de noms de champs possibles dans EODHD.
     """
     try:
         inc = fundamentals["Financials"]["Income_Statement"]["yearly"]
@@ -151,20 +165,74 @@ def build_historical_table(fundamentals: dict, max_years: int = 5) -> pd.DataFra
     except Exception:
         return pd.DataFrame()
 
-    years = sorted(inc.keys(), reverse=True)  # tri décroissant
-    years = years[:max_years]  # on garde les N dernières
+    if not isinstance(inc, dict) or not isinstance(cf, dict):
+        return pd.DataFrame()
+
+    years = sorted(inc.keys(), reverse=True)
+    years = years[:max_years]
 
     rows = []
     for y in years:
         inc_y = inc.get(y, {}) or {}
         cf_y = cf.get(y, {}) or {}
 
-        revenue = inc_y.get("TotalRevenue") or inc_y.get("Revenue")
-        ebit = inc_y.get("OperatingIncome") or inc_y.get("EBIT")
-        net_income = inc_y.get("NetIncome")
+        # CA
+        revenue = pick_first_non_null(
+            inc_y,
+            [
+                "TotalRevenue",
+                "Revenue",
+                "totalRevenue",
+                "SalesRevenueNet",
+                "Sales",
+            ],
+        )
 
-        op_cf = cf_y.get("OperatingCashFlow")
-        capex = cf_y.get("CapitalExpenditures")
+        # EBIT / résultat opérationnel
+        ebit = pick_first_non_null(
+            inc_y,
+            [
+                "OperatingIncome",
+                "OperatingIncomeLoss",
+                "EBIT",
+                "ebit",
+                "Ebit",
+            ],
+        )
+
+        # Résultat net
+        net_income = pick_first_non_null(
+            inc_y,
+            [
+                "NetIncome",
+                "netIncome",
+                "NetIncomeCommonStockholders",
+                "NetIncomeIncludingNoncontrollingInterests",
+            ],
+        )
+
+        # Flux de trésorerie d'exploitation
+        op_cf = pick_first_non_null(
+            cf_y,
+            [
+                "totalCashFromOperatingActivities",
+                "TotalCashFromOperatingActivities",
+                "NetCashProvidedByOperatingActivities",
+                "NetCashFromOperatingActivities",
+                "OperatingCashFlow",
+            ],
+        )
+
+        # Capex
+        capex = pick_first_non_null(
+            cf_y,
+            [
+                "capitalExpenditures",
+                "CapitalExpenditures",
+                "investmentsInPropertyPlantAndEquipment",
+                "InvestmentsInPropertyPlantAndEquipment",
+            ],
+        )
 
         if op_cf is not None and capex is not None:
             fcf = op_cf - capex
@@ -184,8 +252,43 @@ def build_historical_table(fundamentals: dict, max_years: int = 5) -> pd.DataFra
         )
 
     df = pd.DataFrame(rows)
-    df = df.sort_values("Année")  # on remet en ordre croissant pour lecture
+    if df.empty:
+        return df
+
+    df = df.sort_values("Année")
     return df
+
+def scale_df_to_millions(df: pd.DataFrame, exclude_cols=("Année",)) -> pd.DataFrame:
+    """
+    Convertit toutes les colonnes numériques (sauf celles dans exclude_cols) en millions.
+    Renomme ces colonnes avec un suffixe ' (M)'.
+    """
+    df_out = df.copy()
+    numeric_cols = [
+        c for c in df_out.columns
+        if c not in exclude_cols and pd.api.types.is_numeric_dtype(df_out[c])
+    ]
+    for c in numeric_cols:
+        df_out[c] = df_out[c].astype(float) / 1_000_000
+    rename_map = {c: f"{c} (M)" for c in numeric_cols}
+    df_out = df_out.rename(columns=rename_map)
+    return df_out
+def scale_df_to_millions(df: pd.DataFrame, exclude_cols=("Année",)) -> pd.DataFrame:
+    """
+    Convertit toutes les colonnes numériques (sauf celles dans exclude_cols) en millions.
+    Renomme ces colonnes avec un suffixe ' (M)'.
+    """
+    df_out = df.copy()
+    numeric_cols = [
+        c for c in df_out.columns
+        if c not in exclude_cols and pd.api.types.is_numeric_dtype(df_out[c])
+    ]
+    for c in numeric_cols:
+        df_out[c] = df_out[c].astype(float) / 1_000_000
+    rename_map = {c: f"{c} (M)" for c in numeric_cols}
+    df_out = df_out.rename(columns=rename_map)
+    return df_out
+
 
 def estimate_starting_fcf(fundamentals: dict):
     """
@@ -624,19 +727,20 @@ def main():
     )
 
     # ----- TAB 1 : Résumé DCF -----
-    with tab_resume:
-        st.subheader("🎯 Résumé de la valorisation DCF (base case)")
+with tab_resume:
+    st.subheader("🎯 Résumé de la valorisation DCF (base case)")
 
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            st.metric("Valeur d'entreprise (EV)", f"{dcf['ev']:,.0f}")
-            st.metric("Somme FCF actualisés", f"{dcf['sum_disc_fcfs']:,.0f}")
-        with col_b:
-            st.metric("Valeur terminale actualisée", f"{dcf['tv_discounted']:,.0f}")
-            st.metric("Valeur des capitaux propres", f"{dcf['equity_value']:,.0f}")
-        with col_c:
-            st.metric("Juste valeur / action", f"{dcf['fair_value_per_share']:.2f}")
-            st.metric("Nombre d'actions", f"{result['shares']:,.0f}")
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.metric("Valeur d'entreprise (EV)", format_large_number(dcf["ev"]))
+        st.metric("Somme FCF actualisés", format_large_number(dcf["sum_disc_fcfs"]))
+    with col_b:
+        st.metric("Valeur terminale actualisée", format_large_number(dcf["tv_discounted"]))
+        st.metric("Valeur des capitaux propres", format_large_number(dcf["equity_value"]))
+    with col_c:
+        st.metric("Juste valeur / action", f"{dcf['fair_value_per_share']:.2f}")
+        st.metric("Nombre d'actions", format_large_number(result["shares"]))
+
 
         st.markdown("#### Hypothèses retenues (base case)")
         st.write(f"- Horizon de projection : **{years} ans**")
@@ -652,18 +756,23 @@ def main():
         )
 
     # ----- TAB 2 : Historique -----
-    with tab_hist:
-        st.subheader("📚 Données historiques (5 dernières années)")
+with tab_hist:
+    st.subheader("📚 Données historiques (5 dernières années)")
 
-        hist_df = result["hist_df"]
-        if hist_df.empty:
-            st.warning("Impossible de construire un historique complet à partir des données disponibles.")
-        else:
-            df_display = hist_df.copy()
-            numeric_cols = [c for c in df_display.columns if c != "Année"]
-            for c in numeric_cols:
-                df_display[c] = df_display[c].astype(float).round(0)
-            st.dataframe(df_display, use_container_width=True)
+    hist_df = result["hist_df"]
+    if hist_df.empty:
+        st.warning("Impossible de construire un historique complet à partir des données disponibles.")
+    else:
+        # Passage en millions + renommage des colonnes
+        df_display = scale_df_to_millions(hist_df)
+
+        # Arrondi propre
+        numeric_cols = [c for c in df_display.columns if c != "Année"]
+        for c in numeric_cols:
+            df_display[c] = df_display[c].astype(float).round(2)
+
+        st.dataframe(df_display, use_container_width=True)
+        st.caption("Unités : millions de la devise de reporting.")
 
     # ----- TAB 3 : Projections FCF -----
     with tab_proj:
