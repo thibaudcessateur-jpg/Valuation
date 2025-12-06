@@ -187,29 +187,60 @@ def build_historical_table(fundamentals: dict, max_years: int = 5) -> pd.DataFra
     df = df.sort_values("Année")  # on remet en ordre croissant pour lecture
     return df
 
-
 def estimate_starting_fcf(fundamentals: dict):
     """
-    UFCF ≈ OperatingCashFlow - Capex sur la dernière année annuelle disponible.
-    Retourne None si non calculable.
+    UFCF ≈ Free Cash Flow si dispo,
+    sinon FCF = TotalCashFromOperatingActivities - CapitalExpenditures (ou équivalents).
+
+    On gère plusieurs variantes de noms de champs possibles dans l'API EODHD.
     """
     try:
         cf = fundamentals["Financials"]["Cash_Flow"]["yearly"]
-        years = sorted(cf.keys())
-        if not years:
-            return None
-        last_year_key = years[-1]
-        last_year_cf = cf[last_year_key]
-
-        operating_cf = last_year_cf.get("OperatingCashFlow")
-        capex = last_year_cf.get("CapitalExpenditures")
-
-        if operating_cf is None or capex is None:
-            return None
-
-        return operating_cf - capex
     except Exception:
         return None
+
+    if not isinstance(cf, dict) or not cf:
+        return None
+
+    years = sorted(cf.keys())
+    last_year_key = years[-1]
+    row = cf[last_year_key] or {}
+
+    # 1) Si EODHD fournit déjà le free cash-flow, on le prend directement
+    for key in ["freeCashFlow", "FreeCashFlow"]:
+        if key in row and row[key] is not None:
+            return float(row[key])
+
+    # 2) Sinon on reconstruit : FCF = OCF - Capex
+    ocf_candidates = [
+        "totalCashFromOperatingActivities",
+        "TotalCashFromOperatingActivities",
+        "NetCashProvidedByOperatingActivities",
+        "NetCashFromOperatingActivities",
+    ]
+    capex_candidates = [
+        "capitalExpenditures",
+        "CapitalExpenditures",
+        "investmentsInPropertyPlantAndEquipment",
+        "InvestmentsInPropertyPlantAndEquipment",
+    ]
+
+    operating_cf = next((row[k] for k in ocf_candidates if k in row and row[k] is not None), None)
+    capex = next((row[k] for k in capex_candidates if k in row and row[k] is not None), None)
+
+    if operating_cf is None or capex is None:
+        # Petit debug utile : voir les clés réellement dispo dans le cash-flow
+        try:
+            import streamlit as st
+            st.write("⚠️ Clés Cash Flow disponibles pour", last_year_key, ":", list(row.keys()))
+        except Exception:
+            # si on est hors Streamlit (test en script), on ignore
+            pass
+        return None
+
+    return float(operating_cf) - float(capex)
+
+
 
 
 # =========================================
