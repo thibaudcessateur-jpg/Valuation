@@ -726,34 +726,46 @@ def main():
         ["Résumé DCF", "Historique 5 ans", "Projections FCF", "DCF & Sensibilité"]
     )
 
-    # ----- TAB 1 : Résumé DCF -----
-   with tab_resume:
+# ----- TAB 1 : Résumé DCF -----
+with tab_resume:
     st.subheader("🎯 Résumé de la valorisation DCF (base case)")
+
+    # Récupérations sécurisées (évite les KeyError / None)
+    ev = dcf.get("ev", 0) or 0
+    sum_disc_fcfs = dcf.get("sum_disc_fcfs", 0) or 0
+    tv_discounted = dcf.get("tv_discounted", 0) or 0
+    equity_value = dcf.get("equity_value", 0) or 0
+    fair_value_per_share = dcf.get("fair_value_per_share", 0) or 0
+
+    shares = (result.get("shares", 0) or 0)
+    net_debt = (result.get("net_debt", 0) or 0)
+    fcf_start = (result.get("fcf_start", 0) or 0)
 
     col_a, col_b, col_c = st.columns(3)
     with col_a:
-        st.metric("Valeur d'entreprise (EV)", format_large_number(dcf["ev"]))
-        st.metric("Somme FCF actualisés", format_large_number(dcf["sum_disc_fcfs"]))
+        st.metric("Valeur d'entreprise (EV)", format_large_number(ev))
+        st.metric("Somme FCF actualisés", format_large_number(sum_disc_fcfs))
     with col_b:
-        st.metric("Valeur terminale actualisée", format_large_number(dcf["tv_discounted"]))
-        st.metric("Valeur des capitaux propres", format_large_number(dcf["equity_value"]))
+        st.metric("Valeur terminale actualisée", format_large_number(tv_discounted))
+        st.metric("Valeur des capitaux propres", format_large_number(equity_value))
     with col_c:
-        st.metric("Juste valeur / action", f"{dcf['fair_value_per_share']:.2f}")
-        st.metric("Nombre d'actions", format_large_number(result["shares"]))
+        st.metric("Juste valeur / action", f"{fair_value_per_share:,.2f}")
+        st.metric("Nombre d'actions", format_large_number(shares))
 
+    # Bloc hypothèses en pleine largeur (hors des colonnes)
+    st.markdown("#### Hypothèses retenues (base case)")
+    st.write(f"- Horizon de projection : **{years} ans**")
+    st.write(f"- WACC : **{wacc_input:.2f} %**")
+    st.write(f"- Croissance FCF : **{growth_fcf_input:.2f} % par an**")
+    st.write(f"- g de long terme : **{g_terminal_input:.2f} %**")
+    st.write(f"- Dette nette utilisée : **{net_debt:,.0f}**")
+    st.write(f"- FCF de départ estimé : **{fcf_start:,.0f}**")
 
-        st.markdown("#### Hypothèses retenues (base case)")
-        st.write(f"- Horizon de projection : **{years} ans**")
-        st.write(f"- WACC : **{wacc_input:.2f} %**")
-        st.write(f"- Croissance FCF : **{growth_fcf_input:.2f} % par an**")
-        st.write(f"- g de long terme : **{g_terminal_input:.2f} %**")
-        st.write(f"- Dette nette utilisée : **{(result['net_debt'] or 0):,.0f}**")
-        st.write(f"- FCF de départ estimé : **{result['fcf_start']:,.0f}**")
+    st.info(
+        "Ce résumé présente le scénario central (base case). "
+        "La robustesse de la valorisation est détaillée dans l’onglet « DCF & Sensibilité »."
+    )
 
-        st.info(
-            "Ce résumé présente le scénario central (base case). "
-            "La robustesse de la valorisation est analysée dans l'onglet 'DCF & Sensibilité'."
-        )
 
     # ----- TAB 2 : Historique -----
 with tab_hist:
