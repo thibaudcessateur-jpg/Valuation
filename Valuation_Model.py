@@ -138,6 +138,7 @@ def get_net_debt(fundamentals: dict):
     except Exception:
         return None
 
+
 def pick_first_non_null(row: dict, candidates):
     """
     Retourne la première valeur non nulle trouvée parmi les clés candidates dans `row`.
@@ -151,13 +152,12 @@ def pick_first_non_null(row: dict, candidates):
                 continue
     return None
 
+
 def build_historical_table(fundamentals: dict, max_years: int = 5) -> pd.DataFrame:
     """
     Construit un tableau historique multi-lignes sur les dernières années :
     CA, EBIT, Net Income, Operating CF, Capex, FCF approx.
     On reste sur du yearly.
-
-    On gère plusieurs variantes de noms de champs possibles dans EODHD.
     """
     try:
         inc = fundamentals["Financials"]["Income_Statement"]["yearly"]
@@ -258,6 +258,7 @@ def build_historical_table(fundamentals: dict, max_years: int = 5) -> pd.DataFra
     df = df.sort_values("Année")
     return df
 
+
 def scale_df_to_millions(df: pd.DataFrame, exclude_cols=("Année",)) -> pd.DataFrame:
     """
     Convertit toutes les colonnes numériques (sauf celles dans exclude_cols) en millions.
@@ -273,29 +274,33 @@ def scale_df_to_millions(df: pd.DataFrame, exclude_cols=("Année",)) -> pd.DataF
     rename_map = {c: f"{c} (M)" for c in numeric_cols}
     df_out = df_out.rename(columns=rename_map)
     return df_out
-def scale_df_to_millions(df: pd.DataFrame, exclude_cols=("Année",)) -> pd.DataFrame:
+
+
+def format_large_number(x: float) -> str:
     """
-    Convertit toutes les colonnes numériques (sauf celles dans exclude_cols) en millions.
-    Renomme ces colonnes avec un suffixe ' (M)'.
+    Format lisible pour les grands nombres : en M ou Md selon la taille.
     """
-    df_out = df.copy()
-    numeric_cols = [
-        c for c in df_out.columns
-        if c not in exclude_cols and pd.api.types.is_numeric_dtype(df_out[c])
-    ]
-    for c in numeric_cols:
-        df_out[c] = df_out[c].astype(float) / 1_000_000
-    rename_map = {c: f"{c} (M)" for c in numeric_cols}
-    df_out = df_out.rename(columns=rename_map)
-    return df_out
+    if x is None or (isinstance(x, float) and math.isnan(x)):
+        return "N/A"
+
+    try:
+        x = float(x)
+    except Exception:
+        return "N/A"
+
+    ax = abs(x)
+    if ax >= 1_000_000_000:
+        return f"{x / 1_000_000_000:.2f} Md"
+    elif ax >= 1_000_000:
+        return f"{x / 1_000_000:.2f} M"
+    else:
+        return f"{x:,.0f}"
 
 
 def estimate_starting_fcf(fundamentals: dict):
     """
     UFCF ≈ Free Cash Flow si dispo,
     sinon FCF = TotalCashFromOperatingActivities - CapitalExpenditures (ou équivalents).
-
-    On gère plusieurs variantes de noms de champs possibles dans l'API EODHD.
     """
     try:
         cf = fundamentals["Financials"]["Cash_Flow"]["yearly"]
@@ -309,7 +314,7 @@ def estimate_starting_fcf(fundamentals: dict):
     last_year_key = years[-1]
     row = cf[last_year_key] or {}
 
-    # 1) Si EODHD fournit déjà le free cash-flow, on le prend directement
+    # 1) Free cash-flow direct si dispo
     for key in ["freeCashFlow", "FreeCashFlow"]:
         if key in row and row[key] is not None:
             return float(row[key])
@@ -332,18 +337,13 @@ def estimate_starting_fcf(fundamentals: dict):
     capex = next((row[k] for k in capex_candidates if k in row and row[k] is not None), None)
 
     if operating_cf is None or capex is None:
-        # Petit debug utile : voir les clés réellement dispo dans le cash-flow
         try:
-            import streamlit as st
             st.write("⚠️ Clés Cash Flow disponibles pour", last_year_key, ":", list(row.keys()))
         except Exception:
-            # si on est hors Streamlit (test en script), on ignore
             pass
         return None
 
     return float(operating_cf) - float(capex)
-
-
 
 
 # =========================================
@@ -413,11 +413,7 @@ def dcf_fair_value_per_share(
     tv_discounted = tv / ((1 + wacc) ** years)
     ev = sum_discounted_fcfs + tv_discounted
 
-    if net_debt is None:
-        net_debt_used = 0.0
-    else:
-        net_debt_used = net_debt
-
+    net_debt_used = net_debt if net_debt is not None else 0.0
     equity_value = ev - net_debt_used
     fair_value_per_share = equity_value / shares
 
@@ -435,11 +431,10 @@ def build_sensitivity_matrix(
 ):
     """
     Construit une matrice de sensibilité DCF en faisant varier WACC et g.
-    - Lignes : WACC (base ± 1 % + base)
-    - Colonnes : g (base ± 0.5 % + base)
+    - Lignes : WACC autour du WACC de base
+    - Colonnes : g autour de g de base
     Les cellules contiennent la juste valeur par action.
     """
-    # On construit des listes de WACC et g en pourcentage (décimaux)
     wacc_values = sorted(
         {
             max(0.01, base_wacc - 0.01),
@@ -457,7 +452,7 @@ def build_sensitivity_matrix(
         }
     )
 
-    # On s'assure que g < min(WACC) pour éviter des cas invalides
+    # On s'assure que g < WACC max pour éviter des cas invalides
     g_values = [g for g in g_values if g < max(wacc_values)]
 
     data = {}
@@ -474,7 +469,6 @@ def build_sensitivity_matrix(
                 shares=shares,
             )
             row.append(fv if fv is not None else float("nan"))
-        # colonnes nommées par g (%)
         data[f"g = {g*100:.2f} %"] = row
 
     index_labels = [f"WACC = {w*100:.2f} %" for w in wacc_values]
@@ -494,26 +488,20 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     - Récupération fondamentaux + prix
     - Extraction des tableaux historiques
     - DCF + matrice de sensibilité
-    Retourne un dict avec toutes les infos utiles.
     """
-    # 1) Si l'utilisateur a directement donné un ticker complet genre 'AAPL.US', on l'utilise tel quel
-    #    (on fait quand même un try/except, mais ça évite la recherche).
     ticker = None
     search_results = []
 
     if "." in query and " " not in query:
         ticker = query.strip()
     else:
-        # Recherche par nom ou ticker
         search_results = search_instrument(query.strip(), api_key)
         if not search_results:
             raise ValueError("Aucun instrument trouvé pour cette recherche.")
-        # Pour l'instant on prend le premier résultat (tu pourras ensuite ajouter un selectbox)
         ticker = build_ticker_from_search_result(search_results[0])
         if ticker is None:
             raise ValueError("Impossible de construire un ticker valide à partir du résultat de recherche.")
 
-    # 2) Prix + fondamentaux
     price = fetch_eod_price(ticker, api_key)
     if price is None:
         raise ValueError("Impossible de récupérer le cours de marché.")
@@ -528,7 +516,6 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     if fcf_start is None:
         raise ValueError("Impossible d'estimer un FCF de départ à partir des états financiers.")
 
-    # 3) DCF base case
     fv, ev, equity_value, tv_discounted, sum_disc_fcfs = dcf_fair_value_per_share(
         fcf_start=fcf_start,
         growth_fcf=growth_fcf,
@@ -544,7 +531,6 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
 
     upside = (fv / price - 1) * 100
 
-    # 4) Projection FCF sur 5 ans (base case)
     projected_fcfs = project_fcf(fcf_start, growth_fcf, years)
     discounted_fcfs, _ = discount_cash_flows(projected_fcfs, wacc)
     proj_df = pd.DataFrame(
@@ -555,7 +541,6 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         }
     )
 
-    # 5) Matrice de sensibilité
     sens_matrix = build_sensitivity_matrix(
         fcf_start=fcf_start,
         growth_fcf=growth_fcf,
@@ -598,7 +583,7 @@ def main():
         layout="wide"
     )
 
-    # En-tête style pro
+    # En-tête
     st.markdown(
         """
         <div style="
@@ -693,6 +678,7 @@ def main():
     except Exception as e:
         st.error(f"Erreur lors de l'analyse : {e}")
         st.stop()
+        return
 
     # =========================================
     # MISE EN PAGE AVEC TABS
@@ -726,65 +712,59 @@ def main():
         ["Résumé DCF", "Historique 5 ans", "Projections FCF", "DCF & Sensibilité"]
     )
 
-# ----- TAB 1 : Résumé DCF -----
-with tab_resume:
-    st.subheader("🎯 Résumé de la valorisation DCF (base case)")
+    # ----- TAB 1 : Résumé DCF -----
+    with tab_resume:
+        st.subheader("🎯 Résumé de la valorisation DCF (base case)")
 
-    # Récupérations sécurisées (évite les KeyError / None)
-    ev = dcf.get("ev", 0) or 0
-    sum_disc_fcfs = dcf.get("sum_disc_fcfs", 0) or 0
-    tv_discounted = dcf.get("tv_discounted", 0) or 0
-    equity_value = dcf.get("equity_value", 0) or 0
-    fair_value_per_share = dcf.get("fair_value_per_share", 0) or 0
+        ev = dcf.get("ev", 0) or 0
+        sum_disc_fcfs = dcf.get("sum_disc_fcfs", 0) or 0
+        tv_discounted = dcf.get("tv_discounted", 0) or 0
+        equity_value = dcf.get("equity_value", 0) or 0
+        fair_value_per_share = dcf.get("fair_value_per_share", 0) or 0
 
-    shares = (result.get("shares", 0) or 0)
-    net_debt = (result.get("net_debt", 0) or 0)
-    fcf_start = (result.get("fcf_start", 0) or 0)
+        shares = (result.get("shares", 0) or 0)
+        net_debt = (result.get("net_debt", 0) or 0)
+        fcf_start = (result.get("fcf_start", 0) or 0)
 
-    col_a, col_b, col_c = st.columns(3)
-    with col_a:
-        st.metric("Valeur d'entreprise (EV)", format_large_number(ev))
-        st.metric("Somme FCF actualisés", format_large_number(sum_disc_fcfs))
-    with col_b:
-        st.metric("Valeur terminale actualisée", format_large_number(tv_discounted))
-        st.metric("Valeur des capitaux propres", format_large_number(equity_value))
-    with col_c:
-        st.metric("Juste valeur / action", f"{fair_value_per_share:,.2f}")
-        st.metric("Nombre d'actions", format_large_number(shares))
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.metric("Valeur d'entreprise (EV)", format_large_number(ev))
+            st.metric("Somme FCF actualisés", format_large_number(sum_disc_fcfs))
+        with col_b:
+            st.metric("Valeur terminale actualisée", format_large_number(tv_discounted))
+            st.metric("Valeur des capitaux propres", format_large_number(equity_value))
+        with col_c:
+            st.metric("Juste valeur / action", f"{fair_value_per_share:,.2f}")
+            st.metric("Nombre d'actions", format_large_number(shares))
 
-    # Bloc hypothèses en pleine largeur (hors des colonnes)
-    st.markdown("#### Hypothèses retenues (base case)")
-    st.write(f"- Horizon de projection : **{years} ans**")
-    st.write(f"- WACC : **{wacc_input:.2f} %**")
-    st.write(f"- Croissance FCF : **{growth_fcf_input:.2f} % par an**")
-    st.write(f"- g de long terme : **{g_terminal_input:.2f} %**")
-    st.write(f"- Dette nette utilisée : **{net_debt:,.0f}**")
-    st.write(f"- FCF de départ estimé : **{fcf_start:,.0f}**")
+        st.markdown("#### Hypothèses retenues (base case)")
+        st.write(f"- Horizon de projection : **{years} ans**")
+        st.write(f"- WACC : **{wacc_input:.2f} %**")
+        st.write(f"- Croissance FCF : **{growth_fcf_input:.2f} % par an**")
+        st.write(f"- g de long terme : **{g_terminal_input:.2f} %**")
+        st.write(f"- Dette nette utilisée : **{format_large_number(net_debt)}**")
+        st.write(f"- FCF de départ estimé : **{format_large_number(fcf_start)}**")
 
-    st.info(
-        "Ce résumé présente le scénario central (base case). "
-        "La robustesse de la valorisation est détaillée dans l’onglet « DCF & Sensibilité »."
-    )
-
+        st.info(
+            "Ce résumé présente le scénario central (base case). "
+            "La robustesse de la valorisation est analysée dans l'onglet « DCF & Sensibilité »."
+        )
 
     # ----- TAB 2 : Historique -----
-with tab_hist:
-    st.subheader("📚 Données historiques (5 dernières années)")
+    with tab_hist:
+        st.subheader("📚 Données historiques (5 dernières années)")
 
-    hist_df = result["hist_df"]
-    if hist_df.empty:
-        st.warning("Impossible de construire un historique complet à partir des données disponibles.")
-    else:
-        # Passage en millions + renommage des colonnes
-        df_display = scale_df_to_millions(hist_df)
+        hist_df = result["hist_df"]
+        if hist_df.empty:
+            st.warning("Impossible de construire un historique complet à partir des données disponibles.")
+        else:
+            df_display = scale_df_to_millions(hist_df)
+            numeric_cols = [c for c in df_display.columns if c != "Année"]
+            for c in numeric_cols:
+                df_display[c] = df_display[c].astype(float).round(2)
 
-        # Arrondi propre
-        numeric_cols = [c for c in df_display.columns if c != "Année"]
-        for c in numeric_cols:
-            df_display[c] = df_display[c].astype(float).round(2)
-
-        st.dataframe(df_display, use_container_width=True)
-        st.caption("Unités : millions de la devise de reporting.")
+            st.dataframe(df_display, use_container_width=True)
+            st.caption("Unités : millions de la devise de reporting.")
 
     # ----- TAB 3 : Projections FCF -----
     with tab_proj:
@@ -796,8 +776,9 @@ with tab_hist:
         st.dataframe(proj_df, use_container_width=True)
 
         st.markdown(
-            "Les projections sont basées sur un FCF de départ estimé à partir du dernier **Operating Cash Flow - Capex**, "
-            f"et une croissance constante de **{growth_fcf_input:.2f} %/an**."
+            "Les projections sont basées sur un FCF de départ estimé à partir du dernier "
+            "**Operating Cash Flow - Capex**, et une croissance constante de "
+            f"**{growth_fcf_input:.2f} %/an**."
         )
 
     # ----- TAB 4 : DCF & Sensibilité -----
