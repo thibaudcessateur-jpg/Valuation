@@ -727,7 +727,7 @@ def main():
     )
 
     # ----- TAB 1 : Résumé DCF -----
-with tab_resume:
+   with tab_resume:
     st.subheader("🎯 Résumé de la valorisation DCF (base case)")
 
     col_a, col_b, col_c = st.columns(3)
