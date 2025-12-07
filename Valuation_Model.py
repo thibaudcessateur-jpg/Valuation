@@ -357,18 +357,18 @@ def extract_base_financials(fundamentals: dict):
     - ebitda
     - ebit
     - net_income
-    - book_equity
+    - book_equity (fonds propres comptables)
     """
     inc = fundamentals.get("Financials", {}).get("Income_Statement", {}).get("yearly", {})
     bs = fundamentals.get("Financials", {}).get("Balance_Sheet", {}).get("yearly", {})
 
     revenue = ebitda = ebit = net_income = book_equity = None
 
-    # Income statement
+    # ---------- INCOME STATEMENT ----------
     if isinstance(inc, dict) and inc:
         years = sorted(inc.keys())
         last_year = years[-1]
-        row_inc = inc[last_year] or {}
+        row_inc = inc.get(last_year, {}) or {}
 
         revenue = pick_first_non_null(
             row_inc,
@@ -395,27 +395,43 @@ def extract_base_financials(fundamentals: dict):
             ],
         )
 
-    # Balance sheet
+    # ---------- BALANCE SHEET ----------
     if isinstance(bs, dict) and bs:
         years_bs = sorted(bs.keys())
         last_year_bs = years_bs[-1]
-        row_bs = bs[last_year_bs] or {}
+        row_bs = bs.get(last_year_bs, {}) or {}
 
-        # On élargit fortement la liste de clés possibles pour les fonds propres
-        book_equity = pick_first_non_null(
-            row_bs,
-            [
-                "TotalStockholderEquity",
-                "TotalStockholdersEquity",
-                "TotalShareholdersEquity",
-                "TotalEquity",
-                "TotalEquityGrossMinorityInterest",
-                "TotalEquityAndMinorityInterest",
-                "StockholdersEquity",
-                "ShareholdersEquity",
-            ],
-        )
+        # 1) Essai direct sur différentes variantes de "equity"
+        equity_candidates = [
+            "TotalStockholderEquity",
+            "TotalStockholdersEquity",
+            "TotalShareholdersEquity",
+            "TotalEquity",
+            "TotalEquityGrossMinorityInterest",
+            "TotalEquityAndMinorityInterest",
+            "StockholdersEquity",
+            "ShareholdersEquity",
+            "CommonStockEquity",
+        ]
+        book_equity = pick_first_non_null(row_bs, equity_candidates)
 
+        # 2) Fallback : si on n'a toujours rien, on approxime
+        #    book_equity ≈ Total Assets - Total Liabilities
+        if book_equity is None:
+            total_assets = pick_first_non_null(
+                row_bs,
+                ["TotalAssets", "TotalAssetsReported", "Assets"],
+            )
+            total_liabilities = pick_first_non_null(
+                row_bs,
+                [
+                    "TotalLiabilitiesNetMinorityInterest",
+                    "TotalLiabilities",
+                    "Liabilities",
+                ],
+            )
+            if total_assets is not None and total_liabilities is not None:
+                book_equity = total_assets - total_liabilities
 
     return {
         "revenue": revenue,
