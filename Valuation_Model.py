@@ -411,8 +411,11 @@ def extract_base_financials(fundamentals: dict):
                 "TotalEquity",
                 "TotalEquityGrossMinorityInterest",
                 "TotalEquityAndMinorityInterest",
+                "StockholdersEquity",
+                "ShareholdersEquity",
             ],
         )
+
 
     return {
         "revenue": revenue,
