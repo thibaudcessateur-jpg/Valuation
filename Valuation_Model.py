@@ -422,6 +422,19 @@ def extract_base_financials(fundamentals: dict):
         "book_equity": book_equity,
     }
 
+def safe_div(num, den):
+    """
+    Division sécurisée :
+    - renvoie None si num ou den est None
+    - renvoie None si den = 0
+    - évite les erreurs de type
+    """
+    if num is None or den in (None, 0):
+        return None
+    try:
+        return float(num) / float(den)
+    except Exception:
+        return None
 
 def compute_base_multiples(price, shares, net_debt, base_financials: dict):
     """
