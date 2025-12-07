@@ -1348,7 +1348,7 @@ def main():
 
     # ----- TAB 4 : DCF & Sensibilité -----
         with tab_dcf:
-        st.subheader("🧮 DCF détaillé et matrice de sensibilité")
+            st.subheader("🧮 DCF détaillé et matrice de sensibilité")
 
         sens_df = result["sensitivity"]
 
