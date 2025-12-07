@@ -395,79 +395,112 @@ def extract_base_financials(fundamentals: dict):
             ],
         )
 
-    # ---------- BALANCE SHEET ----------
+def extract_base_financials(fundamentals: dict):
+    """
+    Extrait les valeurs de base (dernière année annuelle) nécessaires aux multiples :
+    - revenue
+    - ebitda
+    - ebit
+    - net_income
+    - book_equity (fonds propres comptables)
+    """
+    inc = fundamentals.get("Financials", {}).get("Income_Statement", {}).get("yearly", {})
+    bs = fundamentals.get("Financials", {}).get("Balance_Sheet", {}).get("yearly", {})
+
+    revenue = ebitda = ebit = net_income = book_equity = None
+
+    # ============================================================
+    #                   INCOME STATEMENT
+    # ============================================================
+    if isinstance(inc, dict) and inc:
+        years_inc = sorted(inc.keys())
+        last_year_inc = years_inc[-1]
+        row_inc = inc.get(last_year_inc, {}) or {}
+
+        revenue = pick_first_non_null(
+            row_inc,
+            ["TotalRevenue", "Revenue", "totalRevenue", "SalesRevenueNet", "Sales"],
+        )
+
+        ebitda = pick_first_non_null(
+            row_inc,
+            ["EBITDA", "Ebitda", "ebitda", "OperatingIncomeBeforeDepreciation"],
+        )
+
+        ebit = pick_first_non_null(
+            row_inc,
+            ["OperatingIncome", "OperatingIncomeLoss", "EBIT", "Ebit", "ebit"],
+        )
+
+        net_income = pick_first_non_null(
+            row_inc,
+            [
+                "NetIncome",
+                "netIncome",
+                "NetIncomeCommonStockholders",
+                "NetIncomeIncludingNoncontrollingInterests",
+            ],
+        )
+
+    # ============================================================
+    #                     BALANCE SHEET
+    # ============================================================
     if isinstance(bs, dict) and bs:
         years_bs = sorted(bs.keys())
         last_year_bs = years_bs[-1]
         row_bs = bs.get(last_year_bs, {}) or {}
 
-        # 1) Essai direct sur différentes variantes de "equity"
-        equity_candidates = [
-            "TotalStockholderEquity",
-            "TotalStockholdersEquity",
-            "TotalShareholdersEquity",
-            "TotalEquity",
-            "TotalEquityGrossMinorityInterest",
-            "TotalEquityAndMinorityInterest",
-            "StockholdersEquity",
-            "ShareholdersEquity",
-            "CommonStockEquity",
+        # Normaliser les clés en minuscules (insensible à la casse)
+        normalized = {k.lower(): v for k, v in row_bs.items()}
+
+        # Clés possibles pour les fonds propres (équity)
+        equity_keys = [
+            "totalstockholderequity",
+            "totalstockholdersequity",
+            "totalshareholdersequity",
+            "commonstockequity",
+            "stockholdersequity",
+            "shareholdersequity",
+            "totalequity",
+            "totalequitygrossminorityinterest",
+            "totalequityandminorityinterest",
         ]
-        # ---------- BALANCE SHEET ----------
-if isinstance(bs, dict) and bs:
-    years_bs = sorted(bs.keys())
-    last_year_bs = years_bs[-1]
-    row_bs = bs.get(last_year_bs, {}) or {}
 
-    # Normalisation des clés (insensible à la casse)
-    normalized = {k.lower(): v for k, v in row_bs.items()}
+        # Recherche directe dans les clés normalisées
+        for key in equity_keys:
+            if key in normalized and normalized[key] not in (None, 0):
+                try:
+                    book_equity = float(normalized[key])
+                    break
+                except:
+                    pass
 
-    equity_keys = [
-        "totalstockholderequity",
-        "totalstockholdersequity",
-        "totalshareholdersequity",
-        "commonstockequity",
-        "stockholdersequity",
-        "shareholdersequity",
-        "totalequity",
-        "totalequitygrossminorityinterest",
-        "totalequityandminorityinterest",
-    ]
-
-    for key in equity_keys:
-        if key in normalized and normalized[key] not in (None, 0):
-            book_equity = float(normalized[key])
-            break
-
-    # Fallback automatique si rien trouvé
-    if book_equity is None:
-        assets = normalized.get("totalassets") or normalized.get("assets")
-        liabilities = (
-            normalized.get("totalliabilitiesnetminorityinterest")
-            or normalized.get("totalliabilities")
-            or normalized.get("liabilities")
-        )
-        if assets is not None and liabilities is not None:
-            book_equity = float(assets) - float(liabilities)
-
-
-        # 2) Fallback : si on n'a toujours rien, on approxime
-        #    book_equity ≈ Total Assets - Total Liabilities
+        # ---------------------------
+        # Fallback automatique
+        # book_equity = TotalAssets – TotalLiabilities
+        # ---------------------------
         if book_equity is None:
-            total_assets = pick_first_non_null(
-                row_bs,
-                ["TotalAssets", "TotalAssetsReported", "Assets"],
+            total_assets = (
+                normalized.get("totalassets")
+                or normalized.get("totalassetsreported")
+                or normalized.get("assets")
             )
-            total_liabilities = pick_first_non_null(
-                row_bs,
-                [
-                    "TotalLiabilitiesNetMinorityInterest",
-                    "TotalLiabilities",
-                    "Liabilities",
-                ],
+
+            total_liabilities = (
+                normalized.get("totalliabilitiesnetminorityinterest")
+                or normalized.get("totalliabilities")
+                or normalized.get("liabilities")
             )
+
             if total_assets is not None and total_liabilities is not None:
-                book_equity = total_assets - total_liabilities
+                try:
+                    book_equity = float(total_assets) - float(total_liabilities)
+                except:
+                    book_equity = None
+
+    # ============================================================
+    #                     RETURN FINAL
+    # ============================================================
     return {
         "revenue": revenue,
         "ebitda": ebitda,
@@ -475,6 +508,8 @@ if isinstance(bs, dict) and bs:
         "net_income": net_income,
         "book_equity": book_equity,
     }
+
+
 
 def safe_div(num, den):
     """
