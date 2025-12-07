@@ -364,6 +364,7 @@ def extract_base_financials(fundamentals: dict):
 
     revenue = ebitda = ebit = net_income = book_equity = None
 
+    # Income statement
     if isinstance(inc, dict) and inc:
         years = sorted(inc.keys())
         last_year = years[-1]
@@ -394,18 +395,22 @@ def extract_base_financials(fundamentals: dict):
             ],
         )
 
+    # Balance sheet
     if isinstance(bs, dict) and bs:
         years_bs = sorted(bs.keys())
         last_year_bs = years_bs[-1]
         row_bs = bs[last_year_bs] or {}
 
+        # On élargit fortement la liste de clés possibles pour les fonds propres
         book_equity = pick_first_non_null(
             row_bs,
             [
                 "TotalStockholderEquity",
-                "TotalEquity",
-                "TotalShareholdersEquity",
                 "TotalStockholdersEquity",
+                "TotalShareholdersEquity",
+                "TotalEquity",
+                "TotalEquityGrossMinorityInterest",
+                "TotalEquityAndMinorityInterest",
             ],
         )
 
@@ -416,15 +421,6 @@ def extract_base_financials(fundamentals: dict):
         "net_income": net_income,
         "book_equity": book_equity,
     }
-
-
-def safe_div(num, den):
-    if num is None or den in (None, 0):
-        return None
-    try:
-        return float(num) / float(den)
-    except Exception:
-        return None
 
 
 def compute_base_multiples(price, shares, net_debt, base_financials: dict):
@@ -684,12 +680,12 @@ def classify_company_profile(company: dict, base_metrics: dict, hist_df: pd.Data
     revenue = base_metrics.get("revenue")
     ebit = base_metrics.get("ebit")
 
-    # Capitalisation
+    # Capitalisation (seuils plus réalistes)
     if market_cap is None:
         cap_size = "Unknown"
-    elif market_cap < 500e6:
+    elif market_cap < 2_000_000_000:        # < 2 Mds
         cap_size = "SmallCap"
-    elif market_cap < 5e9:
+    elif market_cap < 10_000_000_000:       # 2–10 Mds
         cap_size = "MidCap"
     else:
         cap_size = "LargeCap"
@@ -965,13 +961,14 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     - Résolution du ticker EODHD
     - Récupération fondamentaux + prix
     - Extraction des tableaux historiques
-    - DCF + matrice de sensibilité
-    - Méthodes par multiples
+    - Multiples & profil société
+    - DCF (uniquement si pertinent)
     - Classification + pondération + synthèse globale
     """
     ticker = None
     search_results = []
 
+    # Résolution du ticker
     if "." in query and " " not in query:
         ticker = query.strip()
     else:
@@ -982,66 +979,86 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         if ticker is None:
             raise ValueError("Impossible de construire un ticker valide à partir du résultat de recherche.")
 
+    # Prix de marché
     price = fetch_eod_price(ticker, api_key)
     if price is None:
         raise ValueError("Impossible de récupérer le cours de marché.")
 
+    # Fondamentaux bruts
     fundamentals = fetch_fundamentals(ticker, api_key)
     company = get_company_summary(fundamentals)
     shares = get_shares_outstanding(fundamentals)
     net_debt = get_net_debt(fundamentals)
     hist_df = build_historical_table(fundamentals, max_years=5)
-    fcf_start = estimate_starting_fcf(fundamentals)
 
-    if fcf_start is None:
-        raise ValueError("Impossible d'estimer un FCF de départ à partir des états financiers.")
-
-    # DCF
-    fv_dcf, ev, equity_value, tv_discounted, sum_disc_fcfs = dcf_fair_value_per_share(
-        fcf_start=fcf_start,
-        growth_fcf=growth_fcf,
-        years=years,
-        wacc=wacc,
-        g_terminal=g_terminal,
-        net_debt=net_debt,
-        shares=shares,
-    )
-
-    if fv_dcf is None:
-        raise ValueError("Impossible de calculer une juste valeur par action avec ces paramètres (WACC/g).")
-
-    upside_dcf = (fv_dcf / price - 1) * 100
-
-    projected_fcfs = project_fcf(fcf_start, growth_fcf, years)
-    discounted_fcfs, _ = discount_cash_flows(projected_fcfs, wacc)
-    proj_df = pd.DataFrame(
-        {
-            "Année": [f"Année {i}" for i in range(1, years + 1)],
-            "FCF projeté": projected_fcfs,
-            "FCF actualisé": discounted_fcfs,
-        }
-    )
-
-    sens_matrix = build_sensitivity_matrix(
-        fcf_start=fcf_start,
-        growth_fcf=growth_fcf,
-        years=years,
-        base_wacc=wacc,
-        base_g=g_terminal,
-        net_debt=net_debt,
-        shares=shares,
-    )
-
-    # Multiples
+    # Multiples & profil
     base_financials = extract_base_financials(fundamentals)
     base_metrics = compute_base_multiples(price, shares, net_debt, base_financials)
-
-    # Classification + pondération
     profile = classify_company_profile(company, base_metrics, hist_df)
+
+    # Estimation du FCF de départ (pour DCF éventuel)
+    fcf_start = estimate_starting_fcf(fundamentals)
+
+    # ===== DCF : seulement si la société n'est PAS small cap et si données suffisantes =====
+    dcf_allowed = (
+        profile.get("cap_size") != "SmallCap"
+        and fcf_start is not None
+        and shares not in (None, 0)
+    )
+
+    if dcf_allowed:
+        fv_dcf, ev, equity_value, tv_discounted, sum_disc_fcfs = dcf_fair_value_per_share(
+            fcf_start=fcf_start,
+            growth_fcf=growth_fcf,
+            years=years,
+            wacc=wacc,
+            g_terminal=g_terminal,
+            net_debt=net_debt,
+            shares=shares,
+        )
+
+        if fv_dcf is not None and price not in (None, 0):
+            upside_dcf = (fv_dcf / price - 1) * 100
+        else:
+            upside_dcf = None
+
+        # Projections FCF & sensibilité
+        projected_fcfs = project_fcf(fcf_start, growth_fcf, years)
+        discounted_fcfs, _ = discount_cash_flows(projected_fcfs, wacc)
+        proj_df = pd.DataFrame(
+            {
+                "Année": [f"Année {i}" for i in range(1, years + 1)],
+                "FCF projeté": projected_fcfs,
+                "FCF actualisé": discounted_fcfs,
+            }
+        )
+
+        sens_matrix = build_sensitivity_matrix(
+            fcf_start=fcf_start,
+            growth_fcf=growth_fcf,
+            years=years,
+            base_wacc=wacc,
+            base_g=g_terminal,
+            net_debt=net_debt,
+            shares=shares,
+        )
+    else:
+        # DCF non pertinent ou impossible → on neutralise toutes les sorties DCF
+        fv_dcf = None
+        ev = None
+        equity_value = None
+        tv_discounted = None
+        sum_disc_fcfs = None
+        upside_dcf = None
+        proj_df = pd.DataFrame()
+        sens_matrix = pd.DataFrame()
+
+    # Multiples : cibles & valorisations
     weights = get_valuation_weights(profile)
     targets = default_target_multiples(profile, base_metrics)
     multiples_vals = compute_multiples_valuations(base_metrics, net_debt, shares, targets)
 
+    # Synthèse globale DCF + multiples (si DCF absent, la pondération DCF est simplement ignorée)
     global_val = combine_global_valuation(
         dcf_value=fv_dcf,
         multiples_vals=multiples_vals,
@@ -1197,6 +1214,8 @@ def main():
     global_val = result["global_valuation"]
     targets = result["target_multiples"]
     weights = result["weights"]
+    dcf_active = dcf.get("fair_value_per_share") is not None
+
 
     # Bandeau résumé
     col1, col2, col3, col4 = st.columns(4)
@@ -1211,12 +1230,22 @@ def main():
         st.metric("Devise", company.get("Currency", "N/A"))
     with col4:
         st.metric("Prix de marché", f"{result['price']:.2f}")
-        st.metric("Juste valeur DCF", f"{dcf['fair_value_per_share']:.2f}")
+        if dcf_active:
+            st.metric("Juste valeur DCF", f"{dcf['fair_value_per_share']:.2f}")
+        else:
+            st.metric("Juste valeur DCF", "N/A")
 
-    upside_color = "🟢" if dcf["upside_pct"] > 0 else "🔴"
-    st.markdown(
-        f"**Upside / Downside DCF :** {upside_color} **{dcf['upside_pct']:.1f} %**"
-    )
+    upside_pct = dcf.get("upside_pct")
+    if dcf_active and upside_pct is not None:
+        upside_color = "🟢" if upside_pct > 0 else "🔴"
+        st.markdown(
+            f"**Upside / Downside DCF :** {upside_color} **{upside_pct:.1f} %**"
+        )
+    else:
+        st.markdown(
+            "**DCF non utilisé pour ce profil (small cap ou données insuffisantes).**"
+        )
+
 
     # Tabs
     tab_resume, tab_hist, tab_proj, tab_dcf, tab_mult, tab_synth = st.tabs(
@@ -1231,43 +1260,51 @@ def main():
     )
 
     # ----- TAB 1 : Résumé DCF -----
-    with tab_resume:
+        with tab_resume:
         st.subheader("🎯 Résumé de la valorisation DCF (base case)")
 
-        ev = dcf.get("ev", 0) or 0
-        sum_disc_fcfs = dcf.get("sum_disc_fcfs", 0) or 0
-        tv_discounted = dcf.get("tv_discounted", 0) or 0
-        equity_value = dcf.get("equity_value", 0) or 0
-        fair_value_per_share = dcf.get("fair_value_per_share", 0) or 0
+        if not dcf_active:
+            st.warning(
+                "Le modèle DCF n'est pas utilisé pour cette société "
+                "(profil small cap ou données de cash-flow insuffisantes). "
+                "Les valorisations reposent principalement sur les méthodes par multiples."
+            )
+        else:
+            ev = dcf.get("ev", 0) or 0
+            sum_disc_fcfs = dcf.get("sum_disc_fcfs", 0) or 0
+            tv_discounted = dcf.get("tv_discounted", 0) or 0
+            equity_value = dcf.get("equity_value", 0) or 0
+            fair_value_per_share = dcf.get("fair_value_per_share", 0) or 0
 
-        shares = (result.get("shares", 0) or 0)
-        net_debt = (result.get("net_debt", 0) or 0)
-        fcf_start = (result.get("fcf_start", 0) or 0)
+            shares = (result.get("shares", 0) or 0)
+            net_debt = (result.get("net_debt", 0) or 0)
+            fcf_start = (result.get("fcf_start", 0) or 0)
 
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            st.metric("Valeur d'entreprise (EV)", format_large_number(ev))
-            st.metric("Somme FCF actualisés", format_large_number(sum_disc_fcfs))
-        with col_b:
-            st.metric("Valeur terminale actualisée", format_large_number(tv_discounted))
-            st.metric("Valeur des capitaux propres", format_large_number(equity_value))
-        with col_c:
-            st.metric("Juste valeur / action", f"{fair_value_per_share:,.2f}")
-            st.metric("Nombre d'actions", format_large_number(shares))
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                st.metric("Valeur d'entreprise (EV)", format_large_number(ev))
+                st.metric("Somme FCF actualisés", format_large_number(sum_disc_fcfs))
+            with col_b:
+                st.metric("Valeur terminale actualisée", format_large_number(tv_discounted))
+                st.metric("Valeur des capitaux propres", format_large_number(equity_value))
+            with col_c:
+                st.metric("Juste valeur / action", f"{fair_value_per_share:,.2f}")
+                st.metric("Nombre d'actions", format_large_number(shares))
 
-        st.markdown("#### Hypothèses retenues (base case)")
-        st.write(f"- Horizon de projection : **{years} ans**")
-        st.write(f"- WACC : **{wacc_input:.2f} %**")
-        st.write(f"- Croissance FCF : **{growth_fcf_input:.2f} % par an**")
-        st.write(f"- g de long terme : **{g_terminal_input:.2f} %**")
-        st.write(f"- Dette nette utilisée : **{format_large_number(net_debt)}**")
-        st.write(f"- FCF de départ estimé : **{format_large_number(fcf_start)}**")
+            st.markdown("#### Hypothèses retenues (base case)")
+            st.write(f"- Horizon de projection : **{years} ans**")
+            st.write(f"- WACC : **{wacc_input:.2f} %**")
+            st.write(f"- Croissance FCF : **{growth_fcf_input:.2f} % par an**")
+            st.write(f"- g de long terme : **{g_terminal_input:.2f} %**")
+            st.write(f"- Dette nette utilisée : **{format_large_number(net_debt)}**")
+            st.write(f"- FCF de départ estimé : **{format_large_number(fcf_start)}**")
 
-        st.info(
-            "Ce résumé présente le scénario central (base case). "
-            "La robustesse de la valorisation est analysée dans l'onglet « DCF & Sensibilité » "
-            "et complétée par les méthodes par multiples."
-        )
+            st.info(
+                "Ce résumé présente le scénario central (base case). "
+                "La robustesse de la valorisation est analysée dans l'onglet « DCF & Sensibilité » "
+                "et complétée par les méthodes par multiples."
+            )
+
 
     # ----- TAB 2 : Historique -----
     with tab_hist:
@@ -1286,35 +1323,52 @@ def main():
             st.caption("Unités : millions de la devise de reporting.")
 
     # ----- TAB 3 : Projections FCF -----
-    with tab_proj:
+        with tab_proj:
         st.subheader("📈 Projections de FCF sur 5 ans (base case)")
 
-        proj_df = result["proj_df"].copy()
-        proj_df["FCF projeté"] = proj_df["FCF projeté"].round(0)
-        proj_df["FCF actualisé"] = proj_df["FCF actualisé"].round(0)
-        st.dataframe(proj_df, use_container_width=True)
+        proj_df = result["proj_df"]
 
-        st.markdown(
-            "Les projections sont basées sur un FCF de départ estimé à partir du dernier "
-            "**Operating Cash Flow - Capex**, et une croissance constante de "
-            f"**{growth_fcf_input:.2f} %/an**."
-        )
+        if not dcf_active or proj_df.empty:
+            st.warning(
+                "Projections de FCF non disponibles ou non pertinentes pour cette société "
+                "(profil small cap ou absence de données suffisantes)."
+            )
+        else:
+            proj_df = proj_df.copy()
+            proj_df["FCF projeté"] = proj_df["FCF projeté"].round(0)
+            proj_df["FCF actualisé"] = proj_df["FCF actualisé"].round(0)
+            st.dataframe(proj_df, use_container_width=True)
+
+            st.markdown(
+                "Les projections sont basées sur un FCF de départ estimé à partir du dernier "
+                "**Operating Cash Flow - Capex**, et une croissance constante de "
+                f"**{growth_fcf_input:.2f} %/an**."
+            )
+
 
     # ----- TAB 4 : DCF & Sensibilité -----
-    with tab_dcf:
+        with tab_dcf:
         st.subheader("🧮 DCF détaillé et matrice de sensibilité")
 
-        st.markdown("#### Matrice de sensibilité (juste valeur / action)")
-        sens_df = result["sensitivity"].round(2)
-        st.dataframe(sens_df, use_container_width=True)
+        sens_df = result["sensitivity"]
 
-        st.markdown(
-            """
-            - **Lignes** : différentes hypothèses de WACC autour de la valeur de base.  
-            - **Colonnes** : différentes hypothèses de croissance de long terme *g*.  
-            - Chaque cellule représente la **juste valeur par action** selon ces hypothèses.
-            """
-        )
+        if not dcf_active or sens_df.empty:
+            st.warning(
+                "Matrice de sensibilité DCF non disponible pour cette société "
+                "(profil small cap ou données cash-flow insuffisantes)."
+            )
+        else:
+            st.markdown("#### Matrice de sensibilité (juste valeur / action)")
+            sens_df = sens_df.round(2)
+            st.dataframe(sens_df, use_container_width=True)
+
+            st.markdown(
+                """
+                - **Lignes** : différentes hypothèses de WACC autour de la valeur de base.  
+                - **Colonnes** : différentes hypothèses de croissance de long terme *g*.  
+                - Chaque cellule représente la **juste valeur par action** selon ces hypothèses.
+                """
+            )
 
         st.markdown("#### Rappel des paramètres du scénario central")
         st.write(f"- WACC base : **{wacc_input:.2f} %**")
@@ -1325,8 +1379,9 @@ def main():
         st.info(
             "Le DCF reste la méthode intrinsèque principale pour les sociétés matures "
             "avec des cash-flows prévisibles (notamment large caps). "
-            "Pour les small caps, d'autres méthodes (EV/Sales, EV/EBITDA...) peuvent être plus pertinentes."
+            "Pour les small caps, d'autres méthodes (EV/Sales, EV/EBITDA...) sont privilégiées."
         )
+
 
     # ----- TAB 5 : Multiples & Comparables -----
     with tab_mult:
