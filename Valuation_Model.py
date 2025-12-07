@@ -468,7 +468,6 @@ if isinstance(bs, dict) and bs:
             )
             if total_assets is not None and total_liabilities is not None:
                 book_equity = total_assets - total_liabilities
-                
     return {
         "revenue": revenue,
         "ebitda": ebitda,
