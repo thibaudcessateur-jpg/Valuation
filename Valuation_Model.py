@@ -413,7 +413,43 @@ def extract_base_financials(fundamentals: dict):
             "ShareholdersEquity",
             "CommonStockEquity",
         ]
-        book_equity = pick_first_non_null(row_bs, equity_candidates)
+        # ---------- BALANCE SHEET ----------
+if isinstance(bs, dict) and bs:
+    years_bs = sorted(bs.keys())
+    last_year_bs = years_bs[-1]
+    row_bs = bs.get(last_year_bs, {}) or {}
+
+    # Normalisation des clés (insensible à la casse)
+    normalized = {k.lower(): v for k, v in row_bs.items()}
+
+    equity_keys = [
+        "totalstockholderequity",
+        "totalstockholdersequity",
+        "totalshareholdersequity",
+        "commonstockequity",
+        "stockholdersequity",
+        "shareholdersequity",
+        "totalequity",
+        "totalequitygrossminorityinterest",
+        "totalequityandminorityinterest",
+    ]
+
+    for key in equity_keys:
+        if key in normalized and normalized[key] not in (None, 0):
+            book_equity = float(normalized[key])
+            break
+
+    # Fallback automatique si rien trouvé
+    if book_equity is None:
+        assets = normalized.get("totalassets") or normalized.get("assets")
+        liabilities = (
+            normalized.get("totalliabilitiesnetminorityinterest")
+            or normalized.get("totalliabilities")
+            or normalized.get("liabilities")
+        )
+        if assets is not None and liabilities is not None:
+            book_equity = float(assets) - float(liabilities)
+
 
         # 2) Fallback : si on n'a toujours rien, on approxime
         #    book_equity ≈ Total Assets - Total Liabilities
