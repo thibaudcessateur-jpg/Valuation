@@ -536,7 +536,7 @@ def dcf_fair_value_per_share(
         return None, None, None, None, None
 
     projected_fcfs = project_fcf(fcf_start, growth_fcf, years)
-    discounted_fcfs, sum_discounted_fcfs = discount_cash_flows(projected_fccs, wacc)
+    discounted_fcfs, sum_discounted_fcfs = discount_cash_flows(projected_fcfs, wacc)
 
     tv = terminal_value(projected_fcfs[-1], wacc, g_terminal)
     if tv is None:
