@@ -1319,7 +1319,7 @@ def main():
             )
 
 
-    # ----- TAB 2 : Historique -----
+      # ----- TAB 2 : Historique -----
     with tab_hist:
         st.subheader("📚 Données historiques (5 dernières années)")
 
@@ -1336,12 +1336,12 @@ def main():
             st.caption("Unités : millions de la devise de reporting.")
 
     # ----- TAB 3 : Projections FCF -----
-        with tab_proj:
-            st.subheader("📈 Projections de FCF sur 5 ans (base case)")
+    with tab_proj:
+        st.subheader("📈 Projections de FCF sur 5 ans (base case)")
 
         proj_df = result["proj_df"]
 
-        if not dcf_active or proj_df.empty:
+        if (not dcf_active) or (proj_df is None) or proj_df.empty:
             st.warning(
                 "Projections de FCF non disponibles ou non pertinentes pour cette société "
                 "(profil small cap ou absence de données suffisantes)."
@@ -1358,14 +1358,13 @@ def main():
                 f"**{growth_fcf_input:.2f} %/an**."
             )
 
-
     # ----- TAB 4 : DCF & Sensibilité -----
-        with tab_dcf:
-            st.subheader("🧮 DCF détaillé et matrice de sensibilité")
+    with tab_dcf:
+        st.subheader("🧮 DCF détaillé et matrice de sensibilité")
 
         sens_df = result["sensitivity"]
 
-        if not dcf_active or sens_df.empty:
+        if (not dcf_active) or (sens_df is None) or sens_df.empty:
             st.warning(
                 "Matrice de sensibilité DCF non disponible pour cette société "
                 "(profil small cap ou données cash-flow insuffisantes)."
@@ -1394,7 +1393,6 @@ def main():
             "avec des cash-flows prévisibles (notamment large caps). "
             "Pour les small caps, d'autres méthodes (EV/Sales, EV/EBITDA...) sont privilégiées."
         )
-
 
     # ----- TAB 5 : Multiples & Comparables -----
     with tab_mult:
