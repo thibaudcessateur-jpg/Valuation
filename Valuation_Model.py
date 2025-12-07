@@ -1260,7 +1260,7 @@ def main():
     )
 
     # ----- TAB 1 : Résumé DCF -----
-        with tab_resume:
+    with tab_resume:
         st.subheader("🎯 Résumé de la valorisation DCF (base case)")
 
         if not dcf_active:
