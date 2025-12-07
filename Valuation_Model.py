@@ -347,6 +347,139 @@ def estimate_starting_fcf(fundamentals: dict):
 
 
 # =========================================
+# EXTRACTION BASE POUR MULTIPLES
+# =========================================
+
+def extract_base_financials(fundamentals: dict):
+    """
+    Extrait les valeurs de base (dernière année annuelle) nécessaires aux multiples :
+    - revenue
+    - ebitda
+    - ebit
+    - net_income
+    - book_equity
+    """
+    inc = fundamentals.get("Financials", {}).get("Income_Statement", {}).get("yearly", {})
+    bs = fundamentals.get("Financials", {}).get("Balance_Sheet", {}).get("yearly", {})
+
+    revenue = ebitda = ebit = net_income = book_equity = None
+
+    if isinstance(inc, dict) and inc:
+        years = sorted(inc.keys())
+        last_year = years[-1]
+        row_inc = inc[last_year] or {}
+
+        revenue = pick_first_non_null(
+            row_inc,
+            ["TotalRevenue", "Revenue", "totalRevenue", "SalesRevenueNet", "Sales"],
+        )
+
+        ebitda = pick_first_non_null(
+            row_inc,
+            ["EBITDA", "Ebitda", "ebitda", "OperatingIncomeBeforeDepreciation"],
+        )
+
+        ebit = pick_first_non_null(
+            row_inc,
+            ["OperatingIncome", "OperatingIncomeLoss", "EBIT", "Ebit", "ebit"],
+        )
+
+        net_income = pick_first_non_null(
+            row_inc,
+            [
+                "NetIncome",
+                "netIncome",
+                "NetIncomeCommonStockholders",
+                "NetIncomeIncludingNoncontrollingInterests",
+            ],
+        )
+
+    if isinstance(bs, dict) and bs:
+        years_bs = sorted(bs.keys())
+        last_year_bs = years_bs[-1]
+        row_bs = bs[last_year_bs] or {}
+
+        book_equity = pick_first_non_null(
+            row_bs,
+            [
+                "TotalStockholderEquity",
+                "TotalEquity",
+                "TotalShareholdersEquity",
+                "TotalStockholdersEquity",
+            ],
+        )
+
+    return {
+        "revenue": revenue,
+        "ebitda": ebitda,
+        "ebit": ebit,
+        "net_income": net_income,
+        "book_equity": book_equity,
+    }
+
+
+def safe_div(num, den):
+    if num is None or den in (None, 0):
+        return None
+    try:
+        return float(num) / float(den)
+    except Exception:
+        return None
+
+
+def compute_base_multiples(price, shares, net_debt, base_financials: dict):
+    """
+    Calcule les métriques de base pour les méthodes par multiples :
+    - EPS, BVPS
+    - Market cap, EV
+    - P/E, P/B, EV/EBITDA, EV/EBIT, EV/Sales
+    """
+    revenue = base_financials.get("revenue")
+    ebitda = base_financials.get("ebitda")
+    ebit = base_financials.get("ebit")
+    net_income = base_financials.get("net_income")
+    book_equity = base_financials.get("book_equity")
+
+    metrics = {}
+
+    eps = None
+    bvps = None
+    market_cap = None
+    ev = None
+
+    if price is not None and shares not in (None, 0):
+        market_cap = price * shares
+
+    if shares not in (None, 0):
+        if net_income is not None:
+            eps = net_income / shares
+        if book_equity is not None:
+            bvps = book_equity / shares
+
+    if market_cap is not None:
+        ev = market_cap + (net_debt or 0)
+
+    metrics["revenue"] = revenue
+    metrics["ebitda"] = ebitda
+    metrics["ebit"] = ebit
+    metrics["net_income"] = net_income
+    metrics["book_equity"] = book_equity
+    metrics["eps"] = eps
+    metrics["bvps"] = bvps
+    metrics["market_cap"] = market_cap
+    metrics["ev"] = ev
+
+    # Multiples courants
+    metrics["pe"] = safe_div(price, eps)
+    metrics["pb"] = safe_div(price, bvps)
+    metrics["ev_ebitda"] = safe_div(ev, ebitda)
+    metrics["ev_ebit"] = safe_div(ev, ebit)
+    metrics["ev_sales"] = safe_div(ev, revenue)
+
+    return metrics
+
+
+# =========================================
 # MOTEUR DCF
 # =========================================
 
@@ -398,13 +531,12 @@ def dcf_fair_value_per_share(
     """
     Calcule une juste valeur par action pour un ensemble de paramètres DCF.
     Retourne (fair_value_per_share, EV, equity_value, tv_discounted, sum_discounted_fcfs).
-    Si impossible (wacc <= g, données manquantes), retourne (None, ...).
     """
     if shares is None or shares <= 0 or fcf_start is None:
         return None, None, None, None, None
 
     projected_fcfs = project_fcf(fcf_start, growth_fcf, years)
-    discounted_fcfs, sum_discounted_fcfs = discount_cash_flows(projected_fcfs, wacc)
+    discounted_fcfs, sum_discounted_fcfs = discount_cash_flows(projected_fccs, wacc)
 
     tv = terminal_value(projected_fcfs[-1], wacc, g_terminal)
     if tv is None:
@@ -431,8 +563,6 @@ def build_sensitivity_matrix(
 ):
     """
     Construit une matrice de sensibilité DCF en faisant varier WACC et g.
-    - Lignes : WACC autour du WACC de base
-    - Colonnes : g autour de g de base
     Les cellules contiennent la juste valeur par action.
     """
     wacc_values = sorted(
@@ -452,7 +582,6 @@ def build_sensitivity_matrix(
         }
     )
 
-    # On s'assure que g < WACC max pour éviter des cas invalides
     g_values = [g for g in g_values if g < max(wacc_values)]
 
     data = {}
@@ -477,6 +606,355 @@ def build_sensitivity_matrix(
 
 
 # =========================================
+# MÉTHODES PAR MULTIPLES (FAIR VALUES)
+# =========================================
+
+def pe_valuation(eps, pe_target):
+    if eps is None or pe_target is None:
+        return None
+    return eps * pe_target
+
+
+def pb_valuation(bvps, pb_target):
+    if bvps is None or pb_target is None:
+        return None
+    return bvps * pb_target
+
+
+def ev_ebitda_valuation(ebitda, net_debt, shares, ev_ebitda_target):
+    if ebitda is None or ev_ebitda_target is None or shares in (None, 0):
+        return None
+    ev_target = ebitda * ev_ebitda_target
+    equity_target = ev_target - (net_debt or 0)
+    return equity_target / shares
+
+
+def ev_ebit_valuation(ebit, net_debt, shares, ev_ebit_target):
+    if ebit is None or ev_ebit_target is None or shares in (None, 0):
+        return None
+    ev_target = ebit * ev_ebit_target
+    equity_target = ev_target - (net_debt or 0)
+    return equity_target / shares
+
+
+def ev_sales_valuation(sales, net_debt, shares, ev_sales_target):
+    if sales is None or ev_sales_target is None or shares in (None, 0):
+        return None
+    ev_target = sales * ev_sales_target
+    equity_target = ev_target - (net_debt or 0)
+    return equity_target / shares
+
+
+# =========================================
+# CLASSIFICATION & PONDÉRATION
+# =========================================
+
+def compute_revenue_cagr(hist_df: pd.DataFrame):
+    """
+    Calcule un CAGR approximatif du chiffre d'affaires si possible.
+    """
+    if hist_df is None or hist_df.empty or "Chiffre d'affaires" not in hist_df.columns:
+        return None
+
+    df = hist_df.dropna(subset=["Chiffre d'affaires"])
+    if df.shape[0] < 2:
+        return None
+
+    df = df.sort_values("Année")
+    rev_start = df["Chiffre d'affaires"].iloc[0]
+    rev_end = df["Chiffre d'affaires"].iloc[-1]
+
+    if rev_start in (None, 0) or rev_end is None:
+        return None
+
+    n_years = df.shape[0] - 1
+    try:
+        cagr = (rev_end / rev_start) ** (1 / n_years) - 1
+        return cagr
+    except Exception:
+        return None
+
+
+def classify_company_profile(company: dict, base_metrics: dict, hist_df: pd.DataFrame):
+    """
+    Classe la société en Small / Mid / Large + quelques infos utiles.
+    """
+    sector = (company.get("Sector") or "").lower()
+    market_cap = base_metrics.get("market_cap")
+    revenue = base_metrics.get("revenue")
+    ebit = base_metrics.get("ebit")
+
+    # Capitalisation
+    if market_cap is None:
+        cap_size = "Unknown"
+    elif market_cap < 500e6:
+        cap_size = "SmallCap"
+    elif market_cap < 5e9:
+        cap_size = "MidCap"
+    else:
+        cap_size = "LargeCap"
+
+    # Marge EBIT
+    ebit_margin = None
+    if ebit is not None and revenue not in (None, 0):
+        ebit_margin = ebit / revenue
+
+    # Croissance CA
+    rev_cagr = compute_revenue_cagr(hist_df)
+
+    # Tag sectoriel spécial pour financières
+    is_financial = any(
+        kw in sector
+        for kw in ["financial", "bank", "insurance", "assurance"]
+    )
+
+    profile = {
+        "sector": company.get("Sector"),
+        "cap_size": cap_size,
+        "market_cap": market_cap,
+        "ebit_margin": ebit_margin,
+        "revenue_cagr": rev_cagr,
+        "is_financial": is_financial,
+    }
+    return profile
+
+
+def get_valuation_weights(profile: dict):
+    """
+    Pondérations par défaut des méthodes selon le profil de la société.
+    Les poids sont des hypothèses modélisées, pas des vérités.
+    """
+    cap_size = profile.get("cap_size", "Unknown")
+    is_financial = profile.get("is_financial", False)
+
+    # Cas spéciaux : financières → P/B et P/E
+    if is_financial:
+        return {
+            "DCF": 0.0,
+            "PE": 0.3,
+            "EV_EBITDA": 0.0,
+            "EV_EBIT": 0.0,
+            "EV_SALES": 0.0,
+            "PB": 0.7,
+        }
+
+    if cap_size == "LargeCap":
+        return {
+            "DCF": 0.6,
+            "PE": 0.15,
+            "EV_EBITDA": 0.25,
+            "EV_EBIT": 0.0,
+            "EV_SALES": 0.0,
+            "PB": 0.0,
+        }
+    elif cap_size == "MidCap":
+        return {
+            "DCF": 0.4,
+            "PE": 0.2,
+            "EV_EBITDA": 0.3,
+            "EV_EBIT": 0.0,
+            "EV_SALES": 0.1,
+            "PB": 0.0,
+        }
+    elif cap_size == "SmallCap":
+        return {
+            "DCF": 0.0,    # DCF considéré non pertinent ici
+            "PE": 0.2,
+            "EV_EBITDA": 0.3,
+            "EV_EBIT": 0.0,
+            "EV_SALES": 0.5,
+            "PB": 0.0,
+        }
+
+    # Valeur par défaut si on ne sait pas classifier
+    return {
+        "DCF": 0.4,
+        "PE": 0.2,
+        "EV_EBITDA": 0.2,
+        "EV_EBIT": 0.0,
+        "EV_SALES": 0.2,
+        "PB": 0.0,
+    }
+
+
+def default_target_multiples(profile: dict, base_metrics: dict):
+    """
+    Multiples cibles génériques (approche neutre, à affiner plus tard).
+    Ce sont des hypothèses, pas des valeurs de marché.
+    """
+    cap_size = profile.get("cap_size", "Unknown")
+    sector = (profile.get("sector") or "").lower()
+
+    # Base générique
+    pe = 15
+    ev_ebitda = 8
+    ev_ebit = 10
+    ev_sales = 2
+    pb = 1.5
+
+    # Ajustements simples selon taille
+    if cap_size == "SmallCap":
+        pe = 18
+        ev_ebitda = 9
+        ev_sales = 2.5
+    elif cap_size == "LargeCap":
+        pe = 14
+        ev_ebitda = 8
+        ev_sales = 2
+
+    # Ajustements très simples pour financières
+    if any(kw in sector for kw in ["bank", "insurance", "financial"]):
+        pe = 10
+        ev_ebitda = None
+        ev_ebit = None
+        ev_sales = None
+        pb = 1.0
+
+    return {
+        "PE": pe,
+        "EV_EBITDA": ev_ebitda,
+        "EV_EBIT": ev_ebit,
+        "EV_SALES": ev_sales,
+        "PB": pb,
+    }
+
+
+def compute_multiples_valuations(base_metrics: dict, net_debt, shares, targets: dict):
+    """
+    Calcule les fair values par méthode de multiples en utilisant les cibles.
+    Retourne un dict par méthode : multiple courant, multiple cible, fair value.
+    """
+    price = None
+    if base_metrics.get("market_cap") is not None and shares not in (None, 0):
+        price = base_metrics["market_cap"] / shares
+
+    eps = base_metrics.get("eps")
+    bvps = base_metrics.get("bvps")
+    revenue = base_metrics.get("revenue")
+    ebitda = base_metrics.get("ebitda")
+    ebit = base_metrics.get("ebit")
+
+    current = {
+        "PE": base_metrics.get("pe"),
+        "EV_EBITDA": base_metrics.get("ev_ebitda"),
+        "EV_EBIT": base_metrics.get("ev_ebit"),
+        "EV_SALES": base_metrics.get("ev_sales"),
+        "PB": base_metrics.get("pb"),
+    }
+
+    fair_pe = pe_valuation(eps, targets.get("PE"))
+    fair_pb = pb_valuation(bvps, targets.get("PB"))
+    fair_ev_ebitda = ev_ebitda_valuation(
+        ebitda, net_debt, shares, targets.get("EV_EBITDA")
+    )
+    fair_ev_ebit = ev_ebit_valuation(
+        ebit, net_debt, shares, targets.get("EV_EBIT")
+    )
+    fair_ev_sales = ev_sales_valuation(
+        revenue, net_debt, shares, targets.get("EV_SALES")
+    )
+
+    valuations = {
+        "PE": {
+            "current_multiple": current["PE"],
+            "target_multiple": targets.get("PE"),
+            "fair_value": fair_pe,
+        },
+        "PB": {
+            "current_multiple": current["PB"],
+            "target_multiple": targets.get("PB"),
+            "fair_value": fair_pb,
+        },
+        "EV_EBITDA": {
+            "current_multiple": current["EV_EBITDA"],
+            "target_multiple": targets.get("EV_EBITDA"),
+            "fair_value": fair_ev_ebitda,
+        },
+        "EV_EBIT": {
+            "current_multiple": current["EV_EBIT"],
+            "target_multiple": targets.get("EV_EBIT"),
+            "fair_value": fair_ev_ebit,
+        },
+        "EV_SALES": {
+            "current_multiple": current["EV_SALES"],
+            "target_multiple": targets.get("EV_SALES"),
+            "fair_value": fair_ev_sales,
+        },
+    }
+
+    return valuations
+
+
+def combine_global_valuation(dcf_value: float, multiples_vals: dict, weights: dict, price: float):
+    """
+    Combine DCF + multiples avec pondération automatique.
+    Ne prend en compte que les méthodes pour lesquelles on a une fair value.
+    """
+    contributions = []
+    total_weight_used = 0.0
+
+    method_labels = {
+        "DCF": "DCF (intrinsèque)",
+        "PE": "P/E",
+        "PB": "P/B",
+        "EV_EBITDA": "EV/EBITDA",
+        "EV_EBIT": "EV/EBIT",
+        "EV_SALES": "EV/Sales",
+    }
+
+    details = []
+
+    for key, w in weights.items():
+        if w <= 0:
+            continue
+
+        if key == "DCF":
+            fv = dcf_value
+        else:
+            info = multiples_vals.get(key)
+            fv = info.get("fair_value") if info else None
+
+        if fv is None:
+            continue
+
+        contributions.append(fv * w)
+        total_weight_used += w
+
+        upside = None
+        if price not in (None, 0):
+            upside = (fv / price - 1) * 100
+
+        details.append(
+            {
+                "Méthode": method_labels.get(key, key),
+                "Poids utilisé": w,
+                "Fair value / action": fv,
+                "Upside (%)": upside,
+            }
+        )
+
+    if total_weight_used == 0:
+        return {
+            "fair_value_global": None,
+            "details": [],
+        }
+
+    fair_value_global = sum(contributions) / total_weight_used
+
+    if price not in (None, 0):
+        upside_global = (fair_value_global / price - 1) * 100
+    else:
+        upside_global = None
+
+    return {
+        "fair_value_global": fair_value_global,
+        "upside_global": upside_global,
+        "details": details,
+        "weight_sum_used": total_weight_used,
+    }
+
+
+# =========================================
 # PIPELINE PRINCIPAL POUR UNE SOCIÉTÉ
 # =========================================
 
@@ -488,6 +966,8 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     - Récupération fondamentaux + prix
     - Extraction des tableaux historiques
     - DCF + matrice de sensibilité
+    - Méthodes par multiples
+    - Classification + pondération + synthèse globale
     """
     ticker = None
     search_results = []
@@ -516,7 +996,8 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     if fcf_start is None:
         raise ValueError("Impossible d'estimer un FCF de départ à partir des états financiers.")
 
-    fv, ev, equity_value, tv_discounted, sum_disc_fcfs = dcf_fair_value_per_share(
+    # DCF
+    fv_dcf, ev, equity_value, tv_discounted, sum_disc_fcfs = dcf_fair_value_per_share(
         fcf_start=fcf_start,
         growth_fcf=growth_fcf,
         years=years,
@@ -526,10 +1007,10 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         shares=shares,
     )
 
-    if fv is None:
+    if fv_dcf is None:
         raise ValueError("Impossible de calculer une juste valeur par action avec ces paramètres (WACC/g).")
 
-    upside = (fv / price - 1) * 100
+    upside_dcf = (fv_dcf / price - 1) * 100
 
     projected_fcfs = project_fcf(fcf_start, growth_fcf, years)
     discounted_fcfs, _ = discount_cash_flows(projected_fcfs, wacc)
@@ -551,6 +1032,23 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         shares=shares,
     )
 
+    # Multiples
+    base_financials = extract_base_financials(fundamentals)
+    base_metrics = compute_base_multiples(price, shares, net_debt, base_financials)
+
+    # Classification + pondération
+    profile = classify_company_profile(company, base_metrics, hist_df)
+    weights = get_valuation_weights(profile)
+    targets = default_target_multiples(profile, base_metrics)
+    multiples_vals = compute_multiples_valuations(base_metrics, net_debt, shares, targets)
+
+    global_val = combine_global_valuation(
+        dcf_value=fv_dcf,
+        multiples_vals=multiples_vals,
+        weights=weights,
+        price=price,
+    )
+
     return {
         "ticker": ticker,
         "search_results": search_results,
@@ -562,14 +1060,21 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         "fcf_start": fcf_start,
         "proj_df": proj_df,
         "dcf": {
-            "fair_value_per_share": fv,
+            "fair_value_per_share": fv_dcf,
             "ev": ev,
             "equity_value": equity_value,
             "tv_discounted": tv_discounted,
             "sum_disc_fcfs": sum_disc_fcfs,
-            "upside_pct": upside,
+            "upside_pct": upside_dcf,
         },
         "sensitivity": sens_matrix,
+        "base_financials": base_financials,
+        "base_metrics": base_metrics,
+        "profile": profile,
+        "weights": weights,
+        "target_multiples": targets,
+        "multiples_valuations": multiples_vals,
+        "global_valuation": global_val,
     }
 
 
@@ -592,10 +1097,10 @@ def main():
             border-radius:1rem;
             margin-bottom:1.5rem;
         ">
-            <h1 style="color:white; margin:0;">📊 Application professionnelle de valorisation DCF</h1>
+            <h1 style="color:white; margin:0;">📊 Application professionnelle de valorisation DCF & Multiples</h1>
             <p style="color:#E5E7EB; margin:0.3rem 0 0;">
                 Analyse fondamentale d'une société via l'API EODHD : données historiques, projections sur 5 ans,
-                valorisation DCF détaillée et matrice de sensibilité (WACC / g).
+                valorisation DCF détaillée, méthodes par multiples et synthèse globale pondérée.
             </p>
         </div>
         """,
@@ -686,6 +1191,12 @@ def main():
 
     company = result["company"]
     dcf = result["dcf"]
+    profile = result["profile"]
+    base_metrics = result["base_metrics"]
+    multiples_vals = result["multiples_valuations"]
+    global_val = result["global_valuation"]
+    targets = result["target_multiples"]
+    weights = result["weights"]
 
     # Bandeau résumé
     col1, col2, col3, col4 = st.columns(4)
@@ -700,16 +1211,23 @@ def main():
         st.metric("Devise", company.get("Currency", "N/A"))
     with col4:
         st.metric("Prix de marché", f"{result['price']:.2f}")
-        st.metric("Juste valeur (DCF)", f"{dcf['fair_value_per_share']:.2f}")
+        st.metric("Juste valeur DCF", f"{dcf['fair_value_per_share']:.2f}")
 
     upside_color = "🟢" if dcf["upside_pct"] > 0 else "🔴"
     st.markdown(
-        f"**Upside / Downside estimé :** {upside_color} **{dcf['upside_pct']:.1f} %**"
+        f"**Upside / Downside DCF :** {upside_color} **{dcf['upside_pct']:.1f} %**"
     )
 
     # Tabs
-    tab_resume, tab_hist, tab_proj, tab_dcf = st.tabs(
-        ["Résumé DCF", "Historique 5 ans", "Projections FCF", "DCF & Sensibilité"]
+    tab_resume, tab_hist, tab_proj, tab_dcf, tab_mult, tab_synth = st.tabs(
+        [
+            "Résumé DCF",
+            "Historique 5 ans",
+            "Projections FCF",
+            "DCF & Sensibilité",
+            "Multiples & Comparables",
+            "Synthèse globale",
+        ]
     )
 
     # ----- TAB 1 : Résumé DCF -----
@@ -747,7 +1265,8 @@ def main():
 
         st.info(
             "Ce résumé présente le scénario central (base case). "
-            "La robustesse de la valorisation est analysée dans l'onglet « DCF & Sensibilité »."
+            "La robustesse de la valorisation est analysée dans l'onglet « DCF & Sensibilité » "
+            "et complétée par les méthodes par multiples."
         )
 
     # ----- TAB 2 : Historique -----
@@ -804,9 +1323,151 @@ def main():
         st.write(f"- Horizon : **{years} ans**")
 
         st.info(
-            "En pratique, tu peux te servir de la matrice pour fixer une **marge de sécurité** : "
-            "par exemple, retenir une valorisation cohérente même avec un WACC légèrement plus élevé "
-            "et un g plus faible que le scénario central."
+            "Le DCF reste la méthode intrinsèque principale pour les sociétés matures "
+            "avec des cash-flows prévisibles (notamment large caps). "
+            "Pour les small caps, d'autres méthodes (EV/Sales, EV/EBITDA...) peuvent être plus pertinentes."
+        )
+
+    # ----- TAB 5 : Multiples & Comparables -----
+    with tab_mult:
+        st.subheader("📊 Multiples & valorisations par comparables")
+
+        price = result["price"]
+        eps = base_metrics.get("eps")
+        bvps = base_metrics.get("bvps")
+
+        col_m1, col_m2, col_m3 = st.columns(3)
+        with col_m1:
+            st.metric("EPS (approx)", f"{eps:.2f}" if eps is not None else "N/A")
+            st.metric("BVPS (approx)", f"{bvps:.2f}" if bvps is not None else "N/A")
+        with col_m2:
+            st.metric("P/E courant", f"{base_metrics.get('pe'):.1f}" if base_metrics.get("pe") else "N/A")
+            st.metric("P/B courant", f"{base_metrics.get('pb'):.1f}" if base_metrics.get("pb") else "N/A")
+        with col_m3:
+            st.metric("EV/EBITDA courant", f"{base_metrics.get('ev_ebitda'):.1f}" if base_metrics.get("ev_ebitda") else "N/A")
+            st.metric("EV/Sales courant", f"{base_metrics.get('ev_sales'):.1f}" if base_metrics.get("ev_sales") else "N/A")
+
+        st.markdown("#### Multiples cibles et fair values implicites")
+
+        rows = []
+        method_order = ["PE", "PB", "EV_EBITDA", "EV_EBIT", "EV_SALES"]
+        labels = {
+            "PE": "P/E",
+            "PB": "P/B",
+            "EV_EBITDA": "EV/EBITDA",
+            "EV_EBIT": "EV/EBIT",
+            "EV_SALES": "EV/Sales",
+        }
+
+        for key in method_order:
+            info = multiples_vals.get(key)
+            if not info:
+                continue
+
+            fv = info.get("fair_value")
+            if fv is None:
+                continue
+
+            cur_mult = info.get("current_multiple")
+            tgt_mult = info.get("target_multiple")
+
+            upside = None
+            if price not in (None, 0):
+                upside = (fv / price - 1) * 100
+
+            rows.append(
+                {
+                    "Méthode": labels.get(key, key),
+                    "Multiple courant": cur_mult,
+                    "Multiple cible (hyp.)": tgt_mult,
+                    "Fair value / action": fv,
+                    "Upside (%)": upside,
+                }
+            )
+
+        if rows:
+            df_mult = pd.DataFrame(rows)
+            df_mult["Multiple courant"] = df_mult["Multiple courant"].round(2)
+            df_mult["Multiple cible (hyp.)"] = df_mult["Multiple cible (hyp.)"].round(2)
+            df_mult["Fair value / action"] = df_mult["Fair value / action"].round(2)
+            df_mult["Upside (%)"] = df_mult["Upside (%)"].round(1)
+
+            st.dataframe(df_mult, use_container_width=True)
+        else:
+            st.warning("Impossible de calculer des valorisations par multiples exploitables pour cette société.")
+
+        st.info(
+            "Les multiples cibles affichés sont des hypothèses génériques (à affiner par secteur et par style d'investissement). "
+            "L'objectif ici est de montrer la cohérence ou l'écart entre la valorisation DCF et les valorisations relatives."
+        )
+
+    # ----- TAB 6 : Synthèse globale -----
+    with tab_synth:
+        st.subheader("🧷 Synthèse globale de valorisation")
+
+        price = result["price"]
+        fair_global = global_val.get("fair_value_global")
+        upside_global = global_val.get("upside_global")
+
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            st.metric("Taille de capitalisation", profile.get("cap_size", "N/A"))
+            st.metric("Market cap approx.", format_large_number(profile.get("market_cap")))
+        with col_s2:
+            rev_cagr = profile.get("revenue_cagr")
+            if rev_cagr is not None:
+                rev_cagr_str = f"{rev_cagr*100:.1f} %/an"
+            else:
+                rev_cagr_str = "N/A"
+            ebit_margin = profile.get("ebit_margin")
+            if ebit_margin is not None:
+                ebit_margin_str = f"{ebit_margin*100:.1f} %"
+            else:
+                ebit_margin_str = "N/A"
+            st.metric("Croissance CA (approx)", rev_cagr_str)
+            st.metric("Marge EBIT (approx)", ebit_margin_str)
+        with col_s3:
+            st.metric("Juste valeur DCF", f"{dcf['fair_value_per_share']:.2f}")
+            st.metric(
+                "Juste valeur globale pondérée",
+                f"{fair_global:.2f}" if fair_global is not None else "N/A",
+            )
+
+        if upside_global is not None:
+            color_glob = "🟢" if upside_global > 0 else "🔴"
+            st.markdown(
+                f"**Upside / Downside global (DCF + multiples pondérés) :** "
+                f"{color_glob} **{upside_global:.1f} %**"
+            )
+
+        st.markdown("#### Détail des méthodes prises en compte dans la synthèse")
+
+        details = global_val.get("details", [])
+        if details:
+            df_det = pd.DataFrame(details)
+            df_det["Fair value / action"] = df_det["Fair value / action"].round(2)
+            df_det["Upside (%)"] = df_det["Upside (%)"].round(1)
+            df_det["Poids utilisé"] = df_det["Poids utilisé"].round(2)
+            st.dataframe(df_det, use_container_width=True)
+        else:
+            st.warning(
+                "Aucune méthode n'a pu être prise en compte dans la synthèse globale "
+                "(problème de données ou pondérations nulles)."
+            )
+
+        st.markdown("#### Rappel de la logique de pondération automatique")
+
+        st.write(
+            "- **Large Caps** : DCF dominant (60 %), complété par EV/EBITDA et P/E.  \n"
+            "- **Mid Caps** : DCF 40 %, EV/EBITDA 30 %, P/E 20 %, EV/Sales 10 %.  \n"
+            "- **Small Caps** : DCF neutralisé (0 %), focus sur EV/Sales, EV/EBITDA, P/E.  \n"
+            "- **Financières** : P/B et P/E privilégiés, DCF mis de côté."
+        )
+
+        st.info(
+            "Ces pondérations sont des hypothèses de travail inspirées des pratiques des analystes professionnels. "
+            "L'intérêt de ton outil est justement d'expliciter ces choix, de les affiner, "
+            "et de montrer que tu sais adapter la méthode au profil de la société analysée."
         )
 
 
