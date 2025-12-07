@@ -1324,7 +1324,7 @@ def main():
 
     # ----- TAB 3 : Projections FCF -----
         with tab_proj:
-        st.subheader("📈 Projections de FCF sur 5 ans (base case)")
+            st.subheader("📈 Projections de FCF sur 5 ans (base case)")
 
         proj_df = result["proj_df"]
 
