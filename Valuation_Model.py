@@ -392,7 +392,26 @@ def estimate_starting_fcf(fundamentals: dict):
         return None
 
     return float(operating_cf) - float(capex)
+    
+def estimate_normalized_fcf(hist_df: pd.DataFrame):
+    """
+    FCF normalisé (prioritaire pour Big Caps) :
+    - prend la série "FCF (approx)" de l'historique
+    - garde uniquement les FCF positifs (sinon non exploitable)
+    - retourne la moyenne des 3 derniers FCF positifs (plus stable qu'une seule année)
+    """
+    if hist_df is None or hist_df.empty:
+        return None
+    if "FCF (approx)" not in hist_df.columns:
+        return None
 
+    s = hist_df["FCF (approx)"].dropna()
+    s = s[s > 0]
+
+    if len(s) == 0:
+        return None
+
+    return float(s.tail(3).mean())
 
 # =========================================
 # EXTRACTION BASE POUR MULTIPLES
@@ -1147,7 +1166,10 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     profile = classify_company_profile(company, base_metrics, hist_df)
 
     # Estimation du FCF de départ (pour DCF éventuel)
-    fcf_start = estimate_starting_fcf(fundamentals)
+    fcf_last = estimate_starting_fcf(fundamentals)
+    fcf_norm = estimate_normalized_fcf(hist_df) 
+
+    fcf_start = fcf_norm if fcf_norm is not None else fcf_last
 
     # ===== DCF : seulement si la société n'est PAS small cap et si données suffisantes =====
     dcf_allowed = (
@@ -1296,24 +1318,24 @@ def main():
     )
     wacc_input = st.sidebar.number_input(
         "WACC (%)",
-        min_value=1.0,
-        max_value=20.0,
-        value=8.0,
-        step=0.5,
+        min_value=5.5,
+        max_value=8.0,
+        value=6.8,
+        step=0.1,
     )
     growth_fcf_input = st.sidebar.number_input(
         "Croissance annuelle FCF (%)",
-        min_value=-10.0,
-        max_value=20.0,
-        value=2.0,
-        step=0.5,
+        min_value=-1.5,
+        max_value=4.0,
+        value=3.0,
+        step=0.1,
     )
     g_terminal_input = st.sidebar.number_input(
         "Croissance long terme g (%)",
-        min_value=0.0,
-        max_value=5.0,
-        value=1.5,
-        step=0.25,
+        min_value=1.0,
+        max_value=2.0,
+        value=1.75,
+        step=0.05,
     )
 
     wacc = wacc_input / 100.0
