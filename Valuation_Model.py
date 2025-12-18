@@ -42,27 +42,26 @@ def search_instrument(query: str, api_key: str, limit: int = 10):
     r.raise_for_status()
     return r.json()
 
-def resolve_best_ticker(search_results, api_key):
+def resolve_best_ticker(search_results, api_key, preferred_country=None):
     """
-    Choisit le ticker le plus pertinent pour une big cap :
-    - Type = Common Stock (si disponible)
-    - Exchange dans une liste de places majeures
-    - Market cap estimée (price * shares) la plus élevée
+    Sélectionne le ticker le plus pertinent pour une big cap en combinant :
+    1) priorité au pays d'origine
+    2) priorité aux exchanges majeurs
+    3) market cap (price * shares)
     """
     if not search_results:
         return None
 
     valid_exchanges = {"PA", "XETRA", "NASDAQ", "NYSE", "LSE", "AMS", "MIL", "SW", "BRU", "STO"}
 
-    candidates = []
+    scored = []
+
     for item in search_results:
-        # Filtre "Type" si le champ existe
-        t = item.get("Type")
-        if t is not None and t != "Common Stock":
+        if item.get("Type") and item.get("Type") != "Common Stock":
             continue
 
-        exch = item.get("Exchange")
-        if exch is not None and exch not in valid_exchanges:
+        exchange = item.get("Exchange")
+        if exchange and exchange not in valid_exchanges:
             continue
 
         ticker = build_ticker_from_search_result(item)
@@ -71,25 +70,39 @@ def resolve_best_ticker(search_results, api_key):
 
         try:
             fundamentals = fetch_fundamentals(ticker, api_key)
-            shares = get_shares_outstanding(fundamentals)  # ta fonction robuste
+            shares = get_shares_outstanding(fundamentals)
             price = fetch_eod_price(ticker, api_key)
 
-            if shares and price:
-                market_cap = float(shares) * float(price)
-                candidates.append((ticker, market_cap))
+            if not shares or not price:
+                continue
+
+            market_cap = float(shares) * float(price)
+
+            score = 0
+
+            # 1️⃣ Priorité pays
+            country = fundamentals.get("General", {}).get("Country")
+            if preferred_country and country == preferred_country:
+                score += 100
+
+            # 2️⃣ Bonus exchange principal
+            if exchange in {"PA", "NYSE", "NASDAQ", "LSE"}:
+                score += 50
+
+            # 3️⃣ Market cap (log pour éviter qu’elle écrase tout)
+            score += math.log10(market_cap)
+
+            scored.append((ticker, score, country, exchange))
+
         except Exception:
             continue
 
-    if not candidates:
-        # fallback : au moins retourner un ticker construit
-        for item in search_results:
-            ticker = build_ticker_from_search_result(item)
-            if ticker:
-                return ticker
+    if not scored:
         return None
 
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    return candidates[0][0]
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[0][0]
+
 
 def build_ticker_from_search_result(item: dict) -> str:
     """
@@ -1122,12 +1135,11 @@ def combine_global_valuation(dcf_value: float, multiples_vals: dict, weights: di
 # =========================================
 # PIPELINE PRINCIPAL POUR UNE SOCIÉTÉ
 # =========================================
-
 def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fcf: float, g_terminal: float):
     """
     Pipeline complet :
     - Recherche par nom/ticker
-    - Résolution du ticker EODHD
+    - Résolution du ticker EODHD (priorité pays d'origine)
     - Récupération fondamentaux + prix
     - Extraction des tableaux historiques
     - Multiples & profil société
@@ -1137,41 +1149,76 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     ticker = None
     search_results = []
 
+    # =========================
     # Résolution du ticker
+    # =========================
     if "." in query and " " not in query:
         ticker = query.strip()
     else:
         search_results = search_instrument(query.strip(), api_key)
-        ticker = resolve_best_ticker(search_results, api_key)
         if not search_results:
             raise ValueError("Aucun instrument trouvé pour cette recherche.")
+
+        # Pays préféré (mapping simple pour éviter les mauvaises cotations)
+        q = query.lower().strip()
+        preferred_country = None
+
+        # France (Euronext Paris)
+        if q in ["airbus", "lvmh", "total", "totalenergies", "sanofi", "danone", "vinci", "schneider", "orange", "axa"]:
+            preferred_country = "France"
+        # Allemagne
+        elif q in ["siemens", "sap", "bmw", "mercedes", "volkswagen", "basf"]:
+            preferred_country = "Germany"
+        # UK
+        elif q in ["shell", "bp", "unilever", "astra", "astrazeneca"]:
+            preferred_country = "United Kingdom"
+        # Suisse
+        elif q in ["nestle", "roche", "novartis"]:
+            preferred_country = "Switzerland"
+        # USA (facultatif : utile si tu veux forcer les tickers US)
+        elif q in ["apple", "microsoft", "amazon", "google", "alphabet", "meta", "tesla", "nvidia", "berkshire"]:
+            preferred_country = "USA"
+
+        # ✅ Résolution robuste (priorité pays + exchanges majeurs + market cap)
+        ticker = resolve_best_ticker(search_results, api_key, preferred_country)
+
         if ticker is None:
             raise ValueError("Impossible de construire un ticker valide à partir du résultat de recherche.")
 
+    # =========================
     # Prix de marché
+    # =========================
     price = fetch_eod_price(ticker, api_key)
     if price is None:
         raise ValueError("Impossible de récupérer le cours de marché.")
 
+    # =========================
     # Fondamentaux bruts
+    # =========================
     fundamentals = fetch_fundamentals(ticker, api_key)
     company = get_company_summary(fundamentals)
     shares = get_shares_outstanding(fundamentals)
     net_debt = get_net_debt(fundamentals)
     hist_df = build_historical_table(fundamentals, max_years=5)
 
+    # =========================
     # Multiples & profil
+    # =========================
     base_financials = extract_base_financials(fundamentals)
     base_metrics = compute_base_multiples(price, shares, net_debt, base_financials)
     profile = classify_company_profile(company, base_metrics, hist_df)
 
+    # =========================
     # Estimation du FCF de départ (pour DCF éventuel)
+    # =========================
     fcf_last = estimate_starting_fcf(fundamentals)
-    fcf_norm = estimate_normalized_fcf(hist_df) 
+    fcf_norm = estimate_normalized_fcf(hist_df)
 
     fcf_start = fcf_norm if fcf_norm is not None else fcf_last
 
-    # ===== DCF : seulement si la société n'est PAS small cap et si données suffisantes =====
+    # =========================
+    # DCF : seulement si la société n'est PAS small cap et si données suffisantes
+    # =========================
     dcf_allowed = (
         profile.get("cap_size") != "SmallCap"
         and fcf_start is not None
@@ -1225,7 +1272,9 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         proj_df = pd.DataFrame()
         sens_matrix = pd.DataFrame()
 
-    # Multiples : cibles & valorisations
+    # =========================
+    # Multiples : cibles & valorisations (INCHANGÉ)
+    # =========================
     weights = get_valuation_weights(profile)
     targets = default_target_multiples(profile, base_metrics)
     multiples_vals = compute_multiples_valuations(base_metrics, net_debt, shares, targets)
