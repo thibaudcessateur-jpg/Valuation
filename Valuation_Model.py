@@ -1071,25 +1071,40 @@ def default_target_multiples(profile: dict, base_metrics: dict):
 
     return targets
 
-def compute_multiples_valuations(base_metrics: dict, net_debt, shares, targets: dict):
+def compute_multiples_valuations(base_metrics: dict, net_debt, shares, targets: dict, base_financials: dict = None):
     """
     Calcule les fair values par méthode de multiples en utilisant les cibles.
     Retourne un dict par méthode : multiple courant, multiple cible, fair value.
+
+    IMPORTANT :
+    - base_metrics = ratios déjà calculés (PE, EV/EBITDA, EV/Sales, PB...)
+    - base_financials = agrégats comptables bruts (revenue, ebitda, ebit, net_income, book_equity)
+      -> utilisé pour décider si un multiple est interprétable.
     """
 
-    # Prix implicite (pas obligatoire ici, mais on garde ta logique)
     price = None
     if base_metrics.get("market_cap") is not None and shares not in (None, 0):
         price = base_metrics["market_cap"] / shares
 
-    # Agrégats fondamentaux
+    # Agrégats : on prend en priorité base_metrics s'ils existent,
+    # sinon fallback sur base_financials (cas le plus fréquent chez toi)
+    base_financials = base_financials or {}
+
     eps = base_metrics.get("eps")
     bvps = base_metrics.get("bvps")
-    revenue = base_metrics.get("revenue")
-    ebitda = base_metrics.get("ebitda")
-    ebit = base_metrics.get("ebit")
 
-    # Multiples courants
+    revenue = base_metrics.get("revenue")
+    if revenue is None:
+        revenue = base_financials.get("revenue")
+
+    ebitda = base_metrics.get("ebitda")
+    if ebitda is None:
+        ebitda = base_financials.get("ebitda")
+
+    ebit = base_metrics.get("ebit")
+    if ebit is None:
+        ebit = base_financials.get("ebit")
+
     current = {
         "PE": base_metrics.get("pe"),
         "EV_EBITDA": base_metrics.get("ev_ebitda"),
@@ -1098,11 +1113,7 @@ def compute_multiples_valuations(base_metrics: dict, net_debt, shares, targets: 
         "PB": base_metrics.get("pb"),
     }
 
-    # ---------------------------------------------------------
-    # Nettoyage "marché" : si la grandeur est <= 0, le multiple
-    # n'est pas interprétable -> on neutralise la cible et la FV.
-    # ---------------------------------------------------------
-    # On clone targets pour ne pas modifier le dict d'entrée
+    # Nettoyage marché : on désactive uniquement les méthodes réellement non interprétables
     targets_clean = dict(targets or {})
 
     # PE : EPS doit être > 0
@@ -1125,9 +1136,7 @@ def compute_multiples_valuations(base_metrics: dict, net_debt, shares, targets: 
     if revenue is None or revenue <= 0:
         targets_clean["EV_SALES"] = None
 
-    # ---------------------------------------------------------
-    # Valorisations (si cible None -> fonctions doivent renvoyer None)
-    # ---------------------------------------------------------
+    # Valorisations
     fair_pe = pe_valuation(eps, targets_clean.get("PE"))
     fair_pb = pb_valuation(bvps, targets_clean.get("PB"))
 
@@ -1170,6 +1179,7 @@ def compute_multiples_valuations(base_metrics: dict, net_debt, shares, targets: 
     }
 
     return valuations
+
 
 
 def combine_global_valuation(dcf_value: float, multiples_vals: dict, weights: dict, price: float):
@@ -1386,7 +1396,7 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     # =========================
     weights = get_valuation_weights(profile)
     targets = default_target_multiples(profile, base_metrics)
-    multiples_vals = compute_multiples_valuations(base_metrics, net_debt, shares, targets)
+    multiples_vals = compute_multiples_valuations(base_metrics, net_debt, shares, targets, base_financials)
 
     # Synthèse globale DCF + multiples (si DCF absent, la pondération DCF est simplement ignorée)
     global_val = combine_global_valuation(
