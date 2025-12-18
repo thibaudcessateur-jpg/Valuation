@@ -962,7 +962,14 @@ def clamp(x, lo, hi):
 
 def safe_positive(x):
     return x is not None and x > 0
+    
+def clamp(x, lo, hi):
+    if x is None:
+        return None
+    return max(lo, min(hi, x))
 
+def safe_positive(x):
+    return x is not None and x > 0
 
 def default_target_multiples(profile: dict, base_metrics: dict):
     """
@@ -970,6 +977,8 @@ def default_target_multiples(profile: dict, base_metrics: dict):
     - calibrées selon le profil (quality / growth / value)
     - ancrées sur les multiples actuels si disponibles (PE, EV/EBITDA, EV/Sales, P/B)
     - bornées pour éviter les sorties absurdes
+    - IMPORTANT : renvoie des clés en MAJUSCULES ("PE", "PB", "EV_EBITDA", "EV_EBIT", "EV_SALES")
+      pour être compatible avec compute_multiples_valuations()
     """
 
     cap_size = (profile or {}).get("cap_size", "Unknown")
@@ -981,16 +990,14 @@ def default_target_multiples(profile: dict, base_metrics: dict):
     # Multiples "courants" calculés dans compute_base_multiples
     pe_current = base_metrics.get("pe")
     ev_ebitda_current = base_metrics.get("ev_ebitda")
+    ev_ebit_current = base_metrics.get("ev_ebit")
     ev_sales_current = base_metrics.get("ev_sales")
     pb_current = base_metrics.get("pb")
 
     # -----------------------------
     # 1) Définir un "tier" de valorisation
     # -----------------------------
-    # Objectif : sur des big caps quality/growth (Dassault Systèmes), augmenter les cibles
-    # Au contraire sur value/cycliques, rester plus bas.
     tier = "core"
-
     if quality == "High" and growth in ("High", "Structural", "AboveAverage"):
         tier = "quality_growth"
     elif style == "Growth":
@@ -1003,73 +1010,81 @@ def default_target_multiples(profile: dict, base_metrics: dict):
     # -----------------------------
     # 2) Multiplicateurs par tier
     # -----------------------------
-    # Ces coefficients ne sont pas “magiques” :
-    # ils reflètent l’écart typique de marché entre value/core et quality/growth.
     tier_mult = {
-        "low_quality":     {"pe": 0.85, "ev_ebitda": 0.85, "ev_sales": 0.90, "pb": 0.85},
-        "value":           {"pe": 0.95, "ev_ebitda": 0.95, "ev_sales": 0.95, "pb": 0.95},
-        "core":            {"pe": 1.05, "ev_ebitda": 1.05, "ev_sales": 1.05, "pb": 1.05},
-        "growth":          {"pe": 1.20, "ev_ebitda": 1.20, "ev_sales": 1.15, "pb": 1.15},
-        "quality_growth":  {"pe": 1.35, "ev_ebitda": 1.35, "ev_sales": 1.25, "pb": 1.25},
+        "low_quality":     {"pe": 0.85, "ev_ebitda": 0.85, "ev_ebit": 0.85, "ev_sales": 0.90, "pb": 0.85},
+        "value":           {"pe": 0.95, "ev_ebitda": 0.95, "ev_ebit": 0.95, "ev_sales": 0.95, "pb": 0.95},
+        "core":            {"pe": 1.05, "ev_ebitda": 1.05, "ev_ebit": 1.05, "ev_sales": 1.05, "pb": 1.05},
+        "growth":          {"pe": 1.20, "ev_ebitda": 1.20, "ev_ebit": 1.15, "ev_sales": 1.15, "pb": 1.15},
+        "quality_growth":  {"pe": 1.35, "ev_ebitda": 1.35, "ev_ebit": 1.25, "ev_sales": 1.25, "pb": 1.25},
     }
-
     m = tier_mult[tier]
 
     # -----------------------------
     # 3) Bornes réalistes (clamp)
     # -----------------------------
-    # Pour éviter que DS sorte à PE=15 (trop bas) ou PE=80 (trop haut), etc.
-    # Ajustement sectoriel (logiciels typiquement plus chers)
     software_like = sector in ("Technology", "Software", "Information Technology")
 
     pe_bounds = (12, 45) if not software_like else (18, 60)
     ev_ebitda_bounds = (6, 28) if not software_like else (10, 40)
+    ev_ebit_bounds = (6, 28) if not software_like else (10, 40)
     ev_sales_bounds = (0.5, 8.0) if not software_like else (1.0, 15.0)
     pb_bounds = (0.6, 10.0) if not software_like else (1.0, 20.0)
 
     # -----------------------------
-    # 4) Construction des cibles
+    # 4) Construction des cibles (CLÉS EN MAJUSCULES)
     # -----------------------------
     targets = {}
 
-    # P/E : ancré sur le PE courant si positif, sinon fallback par tier
+    # P/E
     if safe_positive(pe_current):
-        targets["pe"] = clamp(pe_current * m["pe"], *pe_bounds)
+        targets["PE"] = clamp(pe_current * m["pe"], *pe_bounds)
     else:
-        # fallback si PE courant non exploitable (EPS <= 0)
         base_pe = 16 if tier in ("value", "low_quality") else 22
         if tier in ("growth", "quality_growth"):
             base_pe = 30 if software_like else 24
-        targets["pe"] = clamp(base_pe, *pe_bounds)
+        targets["PE"] = clamp(base_pe, *pe_bounds)
 
-    # EV/EBITDA : même logique
+    # EV/EBITDA
     if safe_positive(ev_ebitda_current):
-        targets["ev_ebitda"] = clamp(ev_ebitda_current * m["ev_ebitda"], *ev_ebitda_bounds)
+        targets["EV_EBITDA"] = clamp(ev_ebitda_current * m["ev_ebitda"], *ev_ebitda_bounds)
     else:
         base_ev_ebitda = 10 if tier in ("value", "low_quality") else 14
         if tier in ("growth", "quality_growth"):
             base_ev_ebitda = 24 if software_like else 18
-        targets["ev_ebitda"] = clamp(base_ev_ebitda, *ev_ebitda_bounds)
+        targets["EV_EBITDA"] = clamp(base_ev_ebitda, *ev_ebitda_bounds)
 
-    # EV/Sales : utile surtout quand bénéfices volatils / non significatifs
+    # EV/EBIT (si ton base_metrics le calcule ; sinon on met None et c'est OK)
+    if safe_positive(ev_ebit_current):
+        targets["EV_EBIT"] = clamp(ev_ebit_current * m["ev_ebit"], *ev_ebit_bounds)
+    else:
+        # fallback raisonnable
+        base_ev_ebit = 10 if tier in ("value", "low_quality") else 14
+        if tier in ("growth", "quality_growth"):
+            base_ev_ebit = 22 if software_like else 17
+        targets["EV_EBIT"] = clamp(base_ev_ebit, *ev_ebit_bounds)
+
+    # EV/Sales
     if safe_positive(ev_sales_current):
-        targets["ev_sales"] = clamp(ev_sales_current * m["ev_sales"], *ev_sales_bounds)
+        targets["EV_SALES"] = clamp(ev_sales_current * m["ev_sales"], *ev_sales_bounds)
     else:
         base_ev_sales = 1.5 if tier in ("value", "low_quality") else 2.5
         if tier in ("growth", "quality_growth"):
             base_ev_sales = 8.0 if software_like else 4.0
-        targets["ev_sales"] = clamp(base_ev_sales, *ev_sales_bounds)
+        targets["EV_SALES"] = clamp(base_ev_sales, *ev_sales_bounds)
 
-    # P/B : ancré si dispo
+    # P/B
     if safe_positive(pb_current):
-        targets["pb"] = clamp(pb_current * m["pb"], *pb_bounds)
+        targets["PB"] = clamp(pb_current * m["pb"], *pb_bounds)
     else:
         base_pb = 1.2 if tier in ("value", "low_quality") else 2.0
         if tier in ("growth", "quality_growth"):
             base_pb = 6.0 if software_like else 3.0
-        targets["pb"] = clamp(base_pb, *pb_bounds)
+        targets["PB"] = clamp(base_pb, *pb_bounds)
 
     return targets
+
+
+
 
 def compute_multiples_valuations(base_metrics: dict, net_debt, shares, targets: dict, base_financials: dict = None):
     """
