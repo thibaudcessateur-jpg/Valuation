@@ -975,16 +975,14 @@ def default_target_multiples(profile: dict, base_metrics: dict):
     """
     Cibles de multiples plus réalistes :
     - calibrées selon le profil (quality / growth / value)
-    - ancrées sur les multiples actuels si disponibles (PE, EV/EBITDA, EV/Sales, P/B)
+    - ancrées sur les multiples actuels si disponibles
     - bornées pour éviter les sorties absurdes
-    - IMPORTANT : renvoie des clés en MAJUSCULES ("PE", "PB", "EV_EBITDA", "EV_EBIT", "EV_SALES")
-      pour être compatible avec compute_multiples_valuations()
+    - IMPORTANT : clés en MAJUSCULES pour être compatibles avec compute_multiples_valuations()
     """
 
-    cap_size = (profile or {}).get("cap_size", "Unknown")
-    style = (profile or {}).get("style", "Core")           # ex: "Value", "Core", "Growth"
-    quality = (profile or {}).get("quality", "Normal")     # ex: "High", "Normal", "Low"
-    growth = (profile or {}).get("growth", "Normal")       # ex: "High", "Normal", "Low"
+    style = (profile or {}).get("style", "Core")           # "Value", "Core", "Growth"
+    quality = (profile or {}).get("quality", "Normal")     # "High", "Normal", "Low"
+    growth = (profile or {}).get("growth", "Normal")       # "High", "Normal", ...
     sector = (profile or {}).get("sector", None)
 
     # Multiples "courants" calculés dans compute_base_multiples
@@ -995,7 +993,7 @@ def default_target_multiples(profile: dict, base_metrics: dict):
     pb_current = base_metrics.get("pb")
 
     # -----------------------------
-    # 1) Définir un "tier" de valorisation
+    # 1) Définir un "tier"
     # -----------------------------
     tier = "core"
     if quality == "High" and growth in ("High", "Structural", "AboveAverage"):
@@ -1008,14 +1006,25 @@ def default_target_multiples(profile: dict, base_metrics: dict):
         tier = "low_quality"
 
     # -----------------------------
-    # 2) Multiplicateurs par tier
+    # 2) Multiplicateurs par tier (DIFFÉRENTS PAR MÉTHODE)
     # -----------------------------
+    # Objectif : éviter que toutes les fair values = Price * k (même k partout)
     tier_mult = {
-        "low_quality":     {"pe": 0.85, "ev_ebitda": 0.85, "ev_ebit": 0.85, "ev_sales": 0.90, "pb": 0.85},
-        "value":           {"pe": 0.95, "ev_ebitda": 0.95, "ev_ebit": 0.95, "ev_sales": 0.95, "pb": 0.95},
-        "core":            {"pe": 1.05, "ev_ebitda": 1.05, "ev_ebit": 1.05, "ev_sales": 1.05, "pb": 1.05},
-        "growth":          {"pe": 1.20, "ev_ebitda": 1.20, "ev_ebit": 1.15, "ev_sales": 1.15, "pb": 1.15},
-        "quality_growth":  {"pe": 1.35, "ev_ebitda": 1.35, "ev_ebit": 1.25, "ev_sales": 1.25, "pb": 1.25},
+        "low_quality": {
+            "PE": 0.85, "PB": 0.80, "EV_EBITDA": 0.85, "EV_EBIT": 0.80, "EV_SALES": 0.90
+        },
+        "value": {
+            "PE": 0.95, "PB": 0.90, "EV_EBITDA": 0.95, "EV_EBIT": 0.92, "EV_SALES": 0.96
+        },
+        "core": {
+            "PE": 1.08, "PB": 1.03, "EV_EBITDA": 1.05, "EV_EBIT": 1.02, "EV_SALES": 1.06
+        },
+        "growth": {
+            "PE": 1.22, "PB": 1.12, "EV_EBITDA": 1.18, "EV_EBIT": 1.15, "EV_SALES": 1.16
+        },
+        "quality_growth": {
+            "PE": 1.35, "PB": 1.20, "EV_EBITDA": 1.28, "EV_EBIT": 1.25, "EV_SALES": 1.25
+        },
     }
     m = tier_mult[tier]
 
@@ -1030,14 +1039,14 @@ def default_target_multiples(profile: dict, base_metrics: dict):
     ev_sales_bounds = (0.5, 8.0) if not software_like else (1.0, 15.0)
     pb_bounds = (0.6, 10.0) if not software_like else (1.0, 20.0)
 
-    # -----------------------------
-    # 4) Construction des cibles (CLÉS EN MAJUSCULES)
-    # -----------------------------
     targets = {}
 
-    # P/E
+    # -----------------------------
+    # 4) Construction des cibles (MAJUSCULES)
+    # -----------------------------
+    # PE
     if safe_positive(pe_current):
-        targets["PE"] = clamp(pe_current * m["pe"], *pe_bounds)
+        targets["PE"] = clamp(pe_current * m["PE"], *pe_bounds)
     else:
         base_pe = 16 if tier in ("value", "low_quality") else 22
         if tier in ("growth", "quality_growth"):
@@ -1046,18 +1055,17 @@ def default_target_multiples(profile: dict, base_metrics: dict):
 
     # EV/EBITDA
     if safe_positive(ev_ebitda_current):
-        targets["EV_EBITDA"] = clamp(ev_ebitda_current * m["ev_ebitda"], *ev_ebitda_bounds)
+        targets["EV_EBITDA"] = clamp(ev_ebitda_current * m["EV_EBITDA"], *ev_ebitda_bounds)
     else:
         base_ev_ebitda = 10 if tier in ("value", "low_quality") else 14
         if tier in ("growth", "quality_growth"):
             base_ev_ebitda = 24 if software_like else 18
         targets["EV_EBITDA"] = clamp(base_ev_ebitda, *ev_ebitda_bounds)
 
-    # EV/EBIT (si ton base_metrics le calcule ; sinon on met None et c'est OK)
+    # EV/EBIT
     if safe_positive(ev_ebit_current):
-        targets["EV_EBIT"] = clamp(ev_ebit_current * m["ev_ebit"], *ev_ebit_bounds)
+        targets["EV_EBIT"] = clamp(ev_ebit_current * m["EV_EBIT"], *ev_ebit_bounds)
     else:
-        # fallback raisonnable
         base_ev_ebit = 10 if tier in ("value", "low_quality") else 14
         if tier in ("growth", "quality_growth"):
             base_ev_ebit = 22 if software_like else 17
@@ -1065,16 +1073,16 @@ def default_target_multiples(profile: dict, base_metrics: dict):
 
     # EV/Sales
     if safe_positive(ev_sales_current):
-        targets["EV_SALES"] = clamp(ev_sales_current * m["ev_sales"], *ev_sales_bounds)
+        targets["EV_SALES"] = clamp(ev_sales_current * m["EV_SALES"], *ev_sales_bounds)
     else:
         base_ev_sales = 1.5 if tier in ("value", "low_quality") else 2.5
         if tier in ("growth", "quality_growth"):
             base_ev_sales = 8.0 if software_like else 4.0
         targets["EV_SALES"] = clamp(base_ev_sales, *ev_sales_bounds)
 
-    # P/B
+    # PB
     if safe_positive(pb_current):
-        targets["PB"] = clamp(pb_current * m["pb"], *pb_bounds)
+        targets["PB"] = clamp(pb_current * m["PB"], *pb_bounds)
     else:
         base_pb = 1.2 if tier in ("value", "low_quality") else 2.0
         if tier in ("growth", "quality_growth"):
@@ -1082,8 +1090,6 @@ def default_target_multiples(profile: dict, base_metrics: dict):
         targets["PB"] = clamp(base_pb, *pb_bounds)
 
     return targets
-
-
 
 
 def compute_multiples_valuations(base_metrics: dict, net_debt, shares, targets: dict, base_financials: dict = None):
