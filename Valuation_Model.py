@@ -42,6 +42,54 @@ def search_instrument(query: str, api_key: str, limit: int = 10):
     r.raise_for_status()
     return r.json()
 
+def resolve_best_ticker(search_results, api_key):
+    """
+    Choisit le ticker le plus pertinent pour une big cap :
+    - Type = Common Stock (si disponible)
+    - Exchange dans une liste de places majeures
+    - Market cap estimée (price * shares) la plus élevée
+    """
+    if not search_results:
+        return None
+
+    valid_exchanges = {"PA", "XETRA", "NASDAQ", "NYSE", "LSE", "AMS", "MIL", "SW", "BRU", "STO"}
+
+    candidates = []
+    for item in search_results:
+        # Filtre "Type" si le champ existe
+        t = item.get("Type")
+        if t is not None and t != "Common Stock":
+            continue
+
+        exch = item.get("Exchange")
+        if exch is not None and exch not in valid_exchanges:
+            continue
+
+        ticker = build_ticker_from_search_result(item)
+        if not ticker:
+            continue
+
+        try:
+            fundamentals = fetch_fundamentals(ticker, api_key)
+            shares = get_shares_outstanding(fundamentals)  # ta fonction robuste
+            price = fetch_eod_price(ticker, api_key)
+
+            if shares and price:
+                market_cap = float(shares) * float(price)
+                candidates.append((ticker, market_cap))
+        except Exception:
+            continue
+
+    if not candidates:
+        # fallback : au moins retourner un ticker construit
+        for item in search_results:
+            ticker = build_ticker_from_search_result(item)
+            if ticker:
+                return ticker
+        return None
+
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    return candidates[0][0]
 
 def build_ticker_from_search_result(item: dict) -> str:
     """
@@ -1075,9 +1123,9 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         ticker = query.strip()
     else:
         search_results = search_instrument(query.strip(), api_key)
+        ticker = resolve_best_ticker(search_results, api_key)
         if not search_results:
             raise ValueError("Aucun instrument trouvé pour cette recherche.")
-        ticker = build_ticker_from_search_result(search_results[0])
         if ticker is None:
             raise ValueError("Impossible de construire un ticker valide à partir du résultat de recherche.")
 
