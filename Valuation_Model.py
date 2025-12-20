@@ -1635,6 +1635,32 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         "global_valuation": global_val,
     }
 
+def render_dcf_auto_panel(profile: dict):
+    """
+    Panneau d'aide : affiche des hypothèses prudentes (value) suggérées à partir du profil.
+    Ne modifie pas tes inputs, c'est uniquement informatif.
+    Requiert suggest_dcf_assumptions(profile).
+    """
+    if profile is None:
+        st.info("Profil indisponible : impossible de proposer des hypothèses auto.")
+        return None
+
+    sugg = suggest_dcf_assumptions(profile)
+
+    st.markdown("### 🎛️ Hypothèses DCF – aide (prudent / value)")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("WACC suggérée (%)", f"{sugg['wacc_base']:.2f}")
+    with c2:
+        st.metric("Croissance FCF suggérée (%)", f"{sugg['growth_fcf_base']:.2f}")
+    with c3:
+        st.metric("g terminal suggéré (%)", f"{sugg['g_terminal_base']:.2f}")
+
+    st.caption(
+        "Ces valeurs sont des hypothèses prudentes basées sur le profil (défensif/cyclique, taille). "
+        "Tu peux conserver tes hypothèses manuelles dans la sidebar."
+    )
+    return sugg
 
 # =========================================
 # STREAMLIT APP
