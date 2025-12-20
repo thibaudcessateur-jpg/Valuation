@@ -1701,13 +1701,11 @@ def main():
     st.sidebar.header("⚙️ Paramètres DCF (manuels)")
     years = st.sidebar.slider("Horizon de projection (années)", min_value=3, max_value=10, value=5)
 
-    # IMPORTANT : ici je suppose que ton app travaille en DECIMAL (0.068 = 6.8%).
-    # Si tu travailles en % (6.8), dis-le moi et je te donne la version adaptée.
     wacc_input_pct = st.sidebar.number_input("WACC (%)", min_value=0.0, max_value=30.0, value=6.80, step=0.10)
     growth_fcf_input_pct = st.sidebar.number_input("Croissance annuelle FCF (%)", min_value=-20.0, max_value=30.0, value=3.00, step=0.10)
     g_terminal_input_pct = st.sidebar.number_input("Croissance long terme g (%)", min_value=-5.0, max_value=10.0, value=1.75, step=0.05)
 
-    # Convertit en décimal pour le moteur
+    # Convertit en décimal pour le moteur (0.068 = 6.8%)
     wacc_input = wacc_input_pct / 100.0
     growth_fcf_input = growth_fcf_input_pct / 100.0
     g_terminal_input = g_terminal_input_pct / 100.0
@@ -1819,7 +1817,10 @@ def main():
                 st.metric("Valeur terminale actualisée", format_large_number(dcf.get("tv_discounted")))
                 st.metric("Valeur des capitaux propres", format_large_number(dcf.get("equity_value")))
             with col_c:
-                st.metric("Juste valeur / action", f"{dcf.get('fair_value_per_share'):.2f}" if dcf.get("fair_value_per_share") is not None else "N/A")
+                st.metric(
+                    "Juste valeur / action",
+                    f"{dcf.get('fair_value_per_share'):.2f}" if dcf.get("fair_value_per_share") is not None else "N/A"
+                )
                 st.metric("Nombre d'actions", format_large_number(result.get("shares")))
 
             st.markdown("#### Hypothèses retenues (base case)")
@@ -1858,7 +1859,6 @@ def main():
         if not multiples_vals:
             st.info("Multiples indisponibles.")
         else:
-            # Tu as déjà ton format ailleurs ; ici affichage simple et robuste
             rows = []
             for k, v in multiples_vals.items():
                 rows.append({
@@ -1876,6 +1876,7 @@ def main():
         else:
             fv = global_val.get("fair_value")
             up = global_val.get("upside_pct")
+
             if fv is not None:
                 st.metric("Fair Value globale", f"{fv:.2f}")
             else:
@@ -1885,29 +1886,6 @@ def main():
                 st.metric("Upside global (%)", f"{up:.1f} %")
             else:
                 st.metric("Upside global (%)", "N/A")
-
-# =========================================
-# UPSIDE / MESSAGE DCF
-# =========================================
-upside_pct = dcf.get("upside_pct")
-if dcf_active and upside_pct is not None:
-    upside_color = "🟢" if upside_pct > 0 else "🔴"
-    st.markdown(
-        f"**Upside / Downside DCF :** {upside_color} **{upside_pct:.1f} %**"
-    )
-else:
-    st.info(
-        "Le modèle DCF n’est pas utilisé pour ce profil "
-        "(small cap, société financière ou données insuffisantes)."
-    )
-
-
-# =========================================
-# PANNEAU D'AIDE DCF (AUTO / PRUDENT)
-# =========================================
-if dcf_active:
-    render_dcf_auto_panel(profile)
-
 
 # =========================================
 # ONGLET DYNAMIQUES SELON LE PROFIL
