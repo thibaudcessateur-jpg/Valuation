@@ -1886,7 +1886,3 @@ def main():
                 st.metric("Upside global (%)", f"{up:.1f} %")
             else:
                 st.metric("Upside global (%)", "N/A")
-
-# =========================================
-# ONGLET DYNAMIQUES SELON LE PROFIL
-# =========================================
