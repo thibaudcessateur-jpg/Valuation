@@ -963,7 +963,6 @@ def clamp(x, lo, hi):
 def safe_positive(x):
     return x is not None and x > 0
 
-
 def default_target_multiples(profile: dict, base_metrics: dict):
     """
     Cibles de multiples plus réalistes :
@@ -1058,6 +1057,8 @@ def default_target_multiples(profile: dict, base_metrics: dict):
     targets.setdefault("EV_EBIT", None)
 
     return targets
+
+
 
 
 def compute_multiples_valuations(base_metrics: dict, net_debt, shares, targets: dict, base_financials: dict = None):
