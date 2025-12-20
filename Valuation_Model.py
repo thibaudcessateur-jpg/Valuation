@@ -1886,3 +1886,207 @@ def main():
                 st.metric("Upside global (%)", f"{up:.1f} %")
             else:
                 st.metric("Upside global (%)", "N/A")
+# =========================================
+# ONGLET DYNAMIQUES SELON LE PROFIL (VERSION PROPRE)
+# =========================================
+if dcf_active:
+    tab_resume, tab_hist, tab_proj, tab_dcf, tab_mult, tab_synth = st.tabs(
+        [
+            "Résumé DCF",
+            "Historique 5 ans",
+            "Projections FCF",
+            "DCF & Sensibilité",
+            "Multiples & Comparables",
+            "Synthèse globale",
+        ]
+    )
+else:
+    tab_hist, tab_mult, tab_synth = st.tabs(
+        [
+            "Historique 5 ans",
+            "Multiples & Comparables",
+            "Synthèse globale",
+        ]
+    )
+
+# =========================================
+# CONTENU DES ONGLETS
+# =========================================
+
+# ----- TAB : Résumé DCF (uniquement si actif) -----
+if dcf_active:
+    with tab_resume:
+        st.subheader("🎯 Résumé de la valorisation DCF (base case)")
+
+        ev = dcf.get("ev")
+        sum_disc_fcfs = dcf.get("sum_disc_fcfs")
+        tv_discounted = dcf.get("tv_discounted")
+        equity_value = dcf.get("equity_value")
+        fair_value_per_share = dcf.get("fair_value_per_share")
+
+        shares = result.get("shares")
+        net_debt = result.get("net_debt")
+        fcf_start = result.get("fcf_start")
+
+        col_a, col_b, col_c = st.columns(3)
+        with col_a:
+            st.metric("Valeur d'entreprise (EV)", format_large_number(ev))
+            st.metric("Somme FCF actualisés", format_large_number(sum_disc_fcfs))
+        with col_b:
+            st.metric("Valeur terminale actualisée", format_large_number(tv_discounted))
+            st.metric("Valeur des capitaux propres", format_large_number(equity_value))
+        with col_c:
+            if fair_value_per_share is not None:
+                st.metric("Juste valeur / action", f"{fair_value_per_share:,.2f}")
+            else:
+                st.metric("Juste valeur / action", "N/A")
+            st.metric("Nombre d'actions", format_large_number(shares))
+
+        st.markdown("#### Hypothèses retenues (base case)")
+        st.write(f"- Horizon de projection : **{years} ans**")
+        st.write(f"- WACC : **{wacc_input_pct:.2f} %**")
+        st.write(f"- Croissance FCF : **{growth_fcf_input_pct:.2f} % / an**")
+        st.write(f"- g de long terme : **{g_terminal_input_pct:.2f} %**")
+        st.write(f"- Dette nette utilisée : **{format_large_number(net_debt)}**")
+        st.write(f"- FCF de départ estimé : **{format_large_number(fcf_start)}**")
+
+        st.info(
+            "Ce résumé présente le scénario central (base case). "
+            "La robustesse est analysée dans « DCF & Sensibilité »."
+        )
+
+# ----- TAB : Historique -----
+with tab_hist:
+    st.subheader("📚 Données historiques (5 dernières années)")
+
+    hist_df = result.get("hist_df")
+    if hist_df is None or getattr(hist_df, "empty", True):
+        st.warning("Impossible de construire un historique complet à partir des données disponibles.")
+    else:
+        df_display = scale_df_to_millions(hist_df)
+        numeric_cols = [c for c in df_display.columns if c != "Année"]
+        for c in numeric_cols:
+            df_display[c] = pd.to_numeric(df_display[c], errors="coerce").round(2)
+
+        st.dataframe(df_display, use_container_width=True)
+        st.caption("Unités : millions de la devise de reporting.")
+
+# ----- TAB : Projections FCF (uniquement si actif) -----
+if dcf_active:
+    with tab_proj:
+        st.subheader("📈 Projections de FCF")
+
+        proj_df = result.get("proj_df")
+        if proj_df is None or getattr(proj_df, "empty", True):
+            st.warning("Projections de FCF indisponibles.")
+        else:
+            proj_df = proj_df.copy()
+            for c in ["FCF projeté", "FCF actualisé"]:
+                if c in proj_df.columns:
+                    proj_df[c] = pd.to_numeric(proj_df[c], errors="coerce").round(0)
+            st.dataframe(proj_df, use_container_width=True)
+
+# ----- TAB : DCF & Sensibilité (uniquement si actif) -----
+if dcf_active:
+    with tab_dcf:
+        st.subheader("🧮 DCF détaillé et matrice de sensibilité")
+
+        sens_df = result.get("sensitivity")
+        if sens_df is None or getattr(sens_df, "empty", True):
+            st.warning("Matrice de sensibilité DCF indisponible.")
+        else:
+            st.markdown("#### Matrice de sensibilité (juste valeur / action)")
+            st.dataframe(sens_df.round(2), use_container_width=True)
+
+# ----- TAB : Multiples -----
+with tab_mult:
+    st.subheader("📊 Multiples & valorisations par comparables")
+
+    price = result.get("price")
+
+    if not multiples_vals:
+        st.warning("Multiples indisponibles.")
+    else:
+        rows = []
+        method_order = ["PE", "PB", "EV_EBITDA", "EV_EBIT", "EV_SALES"]
+        labels = {
+            "PE": "P/E",
+            "PB": "P/B",
+            "EV_EBITDA": "EV/EBITDA",
+            "EV_EBIT": "EV/EBIT",
+            "EV_SALES": "EV/Sales",
+        }
+
+        for key in method_order:
+            info = multiples_vals.get(key)
+            if not info:
+                continue
+
+            fv = info.get("fair_value")
+            cur_mult = info.get("current_multiple")
+            tgt_mult = info.get("target_multiple")
+
+            upside = None
+            if fv is not None and price not in (None, 0):
+                upside = (fv / price - 1) * 100
+
+            rows.append(
+                {
+                    "Méthode": labels.get(key, key),
+                    "Multiple courant": cur_mult,
+                    "Multiple cible (hyp.)": tgt_mult,
+                    "Fair value / action": fv,
+                    "Upside (%)": upside,
+                }
+            )
+
+        if rows:
+            df_mult = pd.DataFrame(rows)
+            for c in ["Multiple courant", "Multiple cible (hyp.)", "Fair value / action"]:
+                df_mult[c] = pd.to_numeric(df_mult[c], errors="coerce").round(2)
+            df_mult["Upside (%)"] = pd.to_numeric(df_mult["Upside (%)"], errors="coerce").round(1)
+
+            st.dataframe(df_mult, use_container_width=True)
+        else:
+            st.warning("Impossible de calculer des valorisations par multiples exploitables pour cette société.")
+
+# ----- TAB : Synthèse -----
+with tab_synth:
+    st.subheader("🧷 Synthèse globale de valorisation")
+
+    price = result.get("price")
+    fair_global = (global_val or {}).get("fair_value_global")
+    upside_global = (global_val or {}).get("upside_global")
+
+    col_s1, col_s2, col_s3 = st.columns(3)
+    with col_s1:
+        st.metric("Taille de capitalisation", profile.get("cap_size", "N/A"))
+        st.metric("Market cap approx.", format_large_number(profile.get("market_cap")))
+    with col_s2:
+        rev_cagr = profile.get("revenue_cagr")
+        ebit_margin = profile.get("ebit_margin")
+        st.metric("Croissance CA (approx)", f"{rev_cagr*100:.1f} %/an" if rev_cagr is not None else "N/A")
+        st.metric("Marge EBIT (approx)", f"{ebit_margin*100:.1f} %" if ebit_margin is not None else "N/A")
+    with col_s3:
+        if dcf_active and dcf.get("fair_value_per_share") is not None:
+            st.metric("Juste valeur DCF", f"{dcf['fair_value_per_share']:.2f}")
+        else:
+            st.metric("Juste valeur DCF", "N/A")
+        st.metric("Juste valeur globale pondérée", f"{fair_global:.2f}" if fair_global is not None else "N/A")
+
+    if upside_global is not None:
+        color_glob = "🟢" if upside_global > 0 else "🔴"
+        st.markdown(f"**Upside / Downside global :** {color_glob} **{upside_global:.1f} %**")
+
+    details = (global_val or {}).get("details", [])
+    if details:
+        df_det = pd.DataFrame(details)
+        if "Fair value / action" in df_det.columns:
+            df_det["Fair value / action"] = pd.to_numeric(df_det["Fair value / action"], errors="coerce").round(2)
+        if "Upside (%)" in df_det.columns:
+            df_det["Upside (%)"] = pd.to_numeric(df_det["Upside (%)"], errors="coerce").round(1)
+        if "Poids utilisé" in df_det.columns:
+            df_det["Poids utilisé"] = pd.to_numeric(df_det["Poids utilisé"], errors="coerce").round(2)
+        st.dataframe(df_det, use_container_width=True)
+    else:
+        st.info("Aucune méthode n'a pu être prise en compte dans la synthèse globale.")
