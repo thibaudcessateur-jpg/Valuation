@@ -851,112 +851,41 @@ def compute_revenue_cagr(hist_df: pd.DataFrame):
         return cagr
     except Exception:
         return None
-        
+
+
 def classify_company_profile(company: dict, base_metrics: dict, hist_df: pd.DataFrame):
     """
-    Classe la société (taille, secteur, cyclicité, défensif)
-    + fournit des indicateurs simples utilisés pour :
-    - pondération DCF / multiples
-    - hypothèses DCF prudentes
+    Classe la société en Small / Mid / Large + quelques infos utiles.
     """
-
-    # -----------------------------
-    # Données de base
-    # -----------------------------
-    sector_raw = company.get("Sector") or ""
-    sector = sector_raw.lower()
-
+    sector = (company.get("Sector") or "").lower()
     market_cap = base_metrics.get("market_cap")
     revenue = base_metrics.get("revenue")
     ebit = base_metrics.get("ebit")
 
-    # -----------------------------
-    # Capitalisation (seuils réalistes marché)
-    # -----------------------------
+    # Capitalisation (seuils plus réalistes)
     if market_cap is None:
         cap_size = "Unknown"
-    elif market_cap < 2_000_000_000:          # < 2 Mds
+    elif market_cap < 2_000_000_000:        # < 2 Mds
         cap_size = "SmallCap"
-    elif market_cap < 10_000_000_000:         # 2–10 Mds
+    elif market_cap < 10_000_000_000:       # 2–10 Mds
         cap_size = "MidCap"
     else:
         cap_size = "LargeCap"
 
-    # -----------------------------
     # Marge EBIT
-    # -----------------------------
     ebit_margin = None
     if ebit is not None and revenue not in (None, 0):
         ebit_margin = ebit / revenue
 
-    # -----------------------------
-    # Croissance du chiffre d'affaires (CAGR historique)
-    # -----------------------------
+    # Croissance CA
     rev_cagr = compute_revenue_cagr(hist_df)
 
-    # -----------------------------
-    # Tags sectoriels
-    # -----------------------------
+    # Tag sectoriel spécial pour financières
     is_financial = any(
         kw in sector
         for kw in ["financial", "bank", "insurance", "assurance"]
     )
 
-    # Cyclicité (heuristique simple et prudente)
-    cyclical_keywords = [
-        "industrial",
-        "materials",
-        "energy",
-        "automotive",
-        "airlines",
-        "travel",
-        "construction",
-        "chemicals",
-        "metals"
-    ]
-    is_cyclical = any(kw in sector for kw in cyclical_keywords)
-
-    # Défensif (consommation de base, santé, utilities)
-    defensive_keywords = [
-        "consumer defensive",
-        "consumer staples",
-        "utilities",
-        "healthcare",
-        "pharmaceutical",
-        "telecom"
-    ]
-    is_defensive = any(kw in sector for kw in defensive_keywords)
-
-    # -----------------------------
-    # Style / qualité (heuristique value-prudente)
-    # -----------------------------
-    quality = "Normal"
-    growth = "Normal"
-    style = "Core"
-
-    # Qualité : marge élevée et stable
-    if ebit_margin is not None and ebit_margin > 0.20:
-        quality = "High"
-
-    # Croissance : CAGR CA significatif mais raisonnable
-    if rev_cagr is not None and rev_cagr > 0.05:
-        growth = "AboveAverage"
-    if rev_cagr is not None and rev_cagr > 0.10:
-        growth = "High"
-
-    # Style
-    if quality == "High" and growth in ("AboveAverage", "High"):
-        style = "Growth"
-    elif quality == "High":
-        style = "Quality"
-    elif growth == "High":
-        style = "Growth"
-    else:
-        style = "Value"
-
-    # -----------------------------
-    # Profil final
-    # -----------------------------
     profile = {
         "sector": company.get("Sector"),
         "cap_size": cap_size,
@@ -964,13 +893,7 @@ def classify_company_profile(company: dict, base_metrics: dict, hist_df: pd.Data
         "ebit_margin": ebit_margin,
         "revenue_cagr": rev_cagr,
         "is_financial": is_financial,
-        "is_cyclical": is_cyclical,
-        "is_defensive": is_defensive,
-        "quality": quality,
-        "growth": growth,
-        "style": style,
     }
-
     return profile
 
 
@@ -1030,6 +953,7 @@ def get_valuation_weights(profile: dict):
         "EV_SALES": 0.2,
         "PB": 0.0,
     }
+
 def clamp(x, lo, hi):
     if x is None:
         return None
@@ -1038,112 +962,35 @@ def clamp(x, lo, hi):
 
 def safe_positive(x):
     return x is not None and x > 0
-    
-def clamp(x, lo, hi):
-    if x is None:
-        return None
-    return max(lo, min(hi, x))
 
-def safe_positive(x):
-    return x is not None and x > 0
-
-def suggest_dcf_assumptions(profile: dict):
-    """
-    Propose des hypothèses DCF prudentes (value investing).
-    Retourne des % (pas des décimaux) pour affichage / UI.
-    """
-    profile = profile or {}
-
-    cap_size = profile.get("cap_size", "Unknown")
-    is_financial = profile.get("is_financial", False)
-    is_cyclical = profile.get("is_cyclical", False)
-    is_defensive = profile.get("is_defensive", False)
-
-    # Base prudente “Large cap mature”
-    wacc_base = 6.8
-    growth_base = 2.5
-    g_base = 1.5
-
-    # Ajustements prudents
-    # Financières : DCF souvent moins adapté, mais si tu l’utilises, rester conservateur
-    if is_financial:
-        wacc_base = 7.5
-        growth_base = 2.0
-        g_base = 1.25
-
-    # Cyclicité : on monte le risque (WACC) et on baisse g
-    if is_cyclical:
-        wacc_base += 0.6
-        g_base -= 0.25
-        growth_base = min(growth_base, 2.5)
-
-    # Défensif : on baisse légèrement WACC, croissance souvent modérée
-    if is_defensive:
-        wacc_base -= 0.3
-        growth_base = min(growth_base, 2.5)
-        g_base = min(g_base, 1.6)
-
-    # Taille : mid cap = un peu plus risqué
-    if cap_size == "MidCap":
-        wacc_base += 0.4
-        g_base = min(g_base, 1.5)
-    elif cap_size == "SmallCap":
-        # (Tu as dit qu’on met de côté les small caps pour l’instant)
-        wacc_base += 1.0
-        g_base = min(g_base, 1.25)
-        growth_base = min(growth_base, 2.0)
-
-    # Bornes prudentes globales (pour éviter exagération)
-    wacc_base = float(max(5.8, min(9.5, wacc_base)))
-    growth_base = float(max(-1.0, min(4.0, growth_base)))
-    g_base = float(max(0.75, min(2.0, g_base)))
-
-    # Ranges utiles pour sensibilité / UI (prudents)
-    wacc_min = max(5.5, wacc_base - 0.6)
-    wacc_max = min(10.5, wacc_base + 0.8)
-
-    g_min = max(0.75, g_base - 0.35)
-    g_max = min(2.25, g_base + 0.25)
-
-    growth_min = max(-2.0, growth_base - 1.0)
-    growth_max = min(6.0, growth_base + 1.5)
-
-    return {
-        "wacc_base": wacc_base,
-        "growth_fcf_base": growth_base,
-        "g_terminal_base": g_base,
-        "ranges": {
-            "wacc": (wacc_min, wacc_max),
-            "growth_fcf": (growth_min, growth_max),
-            "g_terminal": (g_min, g_max),
-        },
-    }
 
 def default_target_multiples(profile: dict, base_metrics: dict):
     """
     Cibles de multiples plus réalistes :
     - calibrées selon le profil (quality / growth / value)
-    - ancrées sur les multiples actuels si disponibles
+    - ancrées sur les multiples actuels si disponibles (PE, EV/EBITDA, EV/Sales, P/B)
     - bornées pour éviter les sorties absurdes
-    - IMPORTANT : clés en MAJUSCULES pour être compatibles avec compute_multiples_valuations()
     """
 
-    style = (profile or {}).get("style", "Core")           # "Value", "Core", "Growth"
-    quality = (profile or {}).get("quality", "Normal")     # "High", "Normal", "Low"
-    growth = (profile or {}).get("growth", "Normal")       # "High", "Normal", ...
+    cap_size = (profile or {}).get("cap_size", "Unknown")
+    style = (profile or {}).get("style", "Core")           # ex: "Value", "Core", "Growth"
+    quality = (profile or {}).get("quality", "Normal")     # ex: "High", "Normal", "Low"
+    growth = (profile or {}).get("growth", "Normal")       # ex: "High", "Normal", "Low"
     sector = (profile or {}).get("sector", None)
 
     # Multiples "courants" calculés dans compute_base_multiples
     pe_current = base_metrics.get("pe")
     ev_ebitda_current = base_metrics.get("ev_ebitda")
-    ev_ebit_current = base_metrics.get("ev_ebit")
     ev_sales_current = base_metrics.get("ev_sales")
     pb_current = base_metrics.get("pb")
 
     # -----------------------------
-    # 1) Définir un "tier"
+    # 1) Définir un "tier" de valorisation
     # -----------------------------
+    # Objectif : sur des big caps quality/growth (Dassault Systèmes), augmenter les cibles
+    # Au contraire sur value/cycliques, rester plus bas.
     tier = "core"
+
     if quality == "High" and growth in ("High", "Structural", "AboveAverage"):
         tier = "quality_growth"
     elif style == "Growth":
@@ -1154,91 +1001,75 @@ def default_target_multiples(profile: dict, base_metrics: dict):
         tier = "low_quality"
 
     # -----------------------------
-    # 2) Multiplicateurs par tier (DIFFÉRENTS PAR MÉTHODE)
+    # 2) Multiplicateurs par tier
     # -----------------------------
-    # Objectif : éviter que toutes les fair values = Price * k (même k partout)
+    # Ces coefficients ne sont pas “magiques” :
+    # ils reflètent l’écart typique de marché entre value/core et quality/growth.
     tier_mult = {
-        "low_quality": {
-            "PE": 0.85, "PB": 0.80, "EV_EBITDA": 0.85, "EV_EBIT": 0.80, "EV_SALES": 0.90
-        },
-        "value": {
-            "PE": 0.95, "PB": 0.90, "EV_EBITDA": 0.95, "EV_EBIT": 0.92, "EV_SALES": 0.96
-        },
-        "core": {
-            "PE": 1.08, "PB": 1.03, "EV_EBITDA": 1.05, "EV_EBIT": 1.02, "EV_SALES": 1.06
-        },
-        "growth": {
-            "PE": 1.22, "PB": 1.12, "EV_EBITDA": 1.18, "EV_EBIT": 1.15, "EV_SALES": 1.16
-        },
-        "quality_growth": {
-            "PE": 1.35, "PB": 1.20, "EV_EBITDA": 1.28, "EV_EBIT": 1.25, "EV_SALES": 1.25
-        },
+        "low_quality":     {"pe": 0.85, "ev_ebitda": 0.85, "ev_sales": 0.90, "pb": 0.85},
+        "value":           {"pe": 0.95, "ev_ebitda": 0.95, "ev_sales": 0.95, "pb": 0.95},
+        "core":            {"pe": 1.05, "ev_ebitda": 1.05, "ev_sales": 1.05, "pb": 1.05},
+        "growth":          {"pe": 1.20, "ev_ebitda": 1.20, "ev_sales": 1.15, "pb": 1.15},
+        "quality_growth":  {"pe": 1.35, "ev_ebitda": 1.35, "ev_sales": 1.25, "pb": 1.25},
     }
+
     m = tier_mult[tier]
 
     # -----------------------------
     # 3) Bornes réalistes (clamp)
     # -----------------------------
+    # Pour éviter que DS sorte à PE=15 (trop bas) ou PE=80 (trop haut), etc.
+    # Ajustement sectoriel (logiciels typiquement plus chers)
     software_like = sector in ("Technology", "Software", "Information Technology")
 
     pe_bounds = (12, 45) if not software_like else (18, 60)
     ev_ebitda_bounds = (6, 28) if not software_like else (10, 40)
-    ev_ebit_bounds = (6, 28) if not software_like else (10, 40)
     ev_sales_bounds = (0.5, 8.0) if not software_like else (1.0, 15.0)
     pb_bounds = (0.6, 10.0) if not software_like else (1.0, 20.0)
 
+    # -----------------------------
+    # 4) Construction des cibles
+    # -----------------------------
     targets = {}
 
-    # -----------------------------
-    # 4) Construction des cibles (MAJUSCULES)
-    # -----------------------------
-    # PE
+    # P/E : ancré sur le PE courant si positif, sinon fallback par tier
     if safe_positive(pe_current):
-        targets["PE"] = clamp(pe_current * m["PE"], *pe_bounds)
+        targets["pe"] = clamp(pe_current * m["pe"], *pe_bounds)
     else:
+        # fallback si PE courant non exploitable (EPS <= 0)
         base_pe = 16 if tier in ("value", "low_quality") else 22
         if tier in ("growth", "quality_growth"):
             base_pe = 30 if software_like else 24
-        targets["PE"] = clamp(base_pe, *pe_bounds)
+        targets["pe"] = clamp(base_pe, *pe_bounds)
 
-    # EV/EBITDA
+    # EV/EBITDA : même logique
     if safe_positive(ev_ebitda_current):
-        targets["EV_EBITDA"] = clamp(ev_ebitda_current * m["EV_EBITDA"], *ev_ebitda_bounds)
+        targets["ev_ebitda"] = clamp(ev_ebitda_current * m["ev_ebitda"], *ev_ebitda_bounds)
     else:
         base_ev_ebitda = 10 if tier in ("value", "low_quality") else 14
         if tier in ("growth", "quality_growth"):
             base_ev_ebitda = 24 if software_like else 18
-        targets["EV_EBITDA"] = clamp(base_ev_ebitda, *ev_ebitda_bounds)
+        targets["ev_ebitda"] = clamp(base_ev_ebitda, *ev_ebitda_bounds)
 
-    # EV/EBIT
-    if safe_positive(ev_ebit_current):
-        targets["EV_EBIT"] = clamp(ev_ebit_current * m["EV_EBIT"], *ev_ebit_bounds)
-    else:
-        base_ev_ebit = 10 if tier in ("value", "low_quality") else 14
-        if tier in ("growth", "quality_growth"):
-            base_ev_ebit = 22 if software_like else 17
-        targets["EV_EBIT"] = clamp(base_ev_ebit, *ev_ebit_bounds)
-
-    # EV/Sales
+    # EV/Sales : utile surtout quand bénéfices volatils / non significatifs
     if safe_positive(ev_sales_current):
-        targets["EV_SALES"] = clamp(ev_sales_current * m["EV_SALES"], *ev_sales_bounds)
+        targets["ev_sales"] = clamp(ev_sales_current * m["ev_sales"], *ev_sales_bounds)
     else:
         base_ev_sales = 1.5 if tier in ("value", "low_quality") else 2.5
         if tier in ("growth", "quality_growth"):
             base_ev_sales = 8.0 if software_like else 4.0
-        targets["EV_SALES"] = clamp(base_ev_sales, *ev_sales_bounds)
+        targets["ev_sales"] = clamp(base_ev_sales, *ev_sales_bounds)
 
-    # PB
+    # P/B : ancré si dispo
     if safe_positive(pb_current):
-        targets["PB"] = clamp(pb_current * m["PB"], *pb_bounds)
+        targets["pb"] = clamp(pb_current * m["pb"], *pb_bounds)
     else:
         base_pb = 1.2 if tier in ("value", "low_quality") else 2.0
         if tier in ("growth", "quality_growth"):
             base_pb = 6.0 if software_like else 3.0
-        targets["PB"] = clamp(base_pb, *pb_bounds)
+        targets["pb"] = clamp(base_pb, *pb_bounds)
 
     return targets
-
 
 def compute_multiples_valuations(base_metrics: dict, net_debt, shares, targets: dict, base_financials: dict = None):
     """
@@ -1419,25 +1250,6 @@ def combine_global_valuation(dcf_value: float, multiples_vals: dict, weights: di
         "weight_sum_used": total_weight_used,
     }
 
-def apply_value_guardrails(wacc: float, growth_fcf: float, g_terminal: float):
-    """
-    Garde-fous prudents (value investing) pour éviter des hypothèses incohérentes.
-    Entrées / sorties en décimal :
-    - wacc=0.068 -> 6.8%
-    - growth_fcf=0.03 -> 3%
-    - g_terminal=0.0175 -> 1.75%
-    """
-
-    # 1) Bornes prudentes globales
-    wacc = max(0.045, min(0.14, wacc))               # 4.5% à 14%
-    growth_fcf = max(-0.05, min(0.08, growth_fcf))   # -5% à +8%
-    g_terminal = max(0.005, min(0.025, g_terminal))  # 0.5% à 2.5%
-
-    # 2) Contrainte structurelle : g terminal < WACC
-    if g_terminal >= wacc:
-        g_terminal = max(0.005, wacc - 0.01)         # marge de sécurité 1%
-
-    return wacc, growth_fcf, g_terminal
 
 # =========================================
 # PIPELINE PRINCIPAL POUR UNE SOCIÉTÉ
@@ -1491,7 +1303,7 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
 
         if ticker is None:
             raise ValueError("Impossible de construire un ticker valide à partir du résultat de recherche.")
-            
+
     # =========================
     # Prix de marché
     # =========================
@@ -1520,18 +1332,11 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     # =========================
     fcf_last = estimate_starting_fcf(fundamentals)
     fcf_norm = estimate_normalized_fcf(hist_df)
+
     fcf_start = fcf_norm if fcf_norm is not None else fcf_last
 
     # =========================
-    # Garde-fous prudents (value investing) sur les paramètres DCF
-    # =========================
-    wacc, growth_fcf, g_terminal = apply_value_guardrails(
-        wacc, growth_fcf, g_terminal
-    )
-
-    # =========================
-    # DCF : seulement si la société n'est PAS small cap
-    # et si les données sont suffisantes
+    # DCF : seulement si la société n'est PAS small cap et si données suffisantes
     # =========================
     dcf_allowed = (
         profile.get("cap_size") != "SmallCap"
@@ -1555,12 +1360,9 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         else:
             upside_dcf = None
 
-        # =========================
         # Projections FCF & sensibilité
-        # =========================
         projected_fcfs = project_fcf(fcf_start, growth_fcf, years)
         discounted_fcfs, _ = discount_cash_flows(projected_fcfs, wacc)
-
         proj_df = pd.DataFrame(
             {
                 "Année": [f"Année {i}" for i in range(1, years + 1)],
@@ -1578,11 +1380,8 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             net_debt=net_debt,
             shares=shares,
         )
-
     else:
-        # =========================
-        # DCF non pertinent → neutralisation complète
-        # =========================
+        # DCF non pertinent ou impossible → on neutralise toutes les sorties DCF
         fv_dcf = None
         ev = None
         equity_value = None
@@ -1635,32 +1434,6 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         "global_valuation": global_val,
     }
 
-def render_dcf_auto_panel(profile: dict):
-    """
-    Panneau d'aide : affiche des hypothèses prudentes (value) suggérées à partir du profil.
-    Ne modifie pas tes inputs, c'est uniquement informatif.
-    Requiert suggest_dcf_assumptions(profile).
-    """
-    if profile is None:
-        st.info("Profil indisponible : impossible de proposer des hypothèses auto.")
-        return None
-
-    sugg = suggest_dcf_assumptions(profile)
-
-    st.markdown("### 🎛️ Hypothèses DCF – aide (prudent / value)")
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.metric("WACC suggérée (%)", f"{sugg['wacc_base']:.2f}")
-    with c2:
-        st.metric("Croissance FCF suggérée (%)", f"{sugg['growth_fcf_base']:.2f}")
-    with c3:
-        st.metric("g terminal suggéré (%)", f"{sugg['g_terminal_base']:.2f}")
-
-    st.caption(
-        "Ces valeurs sont des hypothèses prudentes basées sur le profil (défensif/cyclique, taille). "
-        "Tu peux conserver tes hypothèses manuelles dans la sidebar."
-    )
-    return sugg
 
 # =========================================
 # STREAMLIT APP
@@ -1769,84 +1542,58 @@ def main():
         st.stop()
         return
 
-# =========================================
-# MISE EN PAGE AVEC TABS
-# =========================================
+    # =========================================
+    # MISE EN PAGE AVEC TABS
+    # =========================================
 
-company = result["company"]
-dcf = result["dcf"]
-profile = result["profile"]
-base_metrics = result["base_metrics"]
-multiples_vals = result["multiples_valuations"]
-global_val = result["global_valuation"]
-targets = result["target_multiples"]
-weights = result["weights"]
+    company = result["company"]
+    dcf = result["dcf"]
+    profile = result["profile"]
+    base_metrics = result["base_metrics"]
+    multiples_vals = result["multiples_valuations"]
+    global_val = result["global_valuation"]
+    targets = result["target_multiples"]
+    weights = result["weights"]
+    dcf_active = dcf.get("fair_value_per_share") is not None
 
-dcf_active = dcf.get("fair_value_per_share") is not None
 
+    # Bandeau résumé
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Société", company.get("Name", "N/A"))
+        st.metric("Ticker EODHD", result["ticker"])
+    with col2:
+        st.metric("Secteur", company.get("Sector", "N/A"))
+        st.metric("Industrie", company.get("Industry", "N/A"))
+    with col3:
+        st.metric("Pays", company.get("Country", "N/A"))
+        st.metric("Devise", company.get("Currency", "N/A"))
+    with col4:
+        st.metric("Prix de marché", f"{result['price']:.2f}")
+        if dcf_active:
+            st.metric("Juste valeur DCF", f"{dcf['fair_value_per_share']:.2f}")
+        else:
+            st.metric("Juste valeur DCF", "N/A")
 
-# =========================================
-# BANDEAU RÉSUMÉ
-# =========================================
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.metric("Société", company.get("Name", "N/A"))
-    st.metric("Ticker EODHD", result["ticker"])
-with col2:
-    st.metric("Secteur", company.get("Sector", "N/A"))
-    st.metric("Industrie", company.get("Industry", "N/A"))
-with col3:
-    st.metric("Pays", company.get("Country", "N/A"))
-    st.metric("Devise", company.get("Currency", "N/A"))
-with col4:
-    st.metric("Prix de marché", f"{result['price']:.2f}")
-    if dcf_active:
-        st.metric("Juste valeur DCF", f"{dcf['fair_value_per_share']:.2f}")
+    upside_pct = dcf.get("upside_pct")
+    if dcf_active and upside_pct is not None:
+        upside_color = "🟢" if upside_pct > 0 else "🔴"
+        st.markdown(
+            f"**Upside / Downside DCF :** {upside_color} **{upside_pct:.1f} %**"
+        )
     else:
-        st.metric("Juste valeur DCF", "N/A")
+        st.markdown(
+            "**DCF non utilisé pour ce profil (small cap ou données insuffisantes).**"
+        )
 
 
-# =========================================
-# UPSIDE / MESSAGE DCF
-# =========================================
-upside_pct = dcf.get("upside_pct")
-if dcf_active and upside_pct is not None:
-    upside_color = "🟢" if upside_pct > 0 else "🔴"
-    st.markdown(
-        f"**Upside / Downside DCF :** {upside_color} **{upside_pct:.1f} %**"
-    )
-else:
-    st.info(
-        "Le modèle DCF n’est pas utilisé pour ce profil "
-        "(small cap, société financière ou données insuffisantes)."
-    )
-
-
-# =========================================
-# PANNEAU D'AIDE DCF (AUTO / PRUDENT)
-# =========================================
-if dcf_active:
-    render_dcf_auto_panel(profile)
-
-
-# =========================================
-# ONGLET DYNAMIQUES SELON LE PROFIL
-# =========================================
-if dcf_active:
+    # Tabs
     tab_resume, tab_hist, tab_proj, tab_dcf, tab_mult, tab_synth = st.tabs(
         [
             "Résumé DCF",
             "Historique 5 ans",
             "Projections FCF",
             "DCF & Sensibilité",
-            "Multiples & Comparables",
-            "Synthèse globale",
-        ]
-    )
-else:
-    tab_hist, tab_mult, tab_synth = st.tabs(
-        [
-            "Historique 5 ans",
             "Multiples & Comparables",
             "Synthèse globale",
         ]
