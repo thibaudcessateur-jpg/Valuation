@@ -851,41 +851,112 @@ def compute_revenue_cagr(hist_df: pd.DataFrame):
         return cagr
     except Exception:
         return None
-
-
+        
 def classify_company_profile(company: dict, base_metrics: dict, hist_df: pd.DataFrame):
     """
-    Classe la société en Small / Mid / Large + quelques infos utiles.
+    Classe la société (taille, secteur, cyclicité, défensif)
+    + fournit des indicateurs simples utilisés pour :
+    - pondération DCF / multiples
+    - hypothèses DCF prudentes
     """
-    sector = (company.get("Sector") or "").lower()
+
+    # -----------------------------
+    # Données de base
+    # -----------------------------
+    sector_raw = company.get("Sector") or ""
+    sector = sector_raw.lower()
+
     market_cap = base_metrics.get("market_cap")
     revenue = base_metrics.get("revenue")
     ebit = base_metrics.get("ebit")
 
-    # Capitalisation (seuils plus réalistes)
+    # -----------------------------
+    # Capitalisation (seuils réalistes marché)
+    # -----------------------------
     if market_cap is None:
         cap_size = "Unknown"
-    elif market_cap < 2_000_000_000:        # < 2 Mds
+    elif market_cap < 2_000_000_000:          # < 2 Mds
         cap_size = "SmallCap"
-    elif market_cap < 10_000_000_000:       # 2–10 Mds
+    elif market_cap < 10_000_000_000:         # 2–10 Mds
         cap_size = "MidCap"
     else:
         cap_size = "LargeCap"
 
+    # -----------------------------
     # Marge EBIT
+    # -----------------------------
     ebit_margin = None
     if ebit is not None and revenue not in (None, 0):
         ebit_margin = ebit / revenue
 
-    # Croissance CA
+    # -----------------------------
+    # Croissance du chiffre d'affaires (CAGR historique)
+    # -----------------------------
     rev_cagr = compute_revenue_cagr(hist_df)
 
-    # Tag sectoriel spécial pour financières
+    # -----------------------------
+    # Tags sectoriels
+    # -----------------------------
     is_financial = any(
         kw in sector
         for kw in ["financial", "bank", "insurance", "assurance"]
     )
 
+    # Cyclicité (heuristique simple et prudente)
+    cyclical_keywords = [
+        "industrial",
+        "materials",
+        "energy",
+        "automotive",
+        "airlines",
+        "travel",
+        "construction",
+        "chemicals",
+        "metals"
+    ]
+    is_cyclical = any(kw in sector for kw in cyclical_keywords)
+
+    # Défensif (consommation de base, santé, utilities)
+    defensive_keywords = [
+        "consumer defensive",
+        "consumer staples",
+        "utilities",
+        "healthcare",
+        "pharmaceutical",
+        "telecom"
+    ]
+    is_defensive = any(kw in sector for kw in defensive_keywords)
+
+    # -----------------------------
+    # Style / qualité (heuristique value-prudente)
+    # -----------------------------
+    quality = "Normal"
+    growth = "Normal"
+    style = "Core"
+
+    # Qualité : marge élevée et stable
+    if ebit_margin is not None and ebit_margin > 0.20:
+        quality = "High"
+
+    # Croissance : CAGR CA significatif mais raisonnable
+    if rev_cagr is not None and rev_cagr > 0.05:
+        growth = "AboveAverage"
+    if rev_cagr is not None and rev_cagr > 0.10:
+        growth = "High"
+
+    # Style
+    if quality == "High" and growth in ("AboveAverage", "High"):
+        style = "Growth"
+    elif quality == "High":
+        style = "Quality"
+    elif growth == "High":
+        style = "Growth"
+    else:
+        style = "Value"
+
+    # -----------------------------
+    # Profil final
+    # -----------------------------
     profile = {
         "sector": company.get("Sector"),
         "cap_size": cap_size,
@@ -893,7 +964,13 @@ def classify_company_profile(company: dict, base_metrics: dict, hist_df: pd.Data
         "ebit_margin": ebit_margin,
         "revenue_cagr": rev_cagr,
         "is_financial": is_financial,
+        "is_cyclical": is_cyclical,
+        "is_defensive": is_defensive,
+        "quality": quality,
+        "growth": growth,
+        "style": style,
     }
+
     return profile
 
 
@@ -953,7 +1030,6 @@ def get_valuation_weights(profile: dict):
         "EV_SALES": 0.2,
         "PB": 0.0,
     }
-
 def clamp(x, lo, hi):
     if x is None:
         return None
@@ -970,6 +1046,78 @@ def clamp(x, lo, hi):
 
 def safe_positive(x):
     return x is not None and x > 0
+
+def suggest_dcf_assumptions(profile: dict):
+    """
+    Propose des hypothèses DCF prudentes (value investing).
+    Retourne des % (pas des décimaux) pour affichage / UI.
+    """
+    profile = profile or {}
+
+    cap_size = profile.get("cap_size", "Unknown")
+    is_financial = profile.get("is_financial", False)
+    is_cyclical = profile.get("is_cyclical", False)
+    is_defensive = profile.get("is_defensive", False)
+
+    # Base prudente “Large cap mature”
+    wacc_base = 6.8
+    growth_base = 2.5
+    g_base = 1.5
+
+    # Ajustements prudents
+    # Financières : DCF souvent moins adapté, mais si tu l’utilises, rester conservateur
+    if is_financial:
+        wacc_base = 7.5
+        growth_base = 2.0
+        g_base = 1.25
+
+    # Cyclicité : on monte le risque (WACC) et on baisse g
+    if is_cyclical:
+        wacc_base += 0.6
+        g_base -= 0.25
+        growth_base = min(growth_base, 2.5)
+
+    # Défensif : on baisse légèrement WACC, croissance souvent modérée
+    if is_defensive:
+        wacc_base -= 0.3
+        growth_base = min(growth_base, 2.5)
+        g_base = min(g_base, 1.6)
+
+    # Taille : mid cap = un peu plus risqué
+    if cap_size == "MidCap":
+        wacc_base += 0.4
+        g_base = min(g_base, 1.5)
+    elif cap_size == "SmallCap":
+        # (Tu as dit qu’on met de côté les small caps pour l’instant)
+        wacc_base += 1.0
+        g_base = min(g_base, 1.25)
+        growth_base = min(growth_base, 2.0)
+
+    # Bornes prudentes globales (pour éviter exagération)
+    wacc_base = float(max(5.8, min(9.5, wacc_base)))
+    growth_base = float(max(-1.0, min(4.0, growth_base)))
+    g_base = float(max(0.75, min(2.0, g_base)))
+
+    # Ranges utiles pour sensibilité / UI (prudents)
+    wacc_min = max(5.5, wacc_base - 0.6)
+    wacc_max = min(10.5, wacc_base + 0.8)
+
+    g_min = max(0.75, g_base - 0.35)
+    g_max = min(2.25, g_base + 0.25)
+
+    growth_min = max(-2.0, growth_base - 1.0)
+    growth_max = min(6.0, growth_base + 1.5)
+
+    return {
+        "wacc_base": wacc_base,
+        "growth_fcf_base": growth_base,
+        "g_terminal_base": g_base,
+        "ranges": {
+            "wacc": (wacc_min, wacc_max),
+            "growth_fcf": (growth_min, growth_max),
+            "g_terminal": (g_min, g_max),
+        },
+    }
 
 def default_target_multiples(profile: dict, base_metrics: dict):
     """
@@ -1271,6 +1419,25 @@ def combine_global_valuation(dcf_value: float, multiples_vals: dict, weights: di
         "weight_sum_used": total_weight_used,
     }
 
+def apply_value_guardrails(wacc: float, growth_fcf: float, g_terminal: float):
+    """
+    Garde-fous prudents (value investing) pour éviter des hypothèses incohérentes.
+    Entrées / sorties en décimal :
+    - wacc=0.068 -> 6.8%
+    - growth_fcf=0.03 -> 3%
+    - g_terminal=0.0175 -> 1.75%
+    """
+
+    # 1) Bornes prudentes globales
+    wacc = max(0.045, min(0.14, wacc))               # 4.5% à 14%
+    growth_fcf = max(-0.05, min(0.08, growth_fcf))   # -5% à +8%
+    g_terminal = max(0.005, min(0.025, g_terminal))  # 0.5% à 2.5%
+
+    # 2) Contrainte structurelle : g terminal < WACC
+    if g_terminal >= wacc:
+        g_terminal = max(0.005, wacc - 0.01)         # marge de sécurité 1%
+
+    return wacc, growth_fcf, g_terminal
 
 # =========================================
 # PIPELINE PRINCIPAL POUR UNE SOCIÉTÉ
@@ -1324,7 +1491,7 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
 
         if ticker is None:
             raise ValueError("Impossible de construire un ticker valide à partir du résultat de recherche.")
-
+            
     # =========================
     # Prix de marché
     # =========================
@@ -1353,11 +1520,18 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     # =========================
     fcf_last = estimate_starting_fcf(fundamentals)
     fcf_norm = estimate_normalized_fcf(hist_df)
-
     fcf_start = fcf_norm if fcf_norm is not None else fcf_last
 
     # =========================
-    # DCF : seulement si la société n'est PAS small cap et si données suffisantes
+    # Garde-fous prudents (value investing) sur les paramètres DCF
+    # =========================
+    wacc, growth_fcf, g_terminal = apply_value_guardrails(
+        wacc, growth_fcf, g_terminal
+    )
+
+    # =========================
+    # DCF : seulement si la société n'est PAS small cap
+    # et si les données sont suffisantes
     # =========================
     dcf_allowed = (
         profile.get("cap_size") != "SmallCap"
@@ -1381,9 +1555,12 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         else:
             upside_dcf = None
 
+        # =========================
         # Projections FCF & sensibilité
+        # =========================
         projected_fcfs = project_fcf(fcf_start, growth_fcf, years)
         discounted_fcfs, _ = discount_cash_flows(projected_fcfs, wacc)
+
         proj_df = pd.DataFrame(
             {
                 "Année": [f"Année {i}" for i in range(1, years + 1)],
@@ -1401,8 +1578,11 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             net_debt=net_debt,
             shares=shares,
         )
+
     else:
-        # DCF non pertinent ou impossible → on neutralise toutes les sorties DCF
+        # =========================
+        # DCF non pertinent → neutralisation complète
+        # =========================
         fv_dcf = None
         ev = None
         equity_value = None
@@ -1563,58 +1743,84 @@ def main():
         st.stop()
         return
 
-    # =========================================
-    # MISE EN PAGE AVEC TABS
-    # =========================================
+# =========================================
+# MISE EN PAGE AVEC TABS
+# =========================================
 
-    company = result["company"]
-    dcf = result["dcf"]
-    profile = result["profile"]
-    base_metrics = result["base_metrics"]
-    multiples_vals = result["multiples_valuations"]
-    global_val = result["global_valuation"]
-    targets = result["target_multiples"]
-    weights = result["weights"]
-    dcf_active = dcf.get("fair_value_per_share") is not None
+company = result["company"]
+dcf = result["dcf"]
+profile = result["profile"]
+base_metrics = result["base_metrics"]
+multiples_vals = result["multiples_valuations"]
+global_val = result["global_valuation"]
+targets = result["target_multiples"]
+weights = result["weights"]
+
+dcf_active = dcf.get("fair_value_per_share") is not None
 
 
-    # Bandeau résumé
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("Société", company.get("Name", "N/A"))
-        st.metric("Ticker EODHD", result["ticker"])
-    with col2:
-        st.metric("Secteur", company.get("Sector", "N/A"))
-        st.metric("Industrie", company.get("Industry", "N/A"))
-    with col3:
-        st.metric("Pays", company.get("Country", "N/A"))
-        st.metric("Devise", company.get("Currency", "N/A"))
-    with col4:
-        st.metric("Prix de marché", f"{result['price']:.2f}")
-        if dcf_active:
-            st.metric("Juste valeur DCF", f"{dcf['fair_value_per_share']:.2f}")
-        else:
-            st.metric("Juste valeur DCF", "N/A")
-
-    upside_pct = dcf.get("upside_pct")
-    if dcf_active and upside_pct is not None:
-        upside_color = "🟢" if upside_pct > 0 else "🔴"
-        st.markdown(
-            f"**Upside / Downside DCF :** {upside_color} **{upside_pct:.1f} %**"
-        )
+# =========================================
+# BANDEAU RÉSUMÉ
+# =========================================
+col1, col2, col3, col4 = st.columns(4)
+with col1:
+    st.metric("Société", company.get("Name", "N/A"))
+    st.metric("Ticker EODHD", result["ticker"])
+with col2:
+    st.metric("Secteur", company.get("Sector", "N/A"))
+    st.metric("Industrie", company.get("Industry", "N/A"))
+with col3:
+    st.metric("Pays", company.get("Country", "N/A"))
+    st.metric("Devise", company.get("Currency", "N/A"))
+with col4:
+    st.metric("Prix de marché", f"{result['price']:.2f}")
+    if dcf_active:
+        st.metric("Juste valeur DCF", f"{dcf['fair_value_per_share']:.2f}")
     else:
-        st.markdown(
-            "**DCF non utilisé pour ce profil (small cap ou données insuffisantes).**"
-        )
+        st.metric("Juste valeur DCF", "N/A")
 
 
-    # Tabs
+# =========================================
+# UPSIDE / MESSAGE DCF
+# =========================================
+upside_pct = dcf.get("upside_pct")
+if dcf_active and upside_pct is not None:
+    upside_color = "🟢" if upside_pct > 0 else "🔴"
+    st.markdown(
+        f"**Upside / Downside DCF :** {upside_color} **{upside_pct:.1f} %**"
+    )
+else:
+    st.info(
+        "Le modèle DCF n’est pas utilisé pour ce profil "
+        "(small cap, société financière ou données insuffisantes)."
+    )
+
+
+# =========================================
+# PANNEAU D'AIDE DCF (AUTO / PRUDENT)
+# =========================================
+if dcf_active:
+    render_dcf_auto_panel(profile)
+
+
+# =========================================
+# ONGLET DYNAMIQUES SELON LE PROFIL
+# =========================================
+if dcf_active:
     tab_resume, tab_hist, tab_proj, tab_dcf, tab_mult, tab_synth = st.tabs(
         [
             "Résumé DCF",
             "Historique 5 ans",
             "Projections FCF",
             "DCF & Sensibilité",
+            "Multiples & Comparables",
+            "Synthèse globale",
+        ]
+    )
+else:
+    tab_hist, tab_mult, tab_synth = st.tabs(
+        [
+            "Historique 5 ans",
             "Multiples & Comparables",
             "Synthèse globale",
         ]
