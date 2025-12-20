@@ -1635,150 +1635,256 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         "global_valuation": global_val,
     }
 
+def render_dcf_auto_panel(profile: dict):
+    """
+    Panneau d'aide : affiche des hypothèses prudentes (value) suggérées à partir du profil.
+    Ne modifie pas tes inputs, c'est uniquement informatif.
+    Requiert suggest_dcf_assumptions(profile).
+    """
+    if profile is None:
+        st.info("Profil indisponible : impossible de proposer des hypothèses auto.")
+        return None
+
+    sugg = suggest_dcf_assumptions(profile)
+
+    st.markdown("### 🎛️ Hypothèses DCF – aide (prudent / value)")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("WACC suggérée (%)", f"{sugg['wacc_base']:.2f}")
+    with c2:
+        st.metric("Croissance FCF suggérée (%)", f"{sugg['growth_fcf_base']:.2f}")
+    with c3:
+        st.metric("g terminal suggéré (%)", f"{sugg['g_terminal_base']:.2f}")
+
+    st.caption(
+        "Ces valeurs sont des hypothèses prudentes basées sur le profil (défensif/cyclique, taille). "
+        "Tu peux conserver tes hypothèses manuelles dans la sidebar."
+    )
+    return sugg
+    
+def apply_value_guardrails(wacc: float, growth_fcf: float, g_terminal: float):
+    """
+    Garde-fous prudents (value investing).
+    Entrées/sorties en décimal :
+    - wacc=0.068 => 6.8%
+    - growth_fcf=0.03 => 3%
+    - g_terminal=0.0175 => 1.75%
+    """
+
+    # Bornes prudentes
+    wacc = max(0.045, min(0.14, wacc))               # 4.5% à 14%
+    growth_fcf = max(-0.05, min(0.08, growth_fcf))   # -5% à +8%
+    g_terminal = max(0.005, min(0.025, g_terminal))  # 0.5% à 2.5%
+
+    # Contrainte structurelle : g < WACC (sinon TV explosive)
+    if g_terminal >= wacc:
+        g_terminal = max(0.005, wacc - 0.01)         # marge de sécurité 1%
+
+    return wacc, growth_fcf, g_terminal
 
 # =========================================
 # STREAMLIT APP
 # =========================================
 
 def main():
-    st.set_page_config(
-        page_title="DCF Valuation Pro - EODHD",
-        layout="wide"
-    )
+    st.set_page_config(page_title="Valuation Model", layout="wide")
 
-    # En-tête
-    st.markdown(
-        """
-        <div style="
-            background-color:#0F172A;
-            padding:1.5rem 1rem;
-            border-radius:1rem;
-            margin-bottom:1.5rem;
-        ">
-            <h1 style="color:white; margin:0;">📊 Application professionnelle de valorisation DCF & Multiples</h1>
-            <p style="color:#E5E7EB; margin:0.3rem 0 0;">
-                Analyse fondamentale d'une société via l'API EODHD : données historiques, projections sur 5 ans,
-                valorisation DCF détaillée, méthodes par multiples et synthèse globale pondérée.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    st.title("📈 Valuation Model – DCF & Multiples (EODHD)")
 
-    # Sidebar
-    st.sidebar.header("⚙️ Paramètres généraux")
+    # =========================
+    # SIDEBAR : Inputs
+    # =========================
+    st.sidebar.header("🔎 Recherche")
+    api_key = st.sidebar.text_input("Clé API EODHD", type="password")
+    query = st.sidebar.text_input("Ticker ou nom de société", value="AAPL.US")
 
-    api_key = get_api_key()
+    st.sidebar.header("⚙️ Paramètres DCF (manuels)")
+    years = st.sidebar.slider("Horizon de projection (années)", min_value=3, max_value=10, value=5)
 
-    query = st.sidebar.text_input(
-        "Nom de la société ou ticker (ex : 'LVMH', 'AAPL.US', 'Airbus')",
-        value="AAPL.US"
-    )
+    # IMPORTANT : ici je suppose que ton app travaille en DECIMAL (0.068 = 6.8%).
+    # Si tu travailles en % (6.8), dis-le moi et je te donne la version adaptée.
+    wacc_input_pct = st.sidebar.number_input("WACC (%)", min_value=0.0, max_value=30.0, value=6.80, step=0.10)
+    growth_fcf_input_pct = st.sidebar.number_input("Croissance annuelle FCF (%)", min_value=-20.0, max_value=30.0, value=3.00, step=0.10)
+    g_terminal_input_pct = st.sidebar.number_input("Croissance long terme g (%)", min_value=-5.0, max_value=10.0, value=1.75, step=0.05)
 
-    st.sidebar.markdown("---")
-    st.sidebar.header("Paramètres DCF (base case)")
+    # Convertit en décimal pour le moteur
+    wacc_input = wacc_input_pct / 100.0
+    growth_fcf_input = growth_fcf_input_pct / 100.0
+    g_terminal_input = g_terminal_input_pct / 100.0
 
-    years = st.sidebar.slider(
-        "Horizon de projection (années)",
-        min_value=3,
-        max_value=10,
-        value=5,
-        step=1,
-    )
-    wacc_input = st.sidebar.number_input(
-        "WACC (%)",
-        min_value=5.5,
-        max_value=8.0,
-        value=6.8,
-        step=0.1,
-    )
-    growth_fcf_input = st.sidebar.number_input(
-        "Croissance annuelle FCF (%)",
-        min_value=-1.5,
-        max_value=4.0,
-        value=3.0,
-        step=0.1,
-    )
-    g_terminal_input = st.sidebar.number_input(
-        "Croissance long terme g (%)",
-        min_value=1.0,
-        max_value=2.0,
-        value=1.75,
-        step=0.05,
-    )
+    run = st.sidebar.button("🚀 Analyser")
 
-    wacc = wacc_input / 100.0
-    growth_fcf = growth_fcf_input / 100.0
-    g_terminal = g_terminal_input / 100.0
+    # =========================
+    # RUN ANALYSE
+    # =========================
+    if run:
+        if not api_key:
+            st.error("Merci de renseigner la clé API EODHD.")
+        else:
+            try:
+                with st.spinner("Analyse en cours..."):
+                    result = analyze_company(
+                        query=query.strip(),
+                        api_key=api_key.strip(),
+                        years=years,
+                        wacc=wacc_input,
+                        growth_fcf=growth_fcf_input,
+                        g_terminal=g_terminal_input,
+                    )
+                st.session_state["result"] = result
+            except Exception as e:
+                st.error(f"Erreur lors de l'analyse : {e}")
+                # Important : on ne laisse pas d'ancien résultat incohérent
+                if "result" in st.session_state:
+                    del st.session_state["result"]
 
-    if not api_key:
-        st.warning("➡️ Saisis ta clé API EODHD dans la sidebar pour lancer une analyse.")
+    # =========================
+    # AFFICHAGE RESULTATS
+    # =========================
+    if "result" not in st.session_state:
+        st.info("Entre un ticker/nom, renseigne ta clé EODHD, puis clique sur **Analyser**.")
         return
 
-    col_query, col_btn = st.columns([3, 1])
-    with col_query:
-        st.text_input(
-            "Rappel : société / ticker analysé",
-            value=query,
-            disabled=True,
-        )
-    with col_btn:
-        run_button = st.button("Analyser la société", type="primary")
+    result = st.session_state["result"]
 
-    if not run_button:
-        st.stop()
+    # =========================
+    # MISE EN PAGE AVEC TABS
+    # =========================
+    company = result["company"]
+    dcf = result["dcf"]
+    profile = result["profile"]
+    base_metrics = result["base_metrics"]
+    multiples_vals = result["multiples_valuations"]
+    global_val = result["global_valuation"]
+    targets = result["target_multiples"]
+    weights = result["weights"]
 
-    try:
-        with st.spinner("Analyse en cours..."):
-            result = analyze_company(
-                query=query,
-                api_key=api_key,
-                years=years,
-                wacc=wacc,
-                growth_fcf=growth_fcf,
-                g_terminal=g_terminal,
-            )
-    except Exception as e:
-        st.error(f"Erreur lors de l'analyse : {e}")
-        st.stop()
-        return
+    dcf_active = dcf.get("fair_value_per_share") is not None
 
-# =========================================
-# MISE EN PAGE AVEC TABS
-# =========================================
+    # Bandeau résumé
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Société", company.get("Name", "N/A"))
+        st.metric("Ticker EODHD", result.get("ticker", "N/A"))
+    with col2:
+        st.metric("Secteur", company.get("Sector", "N/A"))
+        st.metric("Industrie", company.get("Industry", "N/A"))
+    with col3:
+        st.metric("Pays", company.get("Country", "N/A"))
+        st.metric("Devise", company.get("Currency", "N/A"))
+    with col4:
+        price = result.get("price")
+        if price is not None:
+            st.metric("Prix de marché", f"{price:.2f}")
+        else:
+            st.metric("Prix de marché", "N/A")
 
-company = result["company"]
-dcf = result["dcf"]
-profile = result["profile"]
-base_metrics = result["base_metrics"]
-multiples_vals = result["multiples_valuations"]
-global_val = result["global_valuation"]
-targets = result["target_multiples"]
-weights = result["weights"]
+        if dcf_active:
+            st.metric("Juste valeur DCF", f"{dcf['fair_value_per_share']:.2f}")
+        else:
+            st.metric("Juste valeur DCF", "N/A")
 
-dcf_active = dcf.get("fair_value_per_share") is not None
-
-
-# =========================================
-# BANDEAU RÉSUMÉ
-# =========================================
-col1, col2, col3, col4 = st.columns(4)
-with col1:
-    st.metric("Société", company.get("Name", "N/A"))
-    st.metric("Ticker EODHD", result["ticker"])
-with col2:
-    st.metric("Secteur", company.get("Sector", "N/A"))
-    st.metric("Industrie", company.get("Industry", "N/A"))
-with col3:
-    st.metric("Pays", company.get("Country", "N/A"))
-    st.metric("Devise", company.get("Currency", "N/A"))
-with col4:
-    st.metric("Prix de marché", f"{result['price']:.2f}")
-    if dcf_active:
-        st.metric("Juste valeur DCF", f"{dcf['fair_value_per_share']:.2f}")
+    upside_pct = dcf.get("upside_pct")
+    if dcf_active and upside_pct is not None:
+        upside_color = "🟢" if upside_pct > 0 else "🔴"
+        st.markdown(f"**Upside / Downside DCF :** {upside_color} **{upside_pct:.1f} %**")
     else:
-        st.metric("Juste valeur DCF", "N/A")
+        st.info("DCF non utilisé (profil / données insuffisantes).")
 
+    # Panneau auto (prudent) uniquement si DCF actif
+    if dcf_active:
+        render_dcf_auto_panel(profile)
+
+    # Tabs dynamiques (sans erreurs)
+    if dcf_active:
+        tab_resume, tab_hist, tab_proj, tab_dcf, tab_mult, tab_synth = st.tabs(
+            ["Résumé DCF", "Historique 5 ans", "Projections FCF", "DCF & Sensibilité", "Multiples & Comparables", "Synthèse globale"]
+        )
+    else:
+        tab_hist, tab_mult, tab_synth = st.tabs(
+            ["Historique 5 ans", "Multiples & Comparables", "Synthèse globale"]
+        )
+
+    # =========================
+    # CONTENU DES TABS
+    # =========================
+    if dcf_active:
+        with tab_resume:
+            st.subheader("🎯 Résumé de la valorisation DCF (base case)")
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                st.metric("Valeur d'entreprise (EV)", format_large_number(dcf.get("ev")))
+                st.metric("Somme FCF actualisés", format_large_number(dcf.get("sum_disc_fcfs")))
+            with col_b:
+                st.metric("Valeur terminale actualisée", format_large_number(dcf.get("tv_discounted")))
+                st.metric("Valeur des capitaux propres", format_large_number(dcf.get("equity_value")))
+            with col_c:
+                st.metric("Juste valeur / action", f"{dcf.get('fair_value_per_share'):.2f}" if dcf.get("fair_value_per_share") is not None else "N/A")
+                st.metric("Nombre d'actions", format_large_number(result.get("shares")))
+
+            st.markdown("#### Hypothèses retenues (base case)")
+            st.write(f"- Horizon de projection : **{years} ans**")
+            st.write(f"- WACC : **{wacc_input_pct:.2f} %**")
+            st.write(f"- Croissance FCF : **{growth_fcf_input_pct:.2f} % / an**")
+            st.write(f"- g de long terme : **{g_terminal_input_pct:.2f} %**")
+
+    with tab_hist:
+        st.subheader("📊 Données historiques (5 ans)")
+        hist_df = result.get("hist_df")
+        if hist_df is None or getattr(hist_df, "empty", True):
+            st.info("Historique indisponible.")
+        else:
+            st.dataframe(hist_df, use_container_width=True)
+
+    if dcf_active:
+        with tab_proj:
+            st.subheader("📈 Projections FCF")
+            proj_df = result.get("proj_df")
+            if proj_df is None or getattr(proj_df, "empty", True):
+                st.info("Projections indisponibles.")
+            else:
+                st.dataframe(proj_df, use_container_width=True)
+
+        with tab_dcf:
+            st.subheader("🧩 DCF & Matrice de sensibilité (WACC vs g)")
+            sens = result.get("sensitivity")
+            if sens is None or getattr(sens, "empty", True):
+                st.info("Matrice de sensibilité indisponible.")
+            else:
+                st.dataframe(sens, use_container_width=True)
+
+    with tab_mult:
+        st.subheader("📌 Multiples & valorisations")
+        if not multiples_vals:
+            st.info("Multiples indisponibles.")
+        else:
+            # Tu as déjà ton format ailleurs ; ici affichage simple et robuste
+            rows = []
+            for k, v in multiples_vals.items():
+                rows.append({
+                    "Méthode": k,
+                    "Multiple courant": v.get("current_multiple"),
+                    "Multiple cible": v.get("target_multiple"),
+                    "Fair value / action": v.get("fair_value"),
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+    with tab_synth:
+        st.subheader("🧠 Synthèse globale")
+        if not global_val:
+            st.info("Synthèse indisponible.")
+        else:
+            fv = global_val.get("fair_value")
+            up = global_val.get("upside_pct")
+            if fv is not None:
+                st.metric("Fair Value globale", f"{fv:.2f}")
+            else:
+                st.metric("Fair Value globale", "N/A")
+
+            if up is not None:
+                st.metric("Upside global (%)", f"{up:.1f} %")
+            else:
+                st.metric("Upside global (%)", "N/A")
 
 # =========================================
 # UPSIDE / MESSAGE DCF
