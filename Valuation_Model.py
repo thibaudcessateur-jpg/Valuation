@@ -1,5 +1,4 @@
 import os
-import json
 import math
 import requests
 import pandas as pd
@@ -181,43 +180,25 @@ def get_shares_outstanding(fundamentals: dict):
 
 def get_net_debt(fundamentals: dict):
     """
-    Dette nette (Net Debt).
-
-    Priorité:
-    1) champ reporté netDebt (si présent dans le Balance_Sheet de Financials),
-    2) calcul (shortTermDebt + longTermDebt) - cash,
-    3) calcul totalDebt - cash.
-
-    Si l'information n'est pas disponible, retourne None (pas d'invention).
+    Dette nette ≈ TotalDebt - CashAndEquivalents (dernière année annuelle disponible).
     """
     try:
-        _, bs_snap = extract_balance_sheet_snapshot(fundamentals)
-        if not bs_snap:
+        balance_sheet = fundamentals["Financials"]["Balance_Sheet"]["yearly"]
+        years = sorted(balance_sheet.keys())
+        if not years:
             return None
+        last_year_key = years[-1]
+        last_year_bs = balance_sheet[last_year_key]
 
-        net_debt_reported = bs_snap.get("net_debt_reported")
-        if net_debt_reported is not None:
-            try:
-                return float(net_debt_reported)
-            except Exception:
-                pass
+        total_debt = last_year_bs.get("TotalDebt")
+        cash = last_year_bs.get("CashAndCashEquivalents")
 
-        cash = bs_snap.get("cash")
-        if cash is None:
+        if total_debt is None or cash is None:
             return None
-
-        std = bs_snap.get("short_term_debt")
-        ltd = bs_snap.get("long_term_debt")
-        if std is not None or ltd is not None:
-            return (float(std or 0.0) + float(ltd or 0.0)) - float(cash)
-
-        total_debt = bs_snap.get("total_debt")
-        if total_debt is not None:
-            return float(total_debt) - float(cash)
-
-        return None
+        return total_debt - cash
     except Exception:
         return None
+
 
 def pick_first_non_null(row: dict, candidates):
     """
@@ -706,9 +687,6 @@ def extract_balance_sheet_snapshot(fundamentals: dict):
     """
     Extrait un snapshot de bilan (dernier exercice annuel) avec des clés standardisées.
     Retourne aussi l'année du snapshot.
-
-    Objectif: être robuste aux variations de champs EODHD (camelCase / underscore / etc),
-    sans inventer de données quand un champ n'existe pas.
     """
     bs = fundamentals.get("Financials", {}).get("Balance_Sheet", {}).get("yearly", {})
     year, row = _extract_latest_year_row(bs)
@@ -729,61 +707,21 @@ def extract_balance_sheet_snapshot(fundamentals: dict):
                 continue
         return None
 
-    total_assets = get_first(["totalassets", "total_assets", "totalassetsreported", "assets"])
+    total_assets = get_first(["totalassets", "totalassetsreported", "assets"])
     total_liabilities = get_first([
         "totalliabilitiesnetminorityinterest",
-        "total_liabilities_net_minority_interest",
         "totalliabilities",
-        "total_liabilities",
-        "liabilities",
+        "liabilities"
     ])
-
-    # Dette (EODHD peut fournir plusieurs champs)
-    short_term_debt = get_first([
-        "shorttermdebt",
-        "short_term_debt",
-        "shorttermdebtandcapitalleaseobligation",
-        "short_term_debt_and_capital_lease_obligation",
-    ])
-    long_term_debt = get_first([
-        "longtermdebt",
-        "long_term_debt",
-        "longtermdebtandcapitalleaseobligation",
-        "long_term_debt_and_capital_lease_obligation",
-        "longtermdebtnoncurrent",
-        "long_term_debt_noncurrent",
-    ])
-
-    total_debt = get_first([
-        "totaldebt",
-        "total_debt",
-        "shortlongtermdebttotal",
-        "short_long_term_debt_total",
-    ])
-    if total_debt is None and (short_term_debt is not None or long_term_debt is not None):
-        total_debt = (short_term_debt or 0.0) + (long_term_debt or 0.0)
-
-    net_debt_reported = get_first(["netdebt", "net_debt"])
-
-    cash = get_first([
-        "cashandcashequivalents",
-        "cash_and_cash_equivalents",
-        "cashcashequivalentsandshortterminvestments",
-        "cash_cashequivalents_and_short_term_investments",
-        "cash",
-    ])
-    current_assets = get_first(["totalcurrentassets", "total_current_assets", "currentassets", "current_assets"])
-    current_liabilities = get_first(["totalcurrentliabilities", "total_current_liabilities", "currentliabilities", "current_liabilities"])
+    total_debt = get_first(["totaldebt"])
+    cash = get_first(["cashandcashequivalents", "cashcashequivalentsandshortterminvestments", "cash"])
+    current_assets = get_first(["totalcurrentassets", "currentassets"])
+    current_liabilities = get_first(["totalcurrentliabilities", "currentliabilities"])
     goodwill = get_first(["goodwill"])
-    intangibles = get_first([
-        "intangibleassets",
-        "intangible_assets",
-        "intangibleassetsexcludinggoodwill",
-        "intangible_assets_excluding_goodwill",
-        "intangibles",
-    ])
+    intangibles = get_first(["intangibleassets", "intangibleassetsexcludinggoodwill", "intangibles"])
 
     # Equity : on réutilise la logique robuste déjà codée dans extract_base_financials (book_equity)
+    # car les clés peuvent varier beaucoup selon les tickers.
     try:
         book_equity = extract_base_financials(fundamentals).get("book_equity")
         if book_equity is not None:
@@ -800,9 +738,6 @@ def extract_balance_sheet_snapshot(fundamentals: dict):
         "total_liabilities": total_liabilities,
         "total_equity": book_equity,
         "total_debt": total_debt,
-        "short_term_debt": short_term_debt,
-        "long_term_debt": long_term_debt,
-        "net_debt_reported": net_debt_reported,
         "cash": cash,
         "current_assets": current_assets,
         "current_liabilities": current_liabilities,
@@ -1164,78 +1099,6 @@ def compute_peer_distribution(peer_tickers: list, api_key: str) -> dict:
 
     return dist
 
-
-def fetch_sector_peers_via_screener(
-    api_key: str,
-    sector: str,
-    exchange: str | None,
-    limit: int = 25,
-    exclude_ticker: str | None = None,
-):
-    """
-    Récupère une liste de tickers EODHD via l'endpoint Screener, filtrés par secteur (+ exchange si fourni).
-
-    - Retour: liste de tickers au format CODE.EXCHANGE (ex: AAPL.US).
-    - Proxy sectoriel: ce n'est PAS un jugement qualitatif des comparables.
-    - Si l'endpoint screener n'est pas accessible (plan), retourne [].
-
-    L'API Screener accepte des filtres sector/industry et exchange. (Chaque requête consomme des API calls.)
-    """
-    if not sector:
-        return []
-
-    exch = (exchange or "").lower().strip()
-    sec = str(sector).strip()
-
-    # L'API screener recommande "match" pour les secteurs à deux mots.
-    op = "match" if " " in sec else "="
-
-    filters = []
-    if exch:
-        filters.append(["exchange", "=", exch])
-    filters.append(["sector", op, sec])
-
-    params = {
-        "api_token": api_key,
-        "sort": "market_capitalization.desc",
-        "filters": json.dumps(filters),
-        "limit": int(max(1, min(100, limit))),
-        "offset": 0,
-    }
-
-    try:
-        url = f"{EODHD_BASE_URL}/screener"
-        r = requests.get(url, params=params, timeout=30)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        if not isinstance(data, list):
-            return []
-
-        out = []
-        for row in data:
-            if not isinstance(row, dict):
-                continue
-            code_ = row.get("code") or row.get("Code") or row.get("ticker") or row.get("Ticker")
-            exch_ = row.get("exchange") or row.get("Exchange") or exch
-            if not code_ or not exch_:
-                continue
-            t = f"{str(code_).upper()}.{str(exch_).upper()}"
-            if exclude_ticker and t.upper() == exclude_ticker.upper():
-                continue
-            out.append(t)
-
-        # Dé-doublonnage en conservant l'ordre
-        seen = set()
-        uniq = []
-        for t in out:
-            if t in seen:
-                continue
-            seen.add(t)
-            uniq.append(t)
-        return uniq
-    except Exception:
-        return []
 
 def style_health_table(df: pd.DataFrame):
     """
@@ -2130,12 +1993,6 @@ def main():
         value="AAPL.US"
     )
 
-    # Defaults (avoid NameError on Streamlit reruns)
-    peer_tickers_raw = ""
-    auto_sector_benchmark = False
-    auto_peers_limit = 25
-
-
     st.sidebar.markdown("---")
     st.sidebar.header("Paramètres DCF (base case)")
 
@@ -2175,20 +2032,6 @@ def main():
     peer_tickers_raw = st.sidebar.text_input(
         "Tickers EODHD comparables (ex: MSFT.US, GOOGL.US, AMZN.US)",
         value="",
-    )
-
-    auto_sector_benchmark = st.sidebar.checkbox(
-        "Auto comparables (même secteur via Screener EODHD)",
-        value=False,
-        help="Utilise /api/screener pour générer des comparables du même secteur (proxy). "
-             "Nécessite que le Screener soit disponible sur ton plan et consomme des appels API.",
-    )
-    auto_peers_limit = st.sidebar.slider(
-        "Nombre de comparables (auto)",
-        min_value=10,
-        max_value=50,
-        value=25,
-        step=5,
     )
 
     wacc = wacc_input / 100.0
@@ -2248,393 +2091,362 @@ def main():
 
     peer_distribution = None
     peer_list = []
-
-    # 1) Comparables manuels (si fournis)
     try:
         raw = (peer_tickers_raw or "").strip()
         if raw:
             peer_list = [x.strip() for x in raw.split(",") if x.strip()]
             if peer_list:
-                if api_key:
-                    peer_distribution = compute_peer_distribution(peer_list, api_key)
+                peer_distribution = compute_peer_distribution(peer_list, api_key)
     except Exception:
         peer_distribution = None
 
-    # 2) Auto comparables sectoriels via Screener (si activé et pas de liste manuelle)
-    if peer_distribution is None and auto_sector_benchmark:
-        try:
-            sector = company.get("Sector")
-            exchange = (result.get("ticker") or "").split(".")[-1] if result.get("ticker") else None
-            auto_peers = fetch_sector_peers_via_screener(
-                api_key=api_key,
-                sector=sector,
-                exchange=exchange,
-                limit=auto_peers_limit,
-                exclude_ticker=result.get("ticker"),
-            )
-            if auto_peers:
-                peer_list = auto_peers
-                if api_key:
-                    peer_distribution = compute_peer_distribution(peer_list, api_key)
-        except Exception:
-            peer_distribution = None
-
-        health_df_raw, pillar_scores = build_health_table(company_ratios, peer_distribution=peer_distribution)
-        health_df_styled = style_health_table(health_df_raw)
+    health_df_raw, pillar_scores = build_health_table(company_ratios, peer_distribution=peer_distribution)
+    health_df_styled = style_health_table(health_df_raw)
 
 
-        # Bandeau résumé
-        col1, col2, col3, col4 = st.columns(4)
-        with col1:
-            st.metric("Société", company.get("Name", "N/A"))
-            st.metric("Ticker EODHD", result["ticker"])
-        with col2:
-            st.metric("Secteur", company.get("Sector", "N/A"))
-            st.metric("Industrie", company.get("Industry", "N/A"))
-        with col3:
-            st.metric("Pays", company.get("Country", "N/A"))
-            st.metric("Devise", company.get("Currency", "N/A"))
-        with col4:
-            st.metric("Prix de marché", f"{result['price']:.2f}")
-            if dcf_active:
-                st.metric("Juste valeur DCF", f"{dcf['fair_value_per_share']:.2f}")
-            else:
-                st.metric("Juste valeur DCF", "N/A")
-
-        upside_pct = dcf.get("upside_pct")
-        if dcf_active and upside_pct is not None:
-            upside_color = "🟢" if upside_pct > 0 else "🔴"
-            st.markdown(
-                f"**Upside / Downside DCF :** {upside_color} **{upside_pct:.1f} %**"
-            )
+    # Bandeau résumé
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        st.metric("Société", company.get("Name", "N/A"))
+        st.metric("Ticker EODHD", result["ticker"])
+    with col2:
+        st.metric("Secteur", company.get("Sector", "N/A"))
+        st.metric("Industrie", company.get("Industry", "N/A"))
+    with col3:
+        st.metric("Pays", company.get("Country", "N/A"))
+        st.metric("Devise", company.get("Currency", "N/A"))
+    with col4:
+        st.metric("Prix de marché", f"{result['price']:.2f}")
+        if dcf_active:
+            st.metric("Juste valeur DCF", f"{dcf['fair_value_per_share']:.2f}")
         else:
-            st.markdown(
-                "**DCF non utilisé pour ce profil (small cap ou données insuffisantes).**"
-            )
+            st.metric("Juste valeur DCF", "N/A")
 
-
-        # Tabs
-        tab_health, tab_resume, tab_hist, tab_proj, tab_dcf, tab_mult, tab_synth = st.tabs(
-            [
-                "Santé financière (ratios)",
-                "Résumé DCF",
-                "Historique 5 ans",
-                "Projections FCF",
-                "DCF & Sensibilité",
-                "Multiples & Comparables",
-                "Synthèse globale",
-            ]
+    upside_pct = dcf.get("upside_pct")
+    if dcf_active and upside_pct is not None:
+        upside_color = "🟢" if upside_pct > 0 else "🔴"
+        st.markdown(
+            f"**Upside / Downside DCF :** {upside_color} **{upside_pct:.1f} %**"
+        )
+    else:
+        st.markdown(
+            "**DCF non utilisé pour ce profil (small cap ou données insuffisantes).**"
         )
 
+
+    # Tabs
+    tab_health, tab_resume, tab_hist, tab_proj, tab_dcf, tab_mult, tab_synth = st.tabs(
+        [
+            "Santé financière (ratios)",
+            "Résumé DCF",
+            "Historique 5 ans",
+            "Projections FCF",
+            "DCF & Sensibilité",
+            "Multiples & Comparables",
+            "Synthèse globale",
+        ]
+    )
+
     
-        # ----- TAB 0 : Santé financière -----
-        with tab_health:
-            st.subheader("🩺 Santé financière (ratios scorés)")
+    # ----- TAB 0 : Santé financière -----
+    with tab_health:
+        st.subheader("🩺 Santé financière (ratios scorés)")
 
-    if peer_distribution is None:
-        st.info("Scoring : seuils génériques (non sectorisé). Ajoute des comparables manuels ou active l'auto sectoriel pour obtenir percentiles & médianes.")
-    else:
-        st.success(f"Scoring sectorisé : comparables = {len(peer_list)} (percentiles).")
+        # Indication de méthode
+        if peer_list:
+            st.caption("Scoring basé sur le percentile au sein des comparables fournis (comparables = benchmark).")
+        else:
+            st.caption("Scoring basé sur des seuils génériques (aucun benchmark comparables/secteur fourni).")
 
-    if peer_list:
-        with st.expander("Voir la liste des comparables utilisés"):
-            st.write(", ".join(peer_list[:100]))
+        if health_df_raw is None or health_df_raw.empty:
+            st.warning("Aucun ratio exploitable n'a pu être calculé avec les données disponibles.")
+        else:
+            st.dataframe(health_df_styled, use_container_width=True)
 
-            # Indication de méthode
-            if peer_list:
-                st.caption("Scoring basé sur le percentile au sein des comparables fournis (comparables = benchmark).")
-            else:
-                st.caption("Scoring basé sur des seuils génériques (aucun benchmark comparables/secteur fourni).")
+        st.markdown("#### Score moyen par pilier")
+        if pillar_scores is not None and not pillar_scores.empty:
+            pillar_scores_disp = pillar_scores.copy()
+            pillar_scores_disp["Score moyen /10"] = pillar_scores_disp["Score moyen /10"].round(2)
+            st.dataframe(pillar_scores_disp, use_container_width=True)
+        else:
+            st.info("Score par pilier indisponible.")
 
-            if health_df_raw is None or health_df_raw.empty:
-                st.warning("Aucun ratio exploitable n'a pu être calculé avec les données disponibles.")
-            else:
-                st.dataframe(health_df_styled, use_container_width=True)
-
-            st.markdown("#### Score moyen par pilier")
-            if pillar_scores is not None and not pillar_scores.empty:
-                pillar_scores_disp = pillar_scores.copy()
-                pillar_scores_disp["Score moyen /10"] = pillar_scores_disp["Score moyen /10"].round(2)
-                st.dataframe(pillar_scores_disp, use_container_width=True)
-            else:
-                st.info("Score par pilier indisponible.")
-
-            # Snapshots (optionnel)
-            with st.expander("Voir les données sources (dernier exercice)"):
-                h = result.get("health", {}) or {}
-                st.write("Année bilan :", h.get("bs_year"))
-                st.write("Année compte de résultat :", h.get("is_year"))
-                st.write("Année cash-flow :", h.get("cf_year"))
-                st.json({
-                    "Balance Sheet": h.get("balance_sheet", {}),
-                    "Income Statement": h.get("income_statement", {}),
-                    "Cash Flow": h.get("cash_flow", {}),
-                })
+        # Snapshots (optionnel)
+        with st.expander("Voir les données sources (dernier exercice)"):
+            h = result.get("health", {}) or {}
+            st.write("Année bilan :", h.get("bs_year"))
+            st.write("Année compte de résultat :", h.get("is_year"))
+            st.write("Année cash-flow :", h.get("cf_year"))
+            st.json({
+                "Balance Sheet": h.get("balance_sheet", {}),
+                "Income Statement": h.get("income_statement", {}),
+                "Cash Flow": h.get("cash_flow", {}),
+            })
 
 
-    # ----- TAB 1 : Résumé DCF -----
-        with tab_resume:
-            st.subheader("🎯 Résumé de la valorisation DCF (base case)")
+# ----- TAB 1 : Résumé DCF -----
+    with tab_resume:
+        st.subheader("🎯 Résumé de la valorisation DCF (base case)")
 
-            if not dcf_active:
-                st.warning(
-                    "Le modèle DCF n'est pas utilisé pour cette société "
-                    "(profil small cap ou données de cash-flow insuffisantes). "
-                    "Les valorisations reposent principalement sur les méthodes par multiples."
-                )
-            else:
-                ev = dcf.get("ev", 0) or 0
-                sum_disc_fcfs = dcf.get("sum_disc_fcfs", 0) or 0
-                tv_discounted = dcf.get("tv_discounted", 0) or 0
-                equity_value = dcf.get("equity_value", 0) or 0
-                fair_value_per_share = dcf.get("fair_value_per_share", 0) or 0
+        if not dcf_active:
+            st.warning(
+                "Le modèle DCF n'est pas utilisé pour cette société "
+                "(profil small cap ou données de cash-flow insuffisantes). "
+                "Les valorisations reposent principalement sur les méthodes par multiples."
+            )
+        else:
+            ev = dcf.get("ev", 0) or 0
+            sum_disc_fcfs = dcf.get("sum_disc_fcfs", 0) or 0
+            tv_discounted = dcf.get("tv_discounted", 0) or 0
+            equity_value = dcf.get("equity_value", 0) or 0
+            fair_value_per_share = dcf.get("fair_value_per_share", 0) or 0
 
-                shares = (result.get("shares", 0) or 0)
-                net_debt = (result.get("net_debt", 0) or 0)
-                fcf_start = (result.get("fcf_start", 0) or 0)
+            shares = (result.get("shares", 0) or 0)
+            net_debt = (result.get("net_debt", 0) or 0)
+            fcf_start = (result.get("fcf_start", 0) or 0)
 
-                col_a, col_b, col_c = st.columns(3)
-                with col_a:
-                    st.metric("Valeur d'entreprise (EV)", format_large_number(ev))
-                    st.metric("Somme FCF actualisés", format_large_number(sum_disc_fcfs))
-                with col_b:
-                    st.metric("Valeur terminale actualisée", format_large_number(tv_discounted))
-                    st.metric("Valeur des capitaux propres", format_large_number(equity_value))
-                with col_c:
-                    st.metric("Juste valeur / action", f"{fair_value_per_share:,.2f}")
-                    st.metric("Nombre d'actions", format_large_number(shares))
+            col_a, col_b, col_c = st.columns(3)
+            with col_a:
+                st.metric("Valeur d'entreprise (EV)", format_large_number(ev))
+                st.metric("Somme FCF actualisés", format_large_number(sum_disc_fcfs))
+            with col_b:
+                st.metric("Valeur terminale actualisée", format_large_number(tv_discounted))
+                st.metric("Valeur des capitaux propres", format_large_number(equity_value))
+            with col_c:
+                st.metric("Juste valeur / action", f"{fair_value_per_share:,.2f}")
+                st.metric("Nombre d'actions", format_large_number(shares))
 
-                st.markdown("#### Hypothèses retenues (base case)")
-                st.write(f"- Horizon de projection : **{years} ans**")
-                st.write(f"- WACC : **{wacc_input:.2f} %**")
-                st.write(f"- Croissance FCF : **{growth_fcf_input:.2f} % par an**")
-                st.write(f"- g de long terme : **{g_terminal_input:.2f} %**")
-                st.write(f"- Dette nette utilisée : **{format_large_number(net_debt)}**")
-                st.write(f"- FCF de départ estimé : **{format_large_number(fcf_start)}**")
-
-                st.info(
-                    "Ce résumé présente le scénario central (base case). "
-                    "La robustesse de la valorisation est analysée dans l'onglet « DCF & Sensibilité » "
-                    "et complétée par les méthodes par multiples."
-                )
-
-
-          # ----- TAB 2 : Historique -----
-        with tab_hist:
-            st.subheader("📚 Données historiques (5 dernières années)")
-
-            hist_df = result["hist_df"]
-            if hist_df.empty:
-                st.warning("Impossible de construire un historique complet à partir des données disponibles.")
-            else:
-                df_display = scale_df_to_millions(hist_df)
-                numeric_cols = [c for c in df_display.columns if c != "Année"]
-                for c in numeric_cols:
-                    df_display[c] = df_display[c].astype(float).round(2)
-
-                st.dataframe(df_display, use_container_width=True)
-                st.caption("Unités : millions de la devise de reporting.")
-
-        # ----- TAB 3 : Projections FCF -----
-        with tab_proj:
-            st.subheader("📈 Projections de FCF sur 5 ans (base case)")
-
-            proj_df = result["proj_df"]
-
-            if (not dcf_active) or (proj_df is None) or proj_df.empty:
-                st.warning(
-                    "Projections de FCF non disponibles ou non pertinentes pour cette société "
-                    "(profil small cap ou absence de données suffisantes)."
-                )
-            else:
-                proj_df = proj_df.copy()
-                proj_df["FCF projeté"] = proj_df["FCF projeté"].round(0)
-                proj_df["FCF actualisé"] = proj_df["FCF actualisé"].round(0)
-                st.dataframe(proj_df, use_container_width=True)
-
-                st.markdown(
-                    "Les projections sont basées sur un FCF de départ estimé à partir du dernier "
-                    "**Operating Cash Flow - Capex**, et une croissance constante de "
-                    f"**{growth_fcf_input:.2f} %/an**."
-                )
-
-        # ----- TAB 4 : DCF & Sensibilité -----
-        with tab_dcf:
-            st.subheader("🧮 DCF détaillé et matrice de sensibilité")
-
-            sens_df = result["sensitivity"]
-
-            if (not dcf_active) or (sens_df is None) or sens_df.empty:
-                st.warning(
-                    "Matrice de sensibilité DCF non disponible pour cette société "
-                    "(profil small cap ou données cash-flow insuffisantes)."
-                )
-            else:
-                st.markdown("#### Matrice de sensibilité (juste valeur / action)")
-                sens_df = sens_df.round(2)
-                st.dataframe(sens_df, use_container_width=True)
-
-                st.markdown(
-                    """
-                    - **Lignes** : différentes hypothèses de WACC autour de la valeur de base.  
-                    - **Colonnes** : différentes hypothèses de croissance de long terme *g*.  
-                    - Chaque cellule représente la **juste valeur par action** selon ces hypothèses.
-                    """
-                )
-
-            st.markdown("#### Rappel des paramètres du scénario central")
-            st.write(f"- WACC base : **{wacc_input:.2f} %**")
-            st.write(f"- g base : **{g_terminal_input:.2f} %**")
-            st.write(f"- Croissance FCF : **{growth_fcf_input:.2f} %/an**")
-            st.write(f"- Horizon : **{years} ans**")
+            st.markdown("#### Hypothèses retenues (base case)")
+            st.write(f"- Horizon de projection : **{years} ans**")
+            st.write(f"- WACC : **{wacc_input:.2f} %**")
+            st.write(f"- Croissance FCF : **{growth_fcf_input:.2f} % par an**")
+            st.write(f"- g de long terme : **{g_terminal_input:.2f} %**")
+            st.write(f"- Dette nette utilisée : **{format_large_number(net_debt)}**")
+            st.write(f"- FCF de départ estimé : **{format_large_number(fcf_start)}**")
 
             st.info(
-                "Le DCF reste la méthode intrinsèque principale pour les sociétés matures "
-                "avec des cash-flows prévisibles (notamment large caps). "
-                "Pour les small caps, d'autres méthodes (EV/Sales, EV/EBITDA...) sont privilégiées."
+                "Ce résumé présente le scénario central (base case). "
+                "La robustesse de la valorisation est analysée dans l'onglet « DCF & Sensibilité » "
+                "et complétée par les méthodes par multiples."
             )
 
-        # ----- TAB 5 : Multiples & Comparables -----
-        with tab_mult:
-            st.subheader("📊 Multiples & valorisations par comparables")
 
-            price = result["price"]
-            eps = base_metrics.get("eps")
-            bvps = base_metrics.get("bvps")
+      # ----- TAB 2 : Historique -----
+    with tab_hist:
+        st.subheader("📚 Données historiques (5 dernières années)")
 
-            col_m1, col_m2, col_m3 = st.columns(3)
-            with col_m1:
-                st.metric("EPS (approx)", f"{eps:.2f}" if eps is not None else "N/A")
-                st.metric("BVPS (approx)", f"{bvps:.2f}" if bvps is not None else "N/A")
-            with col_m2:
-                st.metric("P/E courant", f"{base_metrics.get('pe'):.1f}" if base_metrics.get("pe") else "N/A")
-                st.metric("P/B courant", f"{base_metrics.get('pb'):.1f}" if base_metrics.get("pb") else "N/A")
-            with col_m3:
-                st.metric("EV/EBITDA courant", f"{base_metrics.get('ev_ebitda'):.1f}" if base_metrics.get("ev_ebitda") else "N/A")
-                st.metric("EV/Sales courant", f"{base_metrics.get('ev_sales'):.1f}" if base_metrics.get("ev_sales") else "N/A")
+        hist_df = result["hist_df"]
+        if hist_df.empty:
+            st.warning("Impossible de construire un historique complet à partir des données disponibles.")
+        else:
+            df_display = scale_df_to_millions(hist_df)
+            numeric_cols = [c for c in df_display.columns if c != "Année"]
+            for c in numeric_cols:
+                df_display[c] = df_display[c].astype(float).round(2)
 
-            st.markdown("#### Multiples cibles et fair values implicites")
+            st.dataframe(df_display, use_container_width=True)
+            st.caption("Unités : millions de la devise de reporting.")
 
-            rows = []
-            method_order = ["PE", "PB", "EV_EBITDA", "EV_EBIT", "EV_SALES"]
-            labels = {
-                "PE": "P/E",
-                "PB": "P/B",
-                "EV_EBITDA": "EV/EBITDA",
-                "EV_EBIT": "EV/EBIT",
-                "EV_SALES": "EV/Sales",
-            }
+    # ----- TAB 3 : Projections FCF -----
+    with tab_proj:
+        st.subheader("📈 Projections de FCF sur 5 ans (base case)")
 
-            for key in method_order:
-                info = multiples_vals.get(key)
-                if not info:
-                    continue
+        proj_df = result["proj_df"]
 
-                fv = info.get("fair_value")
-                if fv is None:
-                    continue
+        if (not dcf_active) or (proj_df is None) or proj_df.empty:
+            st.warning(
+                "Projections de FCF non disponibles ou non pertinentes pour cette société "
+                "(profil small cap ou absence de données suffisantes)."
+            )
+        else:
+            proj_df = proj_df.copy()
+            proj_df["FCF projeté"] = proj_df["FCF projeté"].round(0)
+            proj_df["FCF actualisé"] = proj_df["FCF actualisé"].round(0)
+            st.dataframe(proj_df, use_container_width=True)
 
-                cur_mult = info.get("current_multiple")
-                tgt_mult = info.get("target_multiple")
+            st.markdown(
+                "Les projections sont basées sur un FCF de départ estimé à partir du dernier "
+                "**Operating Cash Flow - Capex**, et une croissance constante de "
+                f"**{growth_fcf_input:.2f} %/an**."
+            )
 
-                upside = None
-                if price not in (None, 0):
-                    upside = (fv / price - 1) * 100
+    # ----- TAB 4 : DCF & Sensibilité -----
+    with tab_dcf:
+        st.subheader("🧮 DCF détaillé et matrice de sensibilité")
 
-                rows.append(
-                    {
-                        "Méthode": labels.get(key, key),
-                        "Multiple courant": cur_mult,
-                        "Multiple cible (hyp.)": tgt_mult,
-                        "Fair value / action": fv,
-                        "Upside (%)": upside,
-                    }
-                )
+        sens_df = result["sensitivity"]
 
-            if rows:
-                df_mult = pd.DataFrame(rows)
-                df_mult["Multiple courant"] = df_mult["Multiple courant"].round(2)
-                df_mult["Multiple cible (hyp.)"] = df_mult["Multiple cible (hyp.)"].round(2)
-                df_mult["Fair value / action"] = df_mult["Fair value / action"].round(2)
-                df_mult["Upside (%)"] = df_mult["Upside (%)"].round(1)
+        if (not dcf_active) or (sens_df is None) or sens_df.empty:
+            st.warning(
+                "Matrice de sensibilité DCF non disponible pour cette société "
+                "(profil small cap ou données cash-flow insuffisantes)."
+            )
+        else:
+            st.markdown("#### Matrice de sensibilité (juste valeur / action)")
+            sens_df = sens_df.round(2)
+            st.dataframe(sens_df, use_container_width=True)
 
-                st.dataframe(df_mult, use_container_width=True)
+            st.markdown(
+                """
+                - **Lignes** : différentes hypothèses de WACC autour de la valeur de base.  
+                - **Colonnes** : différentes hypothèses de croissance de long terme *g*.  
+                - Chaque cellule représente la **juste valeur par action** selon ces hypothèses.
+                """
+            )
+
+        st.markdown("#### Rappel des paramètres du scénario central")
+        st.write(f"- WACC base : **{wacc_input:.2f} %**")
+        st.write(f"- g base : **{g_terminal_input:.2f} %**")
+        st.write(f"- Croissance FCF : **{growth_fcf_input:.2f} %/an**")
+        st.write(f"- Horizon : **{years} ans**")
+
+        st.info(
+            "Le DCF reste la méthode intrinsèque principale pour les sociétés matures "
+            "avec des cash-flows prévisibles (notamment large caps). "
+            "Pour les small caps, d'autres méthodes (EV/Sales, EV/EBITDA...) sont privilégiées."
+        )
+
+    # ----- TAB 5 : Multiples & Comparables -----
+    with tab_mult:
+        st.subheader("📊 Multiples & valorisations par comparables")
+
+        price = result["price"]
+        eps = base_metrics.get("eps")
+        bvps = base_metrics.get("bvps")
+
+        col_m1, col_m2, col_m3 = st.columns(3)
+        with col_m1:
+            st.metric("EPS (approx)", f"{eps:.2f}" if eps is not None else "N/A")
+            st.metric("BVPS (approx)", f"{bvps:.2f}" if bvps is not None else "N/A")
+        with col_m2:
+            st.metric("P/E courant", f"{base_metrics.get('pe'):.1f}" if base_metrics.get("pe") else "N/A")
+            st.metric("P/B courant", f"{base_metrics.get('pb'):.1f}" if base_metrics.get("pb") else "N/A")
+        with col_m3:
+            st.metric("EV/EBITDA courant", f"{base_metrics.get('ev_ebitda'):.1f}" if base_metrics.get("ev_ebitda") else "N/A")
+            st.metric("EV/Sales courant", f"{base_metrics.get('ev_sales'):.1f}" if base_metrics.get("ev_sales") else "N/A")
+
+        st.markdown("#### Multiples cibles et fair values implicites")
+
+        rows = []
+        method_order = ["PE", "PB", "EV_EBITDA", "EV_EBIT", "EV_SALES"]
+        labels = {
+            "PE": "P/E",
+            "PB": "P/B",
+            "EV_EBITDA": "EV/EBITDA",
+            "EV_EBIT": "EV/EBIT",
+            "EV_SALES": "EV/Sales",
+        }
+
+        for key in method_order:
+            info = multiples_vals.get(key)
+            if not info:
+                continue
+
+            fv = info.get("fair_value")
+            if fv is None:
+                continue
+
+            cur_mult = info.get("current_multiple")
+            tgt_mult = info.get("target_multiple")
+
+            upside = None
+            if price not in (None, 0):
+                upside = (fv / price - 1) * 100
+
+            rows.append(
+                {
+                    "Méthode": labels.get(key, key),
+                    "Multiple courant": cur_mult,
+                    "Multiple cible (hyp.)": tgt_mult,
+                    "Fair value / action": fv,
+                    "Upside (%)": upside,
+                }
+            )
+
+        if rows:
+            df_mult = pd.DataFrame(rows)
+            df_mult["Multiple courant"] = df_mult["Multiple courant"].round(2)
+            df_mult["Multiple cible (hyp.)"] = df_mult["Multiple cible (hyp.)"].round(2)
+            df_mult["Fair value / action"] = df_mult["Fair value / action"].round(2)
+            df_mult["Upside (%)"] = df_mult["Upside (%)"].round(1)
+
+            st.dataframe(df_mult, use_container_width=True)
+        else:
+            st.warning("Impossible de calculer des valorisations par multiples exploitables pour cette société.")
+
+        st.info(
+            "Les multiples cibles affichés sont des hypothèses génériques (à affiner par secteur et par style d'investissement). "
+            "L'objectif ici est de montrer la cohérence ou l'écart entre la valorisation DCF et les valorisations relatives."
+        )
+
+    # ----- TAB 6 : Synthèse globale -----
+    with tab_synth:
+        st.subheader("🧷 Synthèse globale de valorisation")
+
+        price = result["price"]
+        fair_global = global_val.get("fair_value_global")
+        upside_global = global_val.get("upside_global")
+
+        col_s1, col_s2, col_s3 = st.columns(3)
+        with col_s1:
+            st.metric("Taille de capitalisation", profile.get("cap_size", "N/A"))
+            st.metric("Market cap approx.", format_large_number(profile.get("market_cap")))
+        with col_s2:
+            rev_cagr = profile.get("revenue_cagr")
+            if rev_cagr is not None:
+                rev_cagr_str = f"{rev_cagr*100:.1f} %/an"
             else:
-                st.warning("Impossible de calculer des valorisations par multiples exploitables pour cette société.")
-
-            st.info(
-                "Les multiples cibles affichés sont des hypothèses génériques (à affiner par secteur et par style d'investissement). "
-                "L'objectif ici est de montrer la cohérence ou l'écart entre la valorisation DCF et les valorisations relatives."
-            )
-
-        # ----- TAB 6 : Synthèse globale -----
-        with tab_synth:
-            st.subheader("🧷 Synthèse globale de valorisation")
-
-            price = result["price"]
-            fair_global = global_val.get("fair_value_global")
-            upside_global = global_val.get("upside_global")
-
-            col_s1, col_s2, col_s3 = st.columns(3)
-            with col_s1:
-                st.metric("Taille de capitalisation", profile.get("cap_size", "N/A"))
-                st.metric("Market cap approx.", format_large_number(profile.get("market_cap")))
-            with col_s2:
-                rev_cagr = profile.get("revenue_cagr")
-                if rev_cagr is not None:
-                    rev_cagr_str = f"{rev_cagr*100:.1f} %/an"
-                else:
-                    rev_cagr_str = "N/A"
-                ebit_margin = profile.get("ebit_margin")
-                if ebit_margin is not None:
-                    ebit_margin_str = f"{ebit_margin*100:.1f} %"
-                else:
-                    ebit_margin_str = "N/A"
-                st.metric("Croissance CA (approx)", rev_cagr_str)
-                st.metric("Marge EBIT (approx)", ebit_margin_str)
-            with col_s3:
-                st.metric("Juste valeur DCF", f"{dcf['fair_value_per_share']:.2f}")
-                st.metric(
-                    "Juste valeur globale pondérée",
-                    f"{fair_global:.2f}" if fair_global is not None else "N/A",
-                )
-
-            if upside_global is not None:
-                color_glob = "🟢" if upside_global > 0 else "🔴"
-                st.markdown(
-                    f"**Upside / Downside global (DCF + multiples pondérés) :** "
-                    f"{color_glob} **{upside_global:.1f} %**"
-                )
-
-            st.markdown("#### Détail des méthodes prises en compte dans la synthèse")
-
-            details = global_val.get("details", [])
-            if details:
-                df_det = pd.DataFrame(details)
-                df_det["Fair value / action"] = df_det["Fair value / action"].round(2)
-                df_det["Upside (%)"] = df_det["Upside (%)"].round(1)
-                df_det["Poids utilisé"] = df_det["Poids utilisé"].round(2)
-                st.dataframe(df_det, use_container_width=True)
+                rev_cagr_str = "N/A"
+            ebit_margin = profile.get("ebit_margin")
+            if ebit_margin is not None:
+                ebit_margin_str = f"{ebit_margin*100:.1f} %"
             else:
-                st.warning(
-                    "Aucune méthode n'a pu être prise en compte dans la synthèse globale "
-                    "(problème de données ou pondérations nulles)."
-                )
-
-            st.markdown("#### Rappel de la logique de pondération automatique")
-
-            st.write(
-                "- **Large Caps** : DCF dominant (60 %), complété par EV/EBITDA et P/E.  \n"
-                "- **Mid Caps** : DCF 40 %, EV/EBITDA 30 %, P/E 20 %, EV/Sales 10 %.  \n"
-                "- **Small Caps** : DCF neutralisé (0 %), focus sur EV/Sales, EV/EBITDA, P/E.  \n"
-                "- **Financières** : P/B et P/E privilégiés, DCF mis de côté."
+                ebit_margin_str = "N/A"
+            st.metric("Croissance CA (approx)", rev_cagr_str)
+            st.metric("Marge EBIT (approx)", ebit_margin_str)
+        with col_s3:
+            st.metric("Juste valeur DCF", f"{dcf['fair_value_per_share']:.2f}")
+            st.metric(
+                "Juste valeur globale pondérée",
+                f"{fair_global:.2f}" if fair_global is not None else "N/A",
             )
 
-            st.info(
-                "Ces pondérations sont des hypothèses de travail inspirées des pratiques des analystes professionnels. "
-                "L'intérêt de ton outil est justement d'expliciter ces choix, de les affiner, "
-                "et de montrer que tu sais adapter la méthode au profil de la société analysée."
+        if upside_global is not None:
+            color_glob = "🟢" if upside_global > 0 else "🔴"
+            st.markdown(
+                f"**Upside / Downside global (DCF + multiples pondérés) :** "
+                f"{color_glob} **{upside_global:.1f} %**"
             )
+
+        st.markdown("#### Détail des méthodes prises en compte dans la synthèse")
+
+        details = global_val.get("details", [])
+        if details:
+            df_det = pd.DataFrame(details)
+            df_det["Fair value / action"] = df_det["Fair value / action"].round(2)
+            df_det["Upside (%)"] = df_det["Upside (%)"].round(1)
+            df_det["Poids utilisé"] = df_det["Poids utilisé"].round(2)
+            st.dataframe(df_det, use_container_width=True)
+        else:
+            st.warning(
+                "Aucune méthode n'a pu être prise en compte dans la synthèse globale "
+                "(problème de données ou pondérations nulles)."
+            )
+
+        st.markdown("#### Rappel de la logique de pondération automatique")
+
+        st.write(
+            "- **Large Caps** : DCF dominant (60 %), complété par EV/EBITDA et P/E.  \n"
+            "- **Mid Caps** : DCF 40 %, EV/EBITDA 30 %, P/E 20 %, EV/Sales 10 %.  \n"
+            "- **Small Caps** : DCF neutralisé (0 %), focus sur EV/Sales, EV/EBITDA, P/E.  \n"
+            "- **Financières** : P/B et P/E privilégiés, DCF mis de côté."
+        )
+
+        st.info(
+            "Ces pondérations sont des hypothèses de travail inspirées des pratiques des analystes professionnels. "
+            "L'intérêt de ton outil est justement d'expliciter ces choix, de les affiner, "
+            "et de montrer que tu sais adapter la méthode au profil de la société analysée."
+        )
 
 
 if __name__ == "__main__":
