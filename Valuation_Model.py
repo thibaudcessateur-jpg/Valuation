@@ -657,6 +657,481 @@ def compute_base_multiples(price, shares, net_debt, base_financials: dict):
     return metrics
 
 
+
+# =========================================
+# FUNDAMENTALS HEALTH TABLE (RATIOS + SCORE)
+# =========================================
+
+@st.cache_data(show_spinner=False, ttl=24*3600)
+def fetch_fundamentals_cached(ticker: str, api_key: str):
+    return fetch_fundamentals(ticker, api_key)
+
+@st.cache_data(show_spinner=False, ttl=6*3600)
+def fetch_eod_price_cached(ticker: str, api_key: str):
+    return fetch_eod_price(ticker, api_key)
+
+
+def _extract_latest_year_row(section: dict):
+    """
+    section attendu sous forme de dict {year: {...}}.
+    Retourne (year, row) du dernier exercice disponible.
+    """
+    if not isinstance(section, dict) or not section:
+        return None, {}
+    years = sorted(section.keys())
+    last_year = years[-1]
+    return last_year, (section.get(last_year, {}) or {})
+
+
+def extract_balance_sheet_snapshot(fundamentals: dict):
+    """
+    Extrait un snapshot de bilan (dernier exercice annuel) avec des clés standardisées.
+    Retourne aussi l'année du snapshot.
+    """
+    bs = fundamentals.get("Financials", {}).get("Balance_Sheet", {}).get("yearly", {})
+    year, row = _extract_latest_year_row(bs)
+
+    if not row:
+        return year, {}
+
+    normalized = {str(k).lower(): v for k, v in row.items()}
+
+    def get_first(keys):
+        for k in keys:
+            v = normalized.get(k)
+            if v is None:
+                continue
+            try:
+                return float(v)
+            except Exception:
+                continue
+        return None
+
+    total_assets = get_first(["totalassets", "totalassetsreported", "assets"])
+    total_liabilities = get_first([
+        "totalliabilitiesnetminorityinterest",
+        "totalliabilities",
+        "liabilities"
+    ])
+    total_debt = get_first(["totaldebt"])
+    cash = get_first(["cashandcashequivalents", "cashcashequivalentsandshortterminvestments", "cash"])
+    current_assets = get_first(["totalcurrentassets", "currentassets"])
+    current_liabilities = get_first(["totalcurrentliabilities", "currentliabilities"])
+    goodwill = get_first(["goodwill"])
+    intangibles = get_first(["intangibleassets", "intangibleassetsexcludinggoodwill", "intangibles"])
+
+    # Equity : on réutilise la logique robuste déjà codée dans extract_base_financials (book_equity)
+    # car les clés peuvent varier beaucoup selon les tickers.
+    try:
+        book_equity = extract_base_financials(fundamentals).get("book_equity")
+        if book_equity is not None:
+            book_equity = float(book_equity)
+    except Exception:
+        book_equity = None
+
+    # Fallback equity si besoin : Assets - Liabilities
+    if book_equity is None and total_assets is not None and total_liabilities is not None:
+        book_equity = total_assets - total_liabilities
+
+    return year, {
+        "total_assets": total_assets,
+        "total_liabilities": total_liabilities,
+        "total_equity": book_equity,
+        "total_debt": total_debt,
+        "cash": cash,
+        "current_assets": current_assets,
+        "current_liabilities": current_liabilities,
+        "goodwill": goodwill,
+        "intangibles": intangibles,
+    }
+
+
+def extract_cashflow_snapshot(fundamentals: dict):
+    """
+    Extrait un snapshot de cash-flow (dernier exercice annuel) : CFO, capex, FCF approx.
+    Retourne aussi l'année.
+    """
+    cf = fundamentals.get("Financials", {}).get("Cash_Flow", {}).get("yearly", {})
+    year, row = _extract_latest_year_row(cf)
+    if not row:
+        return year, {}
+
+    ocf = pick_first_non_null(
+        row,
+        [
+            "totalCashFromOperatingActivities",
+            "TotalCashFromOperatingActivities",
+            "NetCashProvidedByOperatingActivities",
+            "NetCashFromOperatingActivities",
+            "OperatingCashFlow",
+        ],
+    )
+    capex = pick_first_non_null(
+        row,
+        [
+            "capitalExpenditures",
+            "CapitalExpenditures",
+            "investmentsInPropertyPlantAndEquipment",
+            "InvestmentsInPropertyPlantAndEquipment",
+        ],
+    )
+
+    fcf = (ocf - capex) if (ocf is not None and capex is not None) else None
+    return year, {"cfo": ocf, "capex": capex, "fcf": fcf}
+
+
+def extract_income_snapshot(fundamentals: dict):
+    """
+    Extrait un snapshot compte de résultat (dernier exercice annuel) : revenue, ebitda, ebit, net_income, gross_profit.
+    Retourne aussi l'année.
+    """
+    inc = fundamentals.get("Financials", {}).get("Income_Statement", {}).get("yearly", {})
+    year, row = _extract_latest_year_row(inc)
+    if not row:
+        return year, {}
+
+    revenue = pick_first_non_null(row, ["TotalRevenue", "Revenue", "totalRevenue", "SalesRevenueNet", "Sales"])
+    ebitda = pick_first_non_null(row, ["EBITDA", "Ebitda", "ebitda", "OperatingIncomeBeforeDepreciation"])
+    ebit = pick_first_non_null(row, ["OperatingIncome", "OperatingIncomeLoss", "EBIT", "Ebit", "ebit"])
+    net_income = pick_first_non_null(
+        row,
+        ["NetIncome", "netIncome", "NetIncomeCommonStockholders", "NetIncomeIncludingNoncontrollingInterests"],
+    )
+    gross_profit = pick_first_non_null(row, ["GrossProfit", "grossProfit"])
+
+    return year, {
+        "revenue": revenue,
+        "ebitda": ebitda,
+        "ebit": ebit,
+        "net_income": net_income,
+        "gross_profit": gross_profit,
+    }
+
+
+def _linear_score(value, low, high, higher_better=True):
+    """
+    Score linéaire 0-10 sur une plage [low, high].
+    - higher_better=True : low -> 0, high -> 10
+    - higher_better=False : low -> 10, high -> 0
+    """
+    if value is None:
+        return None
+    try:
+        x = float(value)
+    except Exception:
+        return None
+
+    if low is None or high is None or low == high:
+        return None
+
+    # clamp dans la plage
+    if x <= low:
+        s = 0.0 if higher_better else 10.0
+    elif x >= high:
+        s = 10.0 if higher_better else 0.0
+    else:
+        t = (x - low) / (high - low)
+        s = 10.0 * (t if higher_better else (1 - t))
+
+    return max(0.0, min(10.0, s))
+
+
+def _color_from_score(score):
+    """
+    Renvoie une couleur hex (fond) en fonction du score.
+    Gris si score indisponible.
+    """
+    if score is None:
+        return "#E5E7EB"  # gris clair
+    try:
+        s = float(score)
+    except Exception:
+        return "#E5E7EB"
+
+    if s >= 8:
+        return "#86EFAC"  # vert clair
+    if s >= 6:
+        return "#BBF7D0"  # vert très clair
+    if s >= 4:
+        return "#FEF08A"  # jaune
+    if s >= 2:
+        return "#FDBA74"  # orange
+    return "#FCA5A5"      # rouge clair
+
+
+def compute_company_health_ratios(
+    company: dict,
+    bs_snap: dict,
+    is_snap: dict,
+    cf_snap: dict,
+    net_debt: float,
+    shares: float,
+    hist_df: pd.DataFrame,
+):
+    """
+    Calcule un set de ratios fondamentaux (automatisables) à partir des snapshots.
+    Tout ce qui n'est pas calculable renvoie None (pas d'extrapolation).
+    """
+    ratios = {}
+
+    total_assets = bs_snap.get("total_assets")
+    total_equity = bs_snap.get("total_equity")
+    total_debt = bs_snap.get("total_debt")
+    cash = bs_snap.get("cash")
+    current_assets = bs_snap.get("current_assets")
+    current_liabilities = bs_snap.get("current_liabilities")
+    goodwill = bs_snap.get("goodwill")
+    intangibles = bs_snap.get("intangibles")
+
+    revenue = is_snap.get("revenue")
+    ebitda = is_snap.get("ebitda")
+    ebit = is_snap.get("ebit")
+    net_income = is_snap.get("net_income")
+    gross_profit = is_snap.get("gross_profit")
+
+    cfo = cf_snap.get("cfo")
+    capex = cf_snap.get("capex")
+    fcf = cf_snap.get("fcf")
+
+    # --- Balance sheet ---
+    ratios["equity_to_assets"] = safe_div(total_equity, total_assets)
+    ratios["net_debt_to_equity"] = safe_div(net_debt, total_equity)
+    ratios["net_debt_to_ebitda"] = safe_div(net_debt, ebitda)
+    ratios["cash_to_debt"] = safe_div(cash, total_debt)
+    ratios["current_ratio"] = safe_div(current_assets, current_liabilities)
+    ratios["cash_to_current_liabilities"] = safe_div(cash, current_liabilities)
+
+    # Qualité des actifs
+    ratios["goodwill_to_assets"] = safe_div(goodwill, total_assets)
+    ratios["intangibles_to_assets"] = safe_div(intangibles, total_assets)
+    if goodwill is not None and intangibles is not None:
+        ratios["gw_plus_intang_to_assets"] = safe_div((goodwill + intangibles), total_assets)
+    else:
+        ratios["gw_plus_intang_to_assets"] = None
+
+    # --- Income statement ---
+    ratios["gross_margin"] = safe_div(gross_profit, revenue)
+    ratios["ebit_margin"] = safe_div(ebit, revenue)
+    ratios["net_margin"] = safe_div(net_income, revenue)
+
+    # Profitabilité (approximations transparentes)
+    ratios["roe"] = safe_div(net_income, total_equity)
+    ratios["roa"] = safe_div(net_income, total_assets)
+
+    # ROIC approx (pré-tax) = EBIT / (Equity + Net Debt) si dispo
+    denom = None
+    if total_equity is not None and net_debt is not None:
+        denom = total_equity + net_debt
+    ratios["roic_approx_pretax"] = safe_div(ebit, denom)
+
+    # --- Cash flow quality ---
+    ratios["cfo_to_net_income"] = safe_div(cfo, net_income)
+    ratios["fcf_to_net_income"] = safe_div(fcf, net_income)
+    ratios["fcf_margin"] = safe_div(fcf, revenue)
+    ratios["capex_to_revenue"] = safe_div(capex, revenue)
+
+    # --- Historique ---
+    rev_cagr = compute_revenue_cagr(hist_df)
+    ratios["revenue_cagr_5y"] = rev_cagr
+
+    # fréquence FCF négatif sur l'historique (si dispo)
+    if hist_df is not None and not hist_df.empty and "FCF (approx)" in hist_df.columns:
+        s = hist_df["FCF (approx)"].dropna()
+        if len(s) > 0:
+            ratios["fcf_negative_years_pct"] = float((s < 0).sum()) / float(len(s))
+        else:
+            ratios["fcf_negative_years_pct"] = None
+    else:
+        ratios["fcf_negative_years_pct"] = None
+
+    return ratios
+
+
+# Liste canonique des métriques affichées (clé -> label + pilier + scoring)
+HEALTH_METRICS = [
+    # Balance sheet
+    {"pillar": "Bilan", "key": "equity_to_assets", "label": "Equity / Total Assets", "higher_better": True,  "score_low": 0.10, "score_high": 0.60, "fmt": "pct"},
+    {"pillar": "Bilan", "key": "net_debt_to_equity", "label": "Net Debt / Equity", "higher_better": False, "score_low": 0.00, "score_high": 2.00, "fmt": "x"},
+    {"pillar": "Bilan", "key": "net_debt_to_ebitda", "label": "Net Debt / EBITDA", "higher_better": False, "score_low": 0.00, "score_high": 4.00, "fmt": "x"},
+    {"pillar": "Bilan", "key": "cash_to_debt", "label": "Cash / Total Debt", "higher_better": True,  "score_low": 0.05, "score_high": 0.50, "fmt": "x"},
+
+    # Liquidité
+    {"pillar": "Liquidité", "key": "current_ratio", "label": "Current Ratio", "higher_better": True, "score_low": 1.00, "score_high": 2.00, "fmt": "x"},
+    {"pillar": "Liquidité", "key": "cash_to_current_liabilities", "label": "Cash / Current Liabilities", "higher_better": True, "score_low": 0.20, "score_high": 1.00, "fmt": "x"},
+
+    # Qualité des actifs
+    {"pillar": "Actifs", "key": "gw_plus_intang_to_assets", "label": "(Goodwill + Intangibles) / Total Assets", "higher_better": False, "score_low": 0.10, "score_high": 0.60, "fmt": "pct"},
+
+    # Opérations / marges
+    {"pillar": "Opérations", "key": "gross_margin", "label": "Gross Margin", "higher_better": True, "score_low": 0.20, "score_high": 0.60, "fmt": "pct"},
+    {"pillar": "Opérations", "key": "ebit_margin", "label": "EBIT Margin", "higher_better": True, "score_low": 0.05, "score_high": 0.25, "fmt": "pct"},
+    {"pillar": "Opérations", "key": "net_margin", "label": "Net Margin", "higher_better": True, "score_low": 0.03, "score_high": 0.20, "fmt": "pct"},
+
+    # Rentabilité
+    {"pillar": "Rentabilité", "key": "roe", "label": "ROE", "higher_better": True, "score_low": 0.05, "score_high": 0.20, "fmt": "pct"},
+    {"pillar": "Rentabilité", "key": "roa", "label": "ROA", "higher_better": True, "score_low": 0.02, "score_high": 0.10, "fmt": "pct"},
+    {"pillar": "Rentabilité", "key": "roic_approx_pretax", "label": "ROIC approx (pré-tax)", "higher_better": True, "score_low": 0.05, "score_high": 0.20, "fmt": "pct"},
+
+    # Cash-flow
+    {"pillar": "Cash-flow", "key": "cfo_to_net_income", "label": "CFO / Net Income", "higher_better": True, "score_low": 0.80, "score_high": 1.50, "fmt": "x"},
+    {"pillar": "Cash-flow", "key": "fcf_to_net_income", "label": "FCF / Net Income", "higher_better": True, "score_low": 0.60, "score_high": 1.20, "fmt": "x"},
+    {"pillar": "Cash-flow", "key": "fcf_margin", "label": "FCF Margin", "higher_better": True, "score_low": 0.02, "score_high": 0.15, "fmt": "pct"},
+    {"pillar": "Cash-flow", "key": "capex_to_revenue", "label": "Capex / Revenue", "higher_better": False, "score_low": 0.02, "score_high": 0.15, "fmt": "pct"},
+
+    # Historique
+    {"pillar": "Croissance", "key": "revenue_cagr_5y", "label": "Revenue CAGR (approx, 5y)", "higher_better": True, "score_low": 0.00, "score_high": 0.12, "fmt": "pct"},
+    {"pillar": "Croissance", "key": "fcf_negative_years_pct", "label": "% années FCF négatif (hist.)", "higher_better": False, "score_low": 0.00, "score_high": 0.50, "fmt": "pct"},
+]
+
+
+def _format_metric_value(value, fmt):
+    if value is None:
+        return None
+    try:
+        x = float(value)
+    except Exception:
+        return None
+    if fmt == "pct":
+        return x * 100.0
+    return x
+
+
+def build_health_table(company_ratios: dict, peer_distribution: dict | None = None) -> pd.DataFrame:
+    """
+    Construit le tableau Health.
+    - Si peer_distribution est fourni (dict key -> list[values]) : score = percentile sectoriel (comparables).
+    - Sinon : score = basé sur des seuils génériques (non sectorisés).
+    """
+    rows = []
+    for m in HEALTH_METRICS:
+        key = m["key"]
+        val = company_ratios.get(key)
+
+        median_peer = None
+        percentile = None
+        score = None
+        scoring_method = None
+
+        if peer_distribution and key in peer_distribution and peer_distribution[key]:
+            values = [v for v in peer_distribution[key] if v is not None]
+            values = [float(v) for v in values if not (isinstance(v, float) and math.isnan(v))]
+            if values and val is not None:
+                values_sorted = sorted(values)
+                median_peer = values_sorted[len(values_sorted)//2]
+                # percentile
+                pct = 100.0 * (sum(1 for x in values_sorted if x <= val) / len(values_sorted))
+                if not m["higher_better"]:
+                    pct = 100.0 - pct
+                percentile = pct
+                score = max(0.0, min(10.0, pct / 10.0))
+                scoring_method = "Comparables (percentile)"
+        else:
+            score = _linear_score(
+                value=val,
+                low=m.get("score_low"),
+                high=m.get("score_high"),
+                higher_better=m.get("higher_better", True),
+            )
+            scoring_method = "Seuils génériques (non sectorisé)"
+
+        rows.append({
+            "Pilier": m["pillar"],
+            "Métrique": m["label"],
+            "Valeur": _format_metric_value(val, m.get("fmt")),
+            "Médiane comparables": _format_metric_value(median_peer, m.get("fmt")) if median_peer is not None else None,
+            "Percentile": percentile,
+            "Score /10": score,
+            "Méthode scoring": scoring_method,
+            "_color": _color_from_score(score),
+        })
+
+    df = pd.DataFrame(rows)
+
+    # Score par pilier
+    pillar_scores = (
+        df.groupby("Pilier")["Score /10"]
+        .apply(lambda s: float(s.dropna().mean()) if len(s.dropna()) else None)
+        .reset_index()
+        .rename(columns={"Score /10": "Score moyen /10"})
+    )
+
+    return df, pillar_scores
+
+
+def compute_peer_distribution(peer_tickers: list, api_key: str) -> dict:
+    """
+    Calcule une distribution de ratios à partir d'une liste de tickers EODHD (comparables).
+    Retourne un dict {ratio_key: [values...]}.
+    """
+    dist = {m["key"]: [] for m in HEALTH_METRICS}
+
+    for t in peer_tickers:
+        t = (t or "").strip()
+        if not t:
+            continue
+
+        try:
+            fundamentals_p = fetch_fundamentals_cached(t, api_key)
+            net_debt_p = get_net_debt(fundamentals_p)
+            shares_p = get_shares_outstanding(fundamentals_p)
+
+            y_bs, bs_p = extract_balance_sheet_snapshot(fundamentals_p)
+            y_is, is_p = extract_income_snapshot(fundamentals_p)
+            y_cf, cf_p = extract_cashflow_snapshot(fundamentals_p)
+            hist_p = build_historical_table(fundamentals_p, max_years=5)
+
+            ratios_p = compute_company_health_ratios(
+                company={},
+                bs_snap=bs_p,
+                is_snap=is_p,
+                cf_snap=cf_p,
+                net_debt=net_debt_p,
+                shares=shares_p,
+                hist_df=hist_p,
+            )
+
+            for k in dist.keys():
+                dist[k].append(ratios_p.get(k))
+
+        except Exception:
+            # On ignore les peers qui échouent (données manquantes, erreur API, etc.)
+            continue
+
+    return dist
+
+
+def style_health_table(df: pd.DataFrame):
+    """
+    Renvoie un Styler Streamlit-friendly : applique une couleur de fond au score.
+    """
+    if df is None or df.empty:
+        return df
+
+    def _apply(row):
+        color = row.get("_color", "#E5E7EB")
+        return [""] * (len(row) - 1) + [""]
+
+    # Mise en forme : colorer uniquement la colonne Score /10
+    def color_score(val, row_color):
+        return f"background-color: {row_color};"
+
+    def apply_colors(data):
+        styles = pd.DataFrame("", index=data.index, columns=data.columns)
+        if "Score /10" in data.columns and "_color" in data.columns:
+            for i in data.index:
+                styles.loc[i, "Score /10"] = f"background-color: {data.loc[i, '_color']};"
+        return styles
+
+    df_disp = df.drop(columns=["_color"], errors="ignore").copy()
+
+    # Formats
+    if "Valeur" in df_disp.columns:
+        # on ne force pas de format global; Streamlit affichera proprement
+        pass
+
+    return df_disp.style.apply(apply_colors, axis=None)
+
+
 # =========================================
 # MOTEUR DCF
 # =========================================
@@ -1339,6 +1814,23 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     hist_df = build_historical_table(fundamentals, max_years=5)
 
     # =========================
+    # Snapshots fondamentaux (bilan / IS / CF) + ratios santé
+    # =========================
+    bs_year, bs_snap = extract_balance_sheet_snapshot(fundamentals)
+    is_year, is_snap = extract_income_snapshot(fundamentals)
+    cf_year, cf_snap = extract_cashflow_snapshot(fundamentals)
+
+    health_ratios = compute_company_health_ratios(
+        company=company,
+        bs_snap=bs_snap,
+        is_snap=is_snap,
+        cf_snap=cf_snap,
+        net_debt=net_debt,
+        shares=shares,
+        hist_df=hist_df,
+    )
+
+    # =========================
     # Multiples & profil
     # =========================
     base_financials = extract_base_financials(fundamentals)
@@ -1432,6 +1924,15 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         "shares": shares,
         "net_debt": net_debt,
         "hist_df": hist_df,
+        "health": {
+            "bs_year": bs_year,
+            "is_year": is_year,
+            "cf_year": cf_year,
+            "balance_sheet": bs_snap,
+            "income_statement": is_snap,
+            "cash_flow": cf_snap,
+            "ratios": health_ratios,
+        },
         "fcf_start": fcf_start,
         "proj_df": proj_df,
         "dcf": {
@@ -1525,6 +2026,15 @@ def main():
     )
 
     wacc = wacc_input / 100.0
+
+    st.sidebar.markdown('---')
+    st.sidebar.header('Benchmark comparables (optionnel)')
+    peer_tickers_raw = st.sidebar.text_input(
+        "Tickers EODHD comparables (ex: MSFT.US, GOOGL.US, AMZN.US)",
+        value="",
+    )
+
+    wacc = wacc_input / 100.0
     growth_fcf = growth_fcf_input / 100.0
     g_terminal = g_terminal_input / 100.0
 
@@ -1574,6 +2084,25 @@ def main():
     weights = result["weights"]
     dcf_active = dcf.get("fair_value_per_share") is not None
 
+    # =========================================
+    # TABLEAU SANTÉ FINANCIÈRE (ratios scorés)
+    # =========================================
+    company_ratios = (result.get("health", {}) or {}).get("ratios", {}) or {}
+
+    peer_distribution = None
+    peer_list = []
+    try:
+        raw = (peer_tickers_raw or "").strip()
+        if raw:
+            peer_list = [x.strip() for x in raw.split(",") if x.strip()]
+            if peer_list:
+                peer_distribution = compute_peer_distribution(peer_list, api_key)
+    except Exception:
+        peer_distribution = None
+
+    health_df_raw, pillar_scores = build_health_table(company_ratios, peer_distribution=peer_distribution)
+    health_df_styled = style_health_table(health_df_raw)
+
 
     # Bandeau résumé
     col1, col2, col3, col4 = st.columns(4)
@@ -1606,8 +2135,9 @@ def main():
 
 
     # Tabs
-    tab_resume, tab_hist, tab_proj, tab_dcf, tab_mult, tab_synth = st.tabs(
+    tab_health, tab_resume, tab_hist, tab_proj, tab_dcf, tab_mult, tab_synth = st.tabs(
         [
+            "Santé financière (ratios)",
             "Résumé DCF",
             "Historique 5 ans",
             "Projections FCF",
@@ -1617,7 +2147,44 @@ def main():
         ]
     )
 
-    # ----- TAB 1 : Résumé DCF -----
+    
+    # ----- TAB 0 : Santé financière -----
+    with tab_health:
+        st.subheader("🩺 Santé financière (ratios scorés)")
+
+        # Indication de méthode
+        if peer_list:
+            st.caption("Scoring basé sur le percentile au sein des comparables fournis (comparables = benchmark).")
+        else:
+            st.caption("Scoring basé sur des seuils génériques (aucun benchmark comparables/secteur fourni).")
+
+        if health_df_raw is None or health_df_raw.empty:
+            st.warning("Aucun ratio exploitable n'a pu être calculé avec les données disponibles.")
+        else:
+            st.dataframe(health_df_styled, use_container_width=True)
+
+        st.markdown("#### Score moyen par pilier")
+        if pillar_scores is not None and not pillar_scores.empty:
+            pillar_scores_disp = pillar_scores.copy()
+            pillar_scores_disp["Score moyen /10"] = pillar_scores_disp["Score moyen /10"].round(2)
+            st.dataframe(pillar_scores_disp, use_container_width=True)
+        else:
+            st.info("Score par pilier indisponible.")
+
+        # Snapshots (optionnel)
+        with st.expander("Voir les données sources (dernier exercice)"):
+            h = result.get("health", {}) or {}
+            st.write("Année bilan :", h.get("bs_year"))
+            st.write("Année compte de résultat :", h.get("is_year"))
+            st.write("Année cash-flow :", h.get("cf_year"))
+            st.json({
+                "Balance Sheet": h.get("balance_sheet", {}),
+                "Income Statement": h.get("income_statement", {}),
+                "Cash Flow": h.get("cash_flow", {}),
+            })
+
+
+# ----- TAB 1 : Résumé DCF -----
     with tab_resume:
         st.subheader("🎯 Résumé de la valorisation DCF (base case)")
 
