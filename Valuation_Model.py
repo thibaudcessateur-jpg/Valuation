@@ -1,6 +1,7 @@
 import os
 import math
 import requests
+import json
 import pandas as pd
 import streamlit as st
 
@@ -180,21 +181,71 @@ def get_shares_outstanding(fundamentals: dict):
 
 def get_net_debt(fundamentals: dict):
     """
-    Dette nette ≈ TotalDebt - CashAndEquivalents (dernière année annuelle disponible).
+    Dette nette (dernier exercice annuel disponible).
+    Priorité :
+      1) champ NetDebt/netDebt si présent
+      2) (ShortTermDebt + LongTermDebt) - Cash
+      3) TotalDebt - Cash
+    Remarque : on évite d'inventer la dette si l'API renvoie NULL.
     """
     try:
-        balance_sheet = fundamentals["Financials"]["Balance_Sheet"]["yearly"]
+        balance_sheet = fundamentals.get("Financials", {}).get("Balance_Sheet", {}).get("yearly", {})
         years = sorted(balance_sheet.keys())
         if not years:
             return None
         last_year_key = years[-1]
-        last_year_bs = balance_sheet[last_year_key]
+        row = balance_sheet[last_year_key] or {}
 
-        total_debt = last_year_bs.get("TotalDebt")
-        cash = last_year_bs.get("CashAndCashEquivalents")
+        # Normalisation des clés
+        normalized = {str(k).lower(): row.get(k) for k in row.keys()}
 
-        if total_debt is None or cash is None:
+        def pick(keys):
+            for k in keys:
+                if k in normalized and normalized[k] is not None:
+                    try:
+                        return float(normalized[k])
+                    except (TypeError, ValueError):
+                        continue
             return None
+
+        net_debt = pick(["netdebt", "net_debt"])
+        if net_debt is not None:
+            return net_debt
+
+        cash = pick([
+            "cashandcashequivalents",
+            "cashcashequivalentsandshortterminvestments",
+            "cashandshortterminvestments",
+            "cash",
+            "cashandcash",
+            "cashandcashequivalent",
+        ])
+
+        # Total debt candidates (EODHD/Yahoo-style field names vary)
+        total_debt = pick([
+            "totaldebt",
+            "total_debt",
+            "shortlongtermdebttotal",
+            "shortlongtermdebt",
+            "shortlongtermdebttotal",
+            "shortlongtermdebttotal",
+            "shortlongtermdebttotal",
+        ])
+
+        short_term_debt = pick(["shorttermdebt", "short_term_debt", "currentdebt", "currentdebtandcapitalleaseobligation"])
+        long_term_debt = pick(["longtermdebt", "long_term_debt", "longtermdebtnoncurrent", "longtermdebtandcapitalleaseobligation"])
+
+        if cash is None:
+            return None
+
+        if short_term_debt is not None or long_term_debt is not None:
+            st = short_term_debt or 0.0
+            lt = long_term_debt or 0.0
+            return (st + lt) - cash
+
+        if total_debt is None:
+            return None
+
         return total_debt - cash
     except Exception:
         return None
@@ -707,18 +758,46 @@ def extract_balance_sheet_snapshot(fundamentals: dict):
                 continue
         return None
 
-    total_assets = get_first(["totalassets", "totalassetsreported", "assets"])
-    total_liabilities = get_first([
-        "totalliabilitiesnetminorityinterest",
-        "totalliabilities",
-        "liabilities"
-    ])
-    total_debt = get_first(["totaldebt"])
-    cash = get_first(["cashandcashequivalents", "cashcashequivalentsandshortterminvestments", "cash"])
-    current_assets = get_first(["totalcurrentassets", "currentassets"])
-    current_liabilities = get_first(["totalcurrentliabilities", "currentliabilities"])
-    goodwill = get_first(["goodwill"])
-    intangibles = get_first(["intangibleassets", "intangibleassetsexcludinggoodwill", "intangibles"])
+        peer_distribution = None
+    peer_list = []
+    try:
+        raw = (peer_tickers_raw or "").strip()
+        if raw:
+            peer_list = [x.strip() for x in raw.split(",") if x.strip()]
+            if peer_list:
+                peer_distribution = compute_peer_distribution(peer_list, api_key)
+    except Exception:
+        peer_distribution = None
+
+    # Option auto-sectoriel (si aucun comparable manuel)
+    try:
+        if (peer_distribution is None or not any(peer_distribution.values())) and auto_sector_benchmark:
+            sector = (result.get("company", {}) or {}).get("Sector")
+            exchange = (result.get("company", {}) or {}).get("Exchange") or ""
+            # Exchange EODHD attend souvent 'US', 'LSE', etc. Screener attend exchange en minuscules (ex: 'us').
+            peers_auto = fetch_sector_peers_via_screener(sector=sector, exchange=exchange, api_key=api_key, limit=int(auto_peers_limit))
+            peers_auto = [p for p in peers_auto if p and p.upper() != (result.get("ticker","") or "").upper()]
+            if peers_auto:
+                # limite et calcul distribution
+                peer_list = peers_auto[:int(auto_peers_limit)]
+                peer_distribution = compute_peer_distribution(peer_list, api_key)
+    except Exception:
+        pass
+
+    # Option auto-sectoriel (si aucun comparable manuel)
+    try:
+        if (peer_distribution is None or not any(peer_distribution.values())) and auto_sector_benchmark:
+            sector = (result.get("company", {}) or {}).get("Sector")
+            exchange = (result.get("company", {}) or {}).get("Exchange") or ""
+            # Exchange EODHD attend souvent 'US', 'LSE', etc. Screener attend exchange en minuscules (ex: 'us').
+            peers_auto = fetch_sector_peers_via_screener(sector=sector, exchange=exchange, api_key=api_key, limit=int(auto_peers_limit))
+            peers_auto = [p for p in peers_auto if p and p.upper() != (result.get("ticker","") or "").upper()]
+            if peers_auto:
+                # limite et calcul distribution
+                peer_list = peers_auto[:int(auto_peers_limit)]
+                peer_distribution = compute_peer_distribution(peer_list, api_key)
+    except Exception:
+        pass
 
     # Equity : on réutilise la logique robuste déjà codée dans extract_base_financials (book_equity)
     # car les clés peuvent varier beaucoup selon les tickers.
@@ -878,6 +957,13 @@ def compute_company_health_ratios(
     total_equity = bs_snap.get("total_equity")
     total_debt = bs_snap.get("total_debt")
     cash = bs_snap.get("cash")
+
+    # Fallback dette nette si non fournie (évite les ratios vides si total_debt & cash existent)
+    if net_debt is None and total_debt is not None and cash is not None:
+        try:
+            net_debt = float(total_debt) - float(cash)
+        except Exception:
+            pass
     current_assets = bs_snap.get("current_assets")
     current_liabilities = bs_snap.get("current_liabilities")
     goodwill = bs_snap.get("goodwill")
@@ -1074,6 +1160,16 @@ def compute_peer_distribution(peer_tickers: list, api_key: str) -> dict:
             fundamentals_p = fetch_fundamentals_cached(t, api_key)
             net_debt_p = get_net_debt(fundamentals_p)
             shares_p = get_shares_outstanding(fundamentals_p)
+
+            # Fallback net debt à partir du snapshot bilan si nécessaire
+            if net_debt_p is None:
+                try:
+                    td = bs_p.get("total_debt")
+                    cc = bs_p.get("cash")
+                    if td is not None and cc is not None:
+                        net_debt_p = float(td) - float(cc)
+                except Exception:
+                    pass
 
             y_bs, bs_p = extract_balance_sheet_snapshot(fundamentals_p)
             y_is, is_p = extract_income_snapshot(fundamentals_p)
@@ -2034,6 +2130,19 @@ def main():
         value="",
     )
 
+    auto_sector_benchmark = st.sidebar.checkbox(
+        "Auto comparables sectoriels (EODHD screener) — expérimental",
+        value=False,
+        help="Si activé et si aucun comparable manuel n'est fourni, l'app tente de récupérer des tickers du même secteur via /screener. En cas d'échec, retour au scoring générique.",
+    )
+    auto_peers_limit = st.sidebar.number_input(
+        "Nombre max de comparables auto",
+        min_value=5,
+        max_value=80,
+        value=25,
+        step=5,
+    )
+
     wacc = wacc_input / 100.0
     growth_fcf = growth_fcf_input / 100.0
     g_terminal = g_terminal_input / 100.0
@@ -2099,6 +2208,21 @@ def main():
                 peer_distribution = compute_peer_distribution(peer_list, api_key)
     except Exception:
         peer_distribution = None
+
+    # Option auto-sectoriel (si aucun comparable manuel)
+    try:
+        if (peer_distribution is None or not any(peer_distribution.values())) and auto_sector_benchmark:
+            sector = (result.get("company", {}) or {}).get("Sector")
+            exchange = (result.get("company", {}) or {}).get("Exchange") or ""
+            # Exchange EODHD attend souvent 'US', 'LSE', etc. Screener attend exchange en minuscules (ex: 'us').
+            peers_auto = fetch_sector_peers_via_screener(sector=sector, exchange=exchange, api_key=api_key, limit=int(auto_peers_limit))
+            peers_auto = [p for p in peers_auto if p and p.upper() != (result.get("ticker","") or "").upper()]
+            if peers_auto:
+                # limite et calcul distribution
+                peer_list = peers_auto[:int(auto_peers_limit)]
+                peer_distribution = compute_peer_distribution(peer_list, api_key)
+    except Exception:
+        pass
 
     health_df_raw, pillar_scores = build_health_table(company_ratios, peer_distribution=peer_distribution)
     health_df_styled = style_health_table(health_df_raw)
