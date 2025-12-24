@@ -3,10 +3,6 @@ import math
 import requests
 import pandas as pd
 import streamlit as st
-import datetime as dt
-import pickle
-import re
-from pathlib import Path
 
 # =========================================
 # CONFIG DE BASE
@@ -185,72 +181,81 @@ def get_shares_outstanding(fundamentals: dict):
 def get_net_debt(fundamentals: dict):
     """
     Dette nette (approx) à partir du dernier bilan annuel.
+
+    Convention EODHD (glossaire "Fundamentals"):
+    netDebt = shortTermDebt + longTermDebtTotal - cash (ou cashAndEquivalents). 
+
     Priorité :
-    1) champ 'NetDebt' / 'netDebt' si fourni
-    2) (ShortTermDebt + LongTermDebt) - Cash
-    3) TotalDebt - Cash
+    1) champ 'netDebt' s'il est fourni
+    2) (shortLongTermDebtTotal OU totalDebt) - cash
+    3) (shortTermDebt + longTermDebtTotal/longTermDebt) - cash
 
     Remarque : si la dette ou le cash n'est pas disponible, renvoie None (pas d'invention).
     """
     try:
-        balance_sheet = fundamentals.get("Financials", {}).get("Balance_Sheet", {}).get("yearly", {})
-        if not isinstance(balance_sheet, dict) or not balance_sheet:
+        bs = fundamentals.get("Financials", {}).get("Balance_Sheet", {}).get("yearly", {})
+        year, row = _extract_latest_year_row(bs)
+        if not isinstance(row, dict) or not row:
             return None
 
-        years = sorted(balance_sheet.keys())
-        last_year_key = years[-1]
-        last_year_bs = balance_sheet.get(last_year_key, {}) or {}
-
-        # Normalisation des clés pour être tolérant à la casse / formats
-        norm = {str(k).lower(): v for k, v in last_year_bs.items()}
-
-        def _get_float(*keys):
-            for k in keys:
-                v = norm.get(k.lower())
-                if v is None:
-                    continue
-                try:
-                    return float(v)
-                except Exception:
-                    continue
-            return None
-
-        # 1) Net debt directement si dispo
-        net_debt = _get_float("netdebt", "net_debt", "NetDebt".lower())
+        # 1) netDebt direct
+        net_debt = pick_first_non_null(row, ["netDebt", "NetDebt", "net_debt"])
         if net_debt is not None:
             return net_debt
 
-        # Cash
-        cash = _get_float(
-            "cashandcashequivalents",
-            "cash_and_cash_equivalents",
-            "cashandcashequivalentsandshortterminvestments",
-            "cash_and_cash_equivalents_and_short_term_investments",
-            "cashcashequivalentsandshortterminvestments",
-            "cash",
+        # Cash (EODHD : cash et cashAndEquivalents peuvent différer selon l'exchange) 
+        cash = pick_first_non_null(
+            row,
+            [
+                "cashAndEquivalents",
+                "cashAndCashEquivalents",
+                "cashAndCashEquivalentsAndShortTermInvestments",
+                "cash",
+                "Cash",
+                "cash_and_equivalents",
+                "cash_and_cash_equivalents",
+            ],
         )
 
-        # 2) Dette court + long terme
-        st_debt = _get_float("shorttermdebt", "short_term_debt", "shorttermborrowings", "currentdebt")
-        lt_debt = _get_float(
-            "longtermdebt",
-            "long_term_debt",
-            "longtermdebtnoncurrent",
-            "longtermdebtandcapitalleaseobligation",
-            "noncurrentdebt",
-        )
-
-        if st_debt is not None or lt_debt is not None:
-            total = (st_debt or 0.0) + (lt_debt or 0.0)
-            if cash is None:
-                return None
-            return total - cash
-
-        # 3) Total debt
-        total_debt = _get_float("totaldebt", "total_debt", "shortlongtermdebttotal", "totaldebtgrossminorityinterest", "debt")
-        if total_debt is None or cash is None:
+        if cash is None:
             return None
-        return total_debt - cash
+
+        # 2) total debt direct
+        total_debt = pick_first_non_null(
+            row,
+            [
+                "shortLongTermDebtTotal",
+                "ShortLongTermDebtTotal",
+                "totalDebt",
+                "TotalDebt",
+                "total_debt",
+                "totalDebtGrossMinorityInterest",
+                "totalDebtNetMinorityInterest",
+                "debt",
+            ],
+        )
+        if total_debt is not None:
+            return total_debt - cash
+
+        # 3) short + long
+        st_debt = pick_first_non_null(row, ["shortTermDebt", "ShortTermDebt", "short_term_debt", "currentDebt", "current_debt"])
+        lt_debt = pick_first_non_null(
+            row,
+            [
+                "longTermDebtTotal",
+                "LongTermDebtTotal",
+                "longTermDebt",
+                "LongTermDebt",
+                "long_term_debt_total",
+                "long_term_debt",
+                "longTermDebtNonCurrent",
+                "longtermdebtnoncurrent",
+            ],
+        )
+        if st_debt is None and lt_debt is None:
+            return None
+
+        return (st_debt or 0.0) + (lt_debt or 0.0) - cash
 
     except Exception:
         return None
@@ -259,14 +264,35 @@ def get_net_debt(fundamentals: dict):
 def pick_first_non_null(row: dict, candidates):
     """
     Retourne la première valeur non nulle trouvée parmi les clés candidates dans `row`.
-    Si rien n'est trouvé, renvoie None.
+    Robustesse EODHD :
+    - recherche directe (clé exacte)
+    - fallback insensible à la casse + suppression des underscores/espaces/tirets.
     """
+    if not isinstance(row, dict) or not row:
+        return None
+
+    def _norm_key(k: str) -> str:
+        return str(k).strip().lower().replace("_", "").replace(" ", "").replace("-", "")
+
+    # map normalisée -> valeur
+    normalized = {_norm_key(k): v for k, v in row.items()}
+
     for key in candidates:
+        # 1) exact
         if key in row and row[key] is not None:
             try:
                 return float(row[key])
             except (TypeError, ValueError):
+                pass
+
+        # 2) normalisé
+        nk = _norm_key(key)
+        if nk in normalized and normalized[nk] is not None:
+            try:
+                return float(normalized[nk])
+            except (TypeError, ValueError):
                 continue
+
     return None
 
 
@@ -494,6 +520,8 @@ def extract_base_financials(fundamentals: dict):
     - ebit
     - net_income
     - book_equity (fonds propres comptables)
+
+    Bonnes pratiques EODHD : certaines clés diffèrent selon les exchanges (camelCase vs variantes). 
     """
     inc = fundamentals.get("Financials", {}).get("Income_Statement", {}).get("yearly", {})
     bs = fundamentals.get("Financials", {}).get("Balance_Sheet", {}).get("yearly", {})
@@ -510,24 +538,25 @@ def extract_base_financials(fundamentals: dict):
 
         revenue = pick_first_non_null(
             row_inc,
-            ["TotalRevenue", "Revenue", "totalRevenue", "SalesRevenueNet", "Sales"],
+            ["totalRevenue", "TotalRevenue", "revenue", "Revenue", "SalesRevenueNet", "Sales"],
         )
 
         ebitda = pick_first_non_null(
             row_inc,
-            ["EBITDA", "Ebitda", "ebitda", "OperatingIncomeBeforeDepreciation"],
+            ["ebitda", "EBITDA", "Ebitda", "OperatingIncomeBeforeDepreciation"],
         )
 
         ebit = pick_first_non_null(
             row_inc,
-            ["OperatingIncome", "OperatingIncomeLoss", "EBIT", "Ebit", "ebit"],
+            ["ebit", "EBIT", "operatingIncome", "OperatingIncome", "OperatingIncomeLoss"],
         )
 
         net_income = pick_first_non_null(
             row_inc,
             [
-                "NetIncome",
                 "netIncome",
+                "NetIncome",
+                "net_income",
                 "NetIncomeCommonStockholders",
                 "NetIncomeIncludingNoncontrollingInterests",
             ],
@@ -541,57 +570,63 @@ def extract_base_financials(fundamentals: dict):
         last_year_bs = years_bs[-1]
         row_bs = bs.get(last_year_bs, {}) or {}
 
-        # Normaliser les clés en minuscules (insensible à la casse)
-        normalized = {k.lower(): v for k, v in row_bs.items()}
+        # Normaliser les clés (insensible à la casse + suppression _ / espaces / tirets)
+        def _norm_key(k: str) -> str:
+            return str(k).strip().lower().replace("_", "").replace(" ", "").replace("-", "")
 
-        # Clés possibles pour les fonds propres (équity)
-        equity_keys = [
+        normalized = {_norm_key(k): v for k, v in row_bs.items()}
+
+        def _get_float(*keys):
+            for k in keys:
+                v = normalized.get(_norm_key(k))
+                if v is None:
+                    continue
+                try:
+                    return float(v)
+                except Exception:
+                    continue
+            return None
+
+        # Equity direct (plusieurs variantes)
+        equity = _get_float(
+            "totalStockholderEquity",
+            "totalStockholdersEquity",
             "totalstockholderequity",
-            "totalstockholdersequity",
-            "totalshareholdersequity",
-            "commonstockequity",
-            "stockholdersequity",
-            "shareholdersequity",
-            "totalequity",
-            "totalequitygrossminorityinterest",
-            "totalequityandminorityinterest",
-        ]
+            "totalStockholdersequity",
+            "totalShareholdersEquity",
+            "commonStockEquity",
+            "stockholdersEquity",
+            "shareholdersEquity",
+            "totalEquity",
+            "total_equity",
+            "totalEquityGrossMinorityInterest",
+            "totalEquityAndMinorityInterest",
+        )
+        if equity is not None and equity not in (0.0,):
+            book_equity = equity
 
-        # Recherche directe dans les clés normalisées
-        for key in equity_keys:
-            if key in normalized and normalized[key] not in (None, 0):
-                try:
-                    book_equity = float(normalized[key])
-                    break
-                except:
-                    pass
-
-        # ---------------------------
-        # Fallback automatique
-        # book_equity = TotalAssets – TotalLiabilities
-        # ---------------------------
+        # Fallback : book_equity = totalAssets - totalLiab 
         if book_equity is None:
-            total_assets = (
-                normalized.get("totalassets")
-                or normalized.get("totalassetsreported")
-                or normalized.get("assets")
+            total_assets = _get_float("totalAssets", "total_assets", "totalAssetsReported", "assets")
+            total_liab = _get_float(
+                "totalLiab",
+                "total_liab",
+                "total_liabilities",
+                "totalLiabilitiesNetMinorityInterest",
+                "totalLiabilities",
+                "liabilities",
             )
 
-            total_liabilities = (
-                normalized.get("totalliabilitiesnetminorityinterest")
-                or normalized.get("totalliabilities")
-                or normalized.get("liabilities")
-            )
+            # si totalLiab absent mais assets+equity présents : totalLiab = assets - equity
+            if total_liab is None and total_assets is not None and equity is not None:
+                total_liab = total_assets - equity
 
-            if total_assets is not None and total_liabilities is not None:
+            if total_assets is not None and total_liab is not None:
                 try:
-                    book_equity = float(total_assets) - float(total_liabilities)
-                except:
+                    book_equity = float(total_assets) - float(total_liab)
+                except Exception:
                     book_equity = None
 
-    # ============================================================
-    #                     RETURN FINAL
-    # ============================================================
     return {
         "revenue": revenue,
         "ebitda": ebitda,
@@ -600,6 +635,129 @@ def extract_base_financials(fundamentals: dict):
         "book_equity": book_equity,
     }
 
+
+def extract_base_financials(fundamentals: dict):
+    """
+    Extrait les valeurs de base (dernière année annuelle) nécessaires aux multiples :
+    - revenue
+    - ebitda
+    - ebit
+    - net_income
+    - book_equity (fonds propres comptables)
+
+    Bonnes pratiques EODHD : certaines clés diffèrent selon les exchanges (camelCase vs variantes). 
+    """
+    inc = fundamentals.get("Financials", {}).get("Income_Statement", {}).get("yearly", {})
+    bs = fundamentals.get("Financials", {}).get("Balance_Sheet", {}).get("yearly", {})
+
+    revenue = ebitda = ebit = net_income = book_equity = None
+
+    # ============================================================
+    #                   INCOME STATEMENT
+    # ============================================================
+    if isinstance(inc, dict) and inc:
+        years_inc = sorted(inc.keys())
+        last_year_inc = years_inc[-1]
+        row_inc = inc.get(last_year_inc, {}) or {}
+
+        revenue = pick_first_non_null(
+            row_inc,
+            ["totalRevenue", "TotalRevenue", "revenue", "Revenue", "SalesRevenueNet", "Sales"],
+        )
+
+        ebitda = pick_first_non_null(
+            row_inc,
+            ["ebitda", "EBITDA", "Ebitda", "OperatingIncomeBeforeDepreciation"],
+        )
+
+        ebit = pick_first_non_null(
+            row_inc,
+            ["ebit", "EBIT", "operatingIncome", "OperatingIncome", "OperatingIncomeLoss"],
+        )
+
+        net_income = pick_first_non_null(
+            row_inc,
+            [
+                "netIncome",
+                "NetIncome",
+                "net_income",
+                "NetIncomeCommonStockholders",
+                "NetIncomeIncludingNoncontrollingInterests",
+            ],
+        )
+
+    # ============================================================
+    #                     BALANCE SHEET
+    # ============================================================
+    if isinstance(bs, dict) and bs:
+        years_bs = sorted(bs.keys())
+        last_year_bs = years_bs[-1]
+        row_bs = bs.get(last_year_bs, {}) or {}
+
+        # Normaliser les clés (insensible à la casse + suppression _ / espaces / tirets)
+        def _norm_key(k: str) -> str:
+            return str(k).strip().lower().replace("_", "").replace(" ", "").replace("-", "")
+
+        normalized = {_norm_key(k): v for k, v in row_bs.items()}
+
+        def _get_float(*keys):
+            for k in keys:
+                v = normalized.get(_norm_key(k))
+                if v is None:
+                    continue
+                try:
+                    return float(v)
+                except Exception:
+                    continue
+            return None
+
+        # Equity direct (plusieurs variantes)
+        equity = _get_float(
+            "totalStockholderEquity",
+            "totalStockholdersEquity",
+            "totalstockholderequity",
+            "totalStockholdersequity",
+            "totalShareholdersEquity",
+            "commonStockEquity",
+            "stockholdersEquity",
+            "shareholdersEquity",
+            "totalEquity",
+            "total_equity",
+            "totalEquityGrossMinorityInterest",
+            "totalEquityAndMinorityInterest",
+        )
+        if equity is not None and equity not in (0.0,):
+            book_equity = equity
+
+        # Fallback : book_equity = totalAssets - totalLiab 
+        if book_equity is None:
+            total_assets = _get_float("totalAssets", "total_assets", "totalAssetsReported", "assets")
+            total_liab = _get_float(
+                "totalLiab",
+                "total_liab",
+                "total_liabilities",
+                "totalLiabilitiesNetMinorityInterest",
+                "totalLiabilities",
+                "liabilities",
+            )
+
+            # si totalLiab absent mais assets+equity présents : totalLiab = assets - equity
+            if total_liab is None and total_assets is not None and equity is not None:
+                total_liab = total_assets - equity
+
+            if total_assets is not None and total_liab is not None:
+                try:
+                    book_equity = float(total_assets) - float(total_liab)
+                except Exception:
+                    book_equity = None
+
+    return {
+        "revenue": revenue,
+        "ebitda": ebitda,
+        "ebit": ebit,
+        "net_income": net_income,
+        "book_equity": book_equity,
+    }
 
 
 def safe_div(num, den):
@@ -698,18 +856,25 @@ def extract_balance_sheet_snapshot(fundamentals: dict):
     """
     Extrait un snapshot de bilan (dernier exercice annuel) avec des clés standardisées.
     Retourne aussi l'année du snapshot.
+
+    Notes EODHD (glossaire Fundamentals):
+    - totalAssets, totalLiab, totalStockholderEquity 
+    - cash vs cashAndEquivalents : peut varier selon l'exchange 
     """
     bs = fundamentals.get("Financials", {}).get("Balance_Sheet", {}).get("yearly", {})
     year, row = _extract_latest_year_row(bs)
 
-    if not row:
+    if not row or not isinstance(row, dict):
         return year, {}
 
-    normalized = {str(k).lower(): v for k, v in row.items()}
+    def _norm_key(k: str) -> str:
+        return str(k).strip().lower().replace("_", "").replace(" ", "").replace("-", "")
+
+    normalized = {_norm_key(k): v for k, v in row.items()}
 
     def get_first(keys):
         for k in keys:
-            v = normalized.get(k)
+            v = normalized.get(_norm_key(k))
             if v is None:
                 continue
             try:
@@ -718,29 +883,84 @@ def extract_balance_sheet_snapshot(fundamentals: dict):
                 continue
         return None
 
-    total_assets = get_first(["totalassets", "total_assets", "totalassetsreported", "assets"])
-    total_liabilities = get_first([
-        "totalliabilitiesnetminorityinterest",
-        "totalliabilities",
-        "total_liabilities",
-        "liabilities"
-    ])
-    # Dette totale : plusieurs variantes possibles selon EODHD
-    total_debt = get_first(["totaldebt", "total_debt", "shortlongtermdebttotal", "totaldebtgrossminorityinterest", "debt"])
+    total_assets = get_first(["totalAssets", "total_assets", "totalassets", "totalAssetsReported", "assets"])
+
+    # EODHD utilise souvent totalLiab (et non totalLiabilities) 
+    total_liabilities = get_first(
+        [
+            "totalLiab",
+            "total_liab",
+            "total_liabilities",
+            "totalLiabilitiesNetMinorityInterest",
+            "totalLiabilities",
+            "liabilities",
+        ]
+    )
+
+    # Equity (si dispo en direct)
+    total_equity_direct = get_first(
+        [
+            "totalStockholderEquity",
+            "total_stockholder_equity",
+            "totalStockholdersEquity",
+            "totalEquity",
+            "total_equity",
+            "commonStockEquity",
+            "stockholdersEquity",
+            "shareholdersEquity",
+        ]
+    )
+
+    # Si liabilities est manquant mais assets+equity sont dispo :
+    # totalLiab = totalAssets - totalStockholderEquity 
+    if total_liabilities is None and total_assets is not None and total_equity_direct is not None:
+        total_liabilities = total_assets - total_equity_direct
+
+    # Dette totale
+    total_debt = get_first(
+        [
+            "shortLongTermDebtTotal",
+            "totalDebt",
+            "total_debt",
+            "totalDebtGrossMinorityInterest",
+            "debt",
+        ]
+    )
     if total_debt is None:
-        st_debt = get_first(["shorttermdebt", "short_term_debt", "shorttermborrowings", "currentdebt"])
-        lt_debt = get_first(["longtermdebt", "long_term_debt", "longtermdebtnoncurrent", "longtermdebtandcapitalleaseobligation", "noncurrentdebt"])
+        st_debt = get_first(["shortTermDebt", "short_term_debt", "currentDebt", "current_debt", "shortLongTermDebt"])
+        lt_debt = get_first(
+            [
+                "longTermDebtTotal",
+                "longTermDebt",
+                "long_term_debt_total",
+                "long_term_debt",
+                "longTermDebtNonCurrent",
+                "longtermdebtnoncurrent",
+                "longTermDebtAndCapitalLeaseObligation",
+                "nonCurrentDebt",
+            ]
+        )
         if st_debt is not None or lt_debt is not None:
             total_debt = (st_debt or 0.0) + (lt_debt or 0.0)
 
-    cash = get_first(["cashandcashequivalents", "cash_and_cash_equivalents", "cashcashequivalentsandshortterminvestments", "cash"])
-    current_assets = get_first(["totalcurrentassets", "currentassets"])
-    current_liabilities = get_first(["totalcurrentliabilities", "currentliabilities"])
-    goodwill = get_first(["goodwill"])
-    intangibles = get_first(["intangibleassets", "intangibleassetsexcludinggoodwill", "intangibles"])
+    cash = get_first(
+        [
+            "cashAndEquivalents",
+            "cashAndCashEquivalents",
+            "cashAndCashEquivalentsAndShortTermInvestments",
+            "cashAndShortTermInvestments",
+            "cash",
+        ]
+    )
 
-    # Equity : on réutilise la logique robuste déjà codée dans extract_base_financials (book_equity)
-    # car les clés peuvent varier beaucoup selon les tickers.
+    current_assets = get_first(["totalCurrentAssets", "currentAssets", "current_assets"])
+    current_liabilities = get_first(["totalCurrentLiabilities", "currentLiabilities", "current_liabilities"])
+
+    goodwill = get_first(["goodWill", "goodwill"])
+    intangibles = get_first(["intangibleAssets", "intangible_assets", "intangibles", "intangibleAssetsExcludingGoodwill"])
+
+    # Equity : on réutilise la logique robuste de extract_base_financials (inclut plusieurs clés + fallback)
+    book_equity = None
     try:
         book_equity = extract_base_financials(fundamentals).get("book_equity")
         if book_equity is not None:
@@ -748,7 +968,10 @@ def extract_balance_sheet_snapshot(fundamentals: dict):
     except Exception:
         book_equity = None
 
-    # Fallback equity si besoin : Assets - Liabilities
+    # Fallback final equity si toujours None
+    if book_equity is None and total_equity_direct is not None:
+        book_equity = total_equity_direct
+
     if book_equity is None and total_assets is not None and total_liabilities is not None:
         book_equity = total_assets - total_liabilities
 
@@ -767,8 +990,11 @@ def extract_balance_sheet_snapshot(fundamentals: dict):
 
 def extract_cashflow_snapshot(fundamentals: dict):
     """
-    Extrait un snapshot de cash-flow (dernier exercice annuel) : CFO, capex, FCF approx.
+    Extrait un snapshot de cash-flow (dernier exercice annuel) : CFO, capex, FCF.
     Retourne aussi l'année.
+
+    Conventions EODHD (glossaire Fundamentals):
+    - totalCashFromOperatingActivities, capitalExpenditures, freeCashFlow 
     """
     cf = fundamentals.get("Financials", {}).get("Cash_Flow", {}).get("yearly", {})
     year, row = _extract_latest_year_row(cf)
@@ -781,8 +1007,9 @@ def extract_cashflow_snapshot(fundamentals: dict):
             "totalCashFromOperatingActivities",
             "TotalCashFromOperatingActivities",
             "NetCashProvidedByOperatingActivities",
-            "NetCashFromOperatingActivities",
-            "OperatingCashFlow",
+            "cashFromOperatingActivities",
+            "cfo",
+            "CFO",
         ],
     )
     capex = pick_first_non_null(
@@ -792,10 +1019,15 @@ def extract_cashflow_snapshot(fundamentals: dict):
             "CapitalExpenditures",
             "investmentsInPropertyPlantAndEquipment",
             "InvestmentsInPropertyPlantAndEquipment",
+            "capex",
+            "CAPEX",
         ],
     )
+    fcf = pick_first_non_null(row, ["freeCashFlow", "FreeCashFlow", "fcf", "FCF"])
 
-    fcf = (ocf - capex) if (ocf is not None and capex is not None) else None
+    if fcf is None and ocf is not None and capex is not None:
+        fcf = ocf - capex
+
     return year, {"cfo": ocf, "capex": capex, "fcf": fcf}
 
 
@@ -803,20 +1035,38 @@ def extract_income_snapshot(fundamentals: dict):
     """
     Extrait un snapshot compte de résultat (dernier exercice annuel) : revenue, ebitda, ebit, net_income, gross_profit.
     Retourne aussi l'année.
+
+    Conventions EODHD (glossaire Fundamentals):
+    - totalRevenue, grossProfit, ebit, ebitda, netIncome 
     """
     inc = fundamentals.get("Financials", {}).get("Income_Statement", {}).get("yearly", {})
     year, row = _extract_latest_year_row(inc)
     if not row:
         return year, {}
 
-    revenue = pick_first_non_null(row, ["TotalRevenue", "Revenue", "totalRevenue", "SalesRevenueNet", "Sales"])
-    ebitda = pick_first_non_null(row, ["EBITDA", "Ebitda", "ebitda", "OperatingIncomeBeforeDepreciation"])
-    ebit = pick_first_non_null(row, ["OperatingIncome", "OperatingIncomeLoss", "EBIT", "Ebit", "ebit"])
+    revenue = pick_first_non_null(
+        row,
+        ["totalRevenue", "TotalRevenue", "revenue", "Revenue", "SalesRevenueNet", "Sales"],
+    )
+    ebitda = pick_first_non_null(
+        row,
+        ["ebitda", "EBITDA", "Ebitda", "OperatingIncomeBeforeDepreciation"],
+    )
+    ebit = pick_first_non_null(
+        row,
+        ["ebit", "EBIT", "operatingIncome", "OperatingIncome", "OperatingIncomeLoss"],
+    )
     net_income = pick_first_non_null(
         row,
-        ["NetIncome", "netIncome", "NetIncomeCommonStockholders", "NetIncomeIncludingNoncontrollingInterests"],
+        [
+            "netIncome",
+            "NetIncome",
+            "net_income",
+            "NetIncomeCommonStockholders",
+            "NetIncomeIncludingNoncontrollingInterests",
+        ],
     )
-    gross_profit = pick_first_non_null(row, ["GrossProfit", "grossProfit"])
+    gross_profit = pick_first_non_null(row, ["grossProfit", "GrossProfit", "gross_profit"])
 
     return year, {
         "revenue": revenue,
@@ -963,30 +1213,6 @@ def compute_company_health_ratios(
     else:
         ratios["fcf_negative_years_pct"] = None
 
-
-    # --- Solvabilité / service de la dette ---
-    # Net Debt / FCF (plus bas = mieux) : si dette nette <= 0 (net cash), on laisse None (pas de ratio de levier).
-    if net_debt is not None and fcf not in (None, 0) and net_debt > 0:
-        ratios["net_debt_to_fcf"] = safe_div(net_debt, fcf)
-        ratios["fcf_to_net_debt"] = safe_div(fcf, net_debt)
-    else:
-        ratios["net_debt_to_fcf"] = None
-        ratios["fcf_to_net_debt"] = None
-
-    # --- Stabilité (volatilité de marge EBIT sur l'historique) ---
-    ratios["ebit_margin_vol_5y"] = None
-    try:
-        if hist_df is not None and not hist_df.empty:
-            # colonnes attendues dans build_historical_table()
-            if ("EBIT" in hist_df.columns) and ("Chiffre d\'affaires" in hist_df.columns):
-                tmp = hist_df[["EBIT", "Chiffre d\'affaires"]].dropna()
-                tmp = tmp[tmp["Chiffre d\'affaires"] != 0]
-                if len(tmp) >= 3:
-                    margins = (tmp["EBIT"] / tmp["Chiffre d\'affaires"]).astype(float)
-                    ratios["ebit_margin_vol_5y"] = float(margins.std(ddof=0))
-    except Exception:
-        ratios["ebit_margin_vol_5y"] = None
-
     return ratios
 
 
@@ -996,9 +1222,6 @@ HEALTH_METRICS = [
     {"pillar": "Bilan", "key": "equity_to_assets", "label": "Equity / Total Assets", "higher_better": True,  "score_low": 0.10, "score_high": 0.60, "fmt": "pct"},
     {"pillar": "Bilan", "key": "net_debt_to_equity", "label": "Net Debt / Equity", "higher_better": False, "score_low": 0.00, "score_high": 2.00, "fmt": "x"},
     {"pillar": "Bilan", "key": "net_debt_to_ebitda", "label": "Net Debt / EBITDA", "higher_better": False, "score_low": 0.00, "score_high": 4.00, "fmt": "x"},
-    # Solvabilité (dette vs génération de cash)
-    {"pillar": "Solvabilité", "key": "net_debt_to_fcf", "label": "Net Debt / FCF", "higher_better": False, "score_low": 0.00, "score_high": 15.00, "fmt": "x"},
-    {"pillar": "Solvabilité", "key": "fcf_to_net_debt", "label": "FCF / Net Debt", "higher_better": True, "score_low": 0.02, "score_high": 0.20, "fmt": "pct"},
     {"pillar": "Bilan", "key": "cash_to_debt", "label": "Cash / Total Debt", "higher_better": True,  "score_low": 0.05, "score_high": 0.50, "fmt": "x"},
 
     # Liquidité
@@ -1012,7 +1235,6 @@ HEALTH_METRICS = [
     {"pillar": "Opérations", "key": "gross_margin", "label": "Gross Margin", "higher_better": True, "score_low": 0.20, "score_high": 0.60, "fmt": "pct"},
     {"pillar": "Opérations", "key": "ebit_margin", "label": "EBIT Margin", "higher_better": True, "score_low": 0.05, "score_high": 0.25, "fmt": "pct"},
     {"pillar": "Opérations", "key": "net_margin", "label": "Net Margin", "higher_better": True, "score_low": 0.03, "score_high": 0.20, "fmt": "pct"},
-    {"pillar": "Stabilité", "key": "ebit_margin_vol_5y", "label": "Volatilité marge EBIT (≈5 ans)", "higher_better": False, "score_low": 0.02, "score_high": 0.15, "fmt": "pct"},
 
     # Rentabilité
     {"pillar": "Rentabilité", "key": "roe", "label": "ROE", "higher_better": True, "score_low": 0.05, "score_high": 0.20, "fmt": "pct"},
@@ -1073,41 +1295,18 @@ def build_health_table(company_ratios: dict, peer_distribution: dict | None = No
                 score = max(0.0, min(10.0, pct / 10.0))
                 scoring_method = "Comparables (percentile)"
         else:
-            # Certaines métriques sont très dépendantes du secteur / modèle économique.
-            # Sans comparables, on les présente comme "flag" plutôt que de donner un score arbitraire.
-            if key in {"gw_plus_intang_to_assets"}:
-                score = None
-                scoring_method = "Flag (non sectorisé)"
-            else:
-                score = _linear_score(
-                    value=val,
-                    low=m.get("score_low"),
-                    high=m.get("score_high"),
-                    higher_better=m.get("higher_better", True),
-                )
-                scoring_method = "Seuils génériques (non sectorisé)"
-
-        flag = None
-        if key == "gw_plus_intang_to_assets" and val is not None:
-            try:
-                v = float(val)
-            except Exception:
-                v = None
-            if v is not None:
-                if v >= 0.60:
-                    flag = "Très élevé"
-                elif v >= 0.40:
-                    flag = "Élevé"
-                elif v >= 0.20:
-                    flag = "Modéré"
-                else:
-                    flag = "Faible"
+            score = _linear_score(
+                value=val,
+                low=m.get("score_low"),
+                high=m.get("score_high"),
+                higher_better=m.get("higher_better", True),
+            )
+            scoring_method = "Seuils génériques (non sectorisé)"
 
         rows.append({
             "Pilier": m["pillar"],
             "Métrique": m["label"],
             "Valeur": _format_metric_value(val, m.get("fmt")),
-            "Flag": flag,
             "Médiane comparables": _format_metric_value(median_peer, m.get("fmt")) if median_peer is not None else None,
             "Percentile": percentile,
             "Score /10": score,
@@ -1168,99 +1367,6 @@ def compute_peer_distribution(peer_tickers: list, api_key: str) -> dict:
             continue
 
     return dist
-
-
-# =========================================
-# BENCHMARK SECTORIEL (CACHE LOCAL)
-# =========================================
-
-SECTOR_CACHE_DIR = Path("sector_cache")
-
-def _sanitize_sector_key(sector: str) -> str:
-    if not sector:
-        return ""
-    s = sector.strip().lower()
-    s = re.sub(r"[^a-z0-9]+", "_", s)
-    return s.strip("_")
-
-def _sector_cache_path(sector: str) -> Path:
-    key = _sanitize_sector_key(sector)
-    if not key:
-        return None
-    SECTOR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    return SECTOR_CACHE_DIR / f"{key}.pkl"
-
-def load_sector_cache(sector: str, max_age_days: int = 31):
-    """
-    Charge un benchmark sectoriel depuis le disque.
-    Retourne (peer_distribution, peer_list, age_days) ou (None, [], None) si indisponible / trop ancien.
-    """
-    path = _sector_cache_path(sector)
-    if path is None or not path.exists():
-        return None, [], None
-    try:
-        payload = pickle.loads(path.read_bytes())
-        updated_at = payload.get("updated_at")
-        peer_list = payload.get("peer_list") or []
-        peer_distribution = payload.get("peer_distribution") or None
-        if not updated_at or peer_distribution is None:
-            return None, [], None
-        updated_dt = dt.datetime.fromisoformat(updated_at)
-        age_days = (dt.datetime.now() - updated_dt).days
-        if max_age_days is not None and age_days > int(max_age_days):
-            return None, [], age_days
-        return peer_distribution, peer_list, age_days
-    except Exception:
-        return None, [], None
-
-def save_sector_cache(sector: str, peer_distribution: dict, peer_list: list):
-    path = _sector_cache_path(sector)
-    if path is None:
-        return
-    try:
-        payload = {
-            "updated_at": dt.datetime.now().isoformat(timespec="seconds"),
-            "peer_list": peer_list or [],
-            "peer_distribution": peer_distribution or {},
-        }
-        path.write_bytes(pickle.dumps(payload))
-    except Exception:
-        return
-
-def load_sector_peers_from_csv(sector: str, csv_path: str = "sector_peers.csv", limit: int = 30) -> list:
-    """
-    Lit un fichier CSV local (case-insensitive) avec au minimum :
-    - sector
-    - ticker
-    Permet d'avoir une base de peers "déjà connue", mise à jour manuellement/ponctuellement.
-    """
-    if not sector:
-        return []
-    p = Path(csv_path)
-    if not p.exists():
-        return []
-    try:
-        df = pd.read_csv(p)
-        # normalise colonnes
-        cols = {c.lower().strip(): c for c in df.columns}
-        if "sector" not in cols or "ticker" not in cols:
-            return []
-        df2 = df[[cols["sector"], cols["ticker"]]].copy()
-        df2.columns = ["sector", "ticker"]
-        df2["sector"] = df2["sector"].astype(str).str.strip().str.lower()
-        df2["ticker"] = df2["ticker"].astype(str).str.strip()
-        wanted = sector.strip().lower()
-        peers = df2[df2["sector"] == wanted]["ticker"].dropna().tolist()
-        # dédoublonne en conservant l'ordre
-        seen = set()
-        out = []
-        for t in peers:
-            if t and t not in seen:
-                seen.add(t)
-                out.append(t)
-        return out[: int(limit)]
-    except Exception:
-        return []
 
 
 def style_health_table(df: pd.DataFrame):
@@ -2197,11 +2303,6 @@ def main():
         value="",
     )
 
-    use_sector_cache = st.sidebar.checkbox("Utiliser benchmark sectoriel (cache)", value=True)
-    cache_max_age_days = st.sidebar.number_input("MAJ auto si cache > (jours)", min_value=7, max_value=120, value=31, step=1)
-    sector_peers_csv = st.sidebar.text_input("Fichier peers secteur (optionnel)", value="sector_peers.csv")
-    refresh_sector_cache = st.sidebar.button("Rafraîchir cache secteur maintenant")
-
     wacc = wacc_input / 100.0
     growth_fcf = growth_fcf_input / 100.0
     g_terminal = g_terminal_input / 100.0
@@ -2259,42 +2360,14 @@ def main():
 
     peer_distribution = None
     peer_list = []
-
-    # Secteur (pour cache sectoriel)
-    sector_name = (result.get("company", {}) or {}).get("Sector") or (result.get("company", {}) or {}).get("sector") or ""
-    sector_name = str(sector_name).strip()
-
-    # 1) Comparables manuels (prioritaire)
-    raw = (peer_tickers_raw or "").strip()
-    if raw:
-        peer_list = [x.strip() for x in raw.split(",") if x.strip()]
-        if peer_list:
-            try:
+    try:
+        raw = (peer_tickers_raw or "").strip()
+        if raw:
+            peer_list = [x.strip() for x in raw.split(",") if x.strip()]
+            if peer_list:
                 peer_distribution = compute_peer_distribution(peer_list, api_key)
-                # Si on a réussi à construire un benchmark, on le met en cache par secteur
-                if sector_name and peer_distribution:
-                    save_sector_cache(sector_name, peer_distribution, peer_list)
-            except Exception:
-                peer_distribution = None
-
-    # 2) Cache sectoriel (si pas de peers manuels)
-    if peer_distribution is None and use_sector_cache and sector_name:
-        cached_dist, cached_peers, age_days = load_sector_cache(sector_name, max_age_days=int(cache_max_age_days))
-        peer_distribution = cached_dist
-        peer_list = cached_peers or peer_list
-
-        # Rafraîchissement demandé / cache trop vieux
-        if (peer_distribution is None) and refresh_sector_cache:
-            # Tentative de rebuild via un CSV local sector->tickers (optionnel)
-            peers_from_csv = load_sector_peers_from_csv(sector_name, csv_path=sector_peers_csv, limit=30)
-            if peers_from_csv:
-                try:
-                    peer_distribution = compute_peer_distribution(peers_from_csv, api_key)
-                    peer_list = peers_from_csv
-                    if peer_distribution:
-                        save_sector_cache(sector_name, peer_distribution, peer_list)
-                except Exception:
-                    peer_distribution = None
+    except Exception:
+        peer_distribution = None
 
     health_df_raw, pillar_scores = build_health_table(company_ratios, peer_distribution=peer_distribution)
     health_df_styled = style_health_table(health_df_raw)
