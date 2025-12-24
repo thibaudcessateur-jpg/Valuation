@@ -3,11 +3,7 @@ import math
 import requests
 import pandas as pd
 import streamlit as st
-import json
-import pickle
-from pathlib import Path
-from datetime import datetime, timedelta
-import statistics
+
 # =========================================
 # CONFIG DE BASE
 # =========================================
@@ -223,25 +219,18 @@ def get_net_debt(fundamentals: dict):
         # Cash
         cash = _get_float(
             "cashandcashequivalents",
-            "cash_and_cash_equivalents",
             "cashandcashequivalentsandshortterminvestments",
-            "cash_and_cash_equivalents_and_short_term_investments",
             "cashcashequivalentsandshortterminvestments",
-            "cash_cash_equivalents_and_short_term_investments",
             "cash",
         )
 
         # 2) Dette court + long terme
-        st_debt = _get_float("shorttermdebt", "short_term_debt", "shorttermborrowings", "short_term_borrowings", "currentdebt", "current_debt")
+        st_debt = _get_float("shorttermdebt", "shorttermborrowings", "currentdebt")
         lt_debt = _get_float(
             "longtermdebt",
-            "long_term_debt",
             "longtermdebtnoncurrent",
-            "long_term_debt_noncurrent",
             "longtermdebtandcapitalleaseobligation",
-            "long_term_debt_and_capital_lease_obligation",
             "noncurrentdebt",
-            "noncurrent_debt",
         )
 
         if st_debt is not None or lt_debt is not None:
@@ -251,7 +240,7 @@ def get_net_debt(fundamentals: dict):
             return total - cash
 
         # 3) Total debt
-        total_debt = _get_float("totaldebt", "total_debt", "shortlongtermdebttotal", "short_long_term_debt_total", "totaldebtgrossminorityinterest", "total_debt_gross_minority_interest", "debt")
+        total_debt = _get_float("totaldebt", "shortlongtermdebttotal", "totaldebtgrossminorityinterest", "debt")
         if total_debt is None or cash is None:
             return None
         return total_debt - cash
@@ -512,17 +501,17 @@ def extract_base_financials(fundamentals: dict):
 
         revenue = pick_first_non_null(
             row_inc,
-            ["TotalRevenue", "Revenue", "totalRevenue", "SalesRevenueNet", "Sales", "revenue", "total_revenue"],
+            ["TotalRevenue", "Revenue", "totalRevenue", "SalesRevenueNet", "Sales"],
         )
 
         ebitda = pick_first_non_null(
             row_inc,
-            ["EBITDA", "Ebitda", "ebitda", "OperatingIncomeBeforeDepreciation", "operating_income_before_depreciation"],
+            ["EBITDA", "Ebitda", "ebitda", "OperatingIncomeBeforeDepreciation"],
         )
 
         ebit = pick_first_non_null(
             row_inc,
-            ["OperatingIncome", "OperatingIncomeLoss", "EBIT", "Ebit", "ebit", "operating_income"],
+            ["OperatingIncome", "OperatingIncomeLoss", "EBIT", "Ebit", "ebit"],
         )
 
         net_income = pick_first_non_null(
@@ -559,17 +548,17 @@ def extract_base_financials(fundamentals: dict):
 
         revenue = pick_first_non_null(
             row_inc,
-            ["TotalRevenue", "Revenue", "totalRevenue", "SalesRevenueNet", "Sales", "revenue", "total_revenue"],
+            ["TotalRevenue", "Revenue", "totalRevenue", "SalesRevenueNet", "Sales"],
         )
 
         ebitda = pick_first_non_null(
             row_inc,
-            ["EBITDA", "Ebitda", "ebitda", "OperatingIncomeBeforeDepreciation", "operating_income_before_depreciation"],
+            ["EBITDA", "Ebitda", "ebitda", "OperatingIncomeBeforeDepreciation"],
         )
 
         ebit = pick_first_non_null(
             row_inc,
-            ["OperatingIncome", "OperatingIncomeLoss", "EBIT", "Ebit", "ebit", "operating_income"],
+            ["OperatingIncome", "OperatingIncomeLoss", "EBIT", "Ebit", "ebit"],
         )
 
         net_income = pick_first_non_null(
@@ -767,35 +756,25 @@ def extract_balance_sheet_snapshot(fundamentals: dict):
                 continue
         return None
 
-    total_assets = get_first(["totalassets", "total_assets", "totalassetsreported", "total_assets_reported", "assets"])
+    total_assets = get_first(["totalassets", "totalassetsreported", "assets"])
     total_liabilities = get_first([
         "totalliabilitiesnetminorityinterest",
-        "total_liabilities_net_minority_interest",
         "totalliabilities",
-        "total_liabilities",
         "liabilities"
     ])
-    # Dette totale : plusieurs variantes possibles selon EODHD (camelCase, snake_case...)
-    total_debt = get_first([
-        "totaldebt",
-        "total_debt",
-        "shortlongtermdebttotal",
-        "short_long_term_debt_total",
-        "totaldebtgrossminorityinterest",
-        "total_debt_gross_minority_interest",
-        "debt",
-    ])
+    # Dette totale : plusieurs variantes possibles selon EODHD
+    total_debt = get_first(["totaldebt", "shortlongtermdebttotal", "totaldebtgrossminorityinterest", "debt"])
     if total_debt is None:
-        st_debt = get_first(["shorttermdebt", "short_term_debt", "shorttermborrowings", "short_term_borrowings", "currentdebt", "current_debt"])
-        lt_debt = get_first(["longtermdebt", "long_term_debt", "longtermdebtnoncurrent", "long_term_debt_noncurrent", "longtermdebtandcapitalleaseobligation", "long_term_debt_and_capital_lease_obligation", "noncurrentdebt", "noncurrent_debt"])
+        st_debt = get_first(["shorttermdebt", "shorttermborrowings", "currentdebt"])
+        lt_debt = get_first(["longtermdebt", "longtermdebtnoncurrent", "longtermdebtandcapitalleaseobligation", "noncurrentdebt"])
         if st_debt is not None or lt_debt is not None:
             total_debt = (st_debt or 0.0) + (lt_debt or 0.0)
 
-    cash = get_first(["cashandcashequivalents", "cash_and_cash_equivalents", "cashcashequivalentsandshortterminvestments", "cash_cash_equivalents_and_short_term_investments", "cash"])
-    current_assets = get_first(["totalcurrentassets", "total_current_assets", "currentassets", "current_assets"])
-    current_liabilities = get_first(["totalcurrentliabilities", "total_current_liabilities", "currentliabilities", "current_liabilities"])
+    cash = get_first(["cashandcashequivalents", "cashcashequivalentsandshortterminvestments", "cash"])
+    current_assets = get_first(["totalcurrentassets", "currentassets"])
+    current_liabilities = get_first(["totalcurrentliabilities", "currentliabilities"])
     goodwill = get_first(["goodwill"])
-    intangibles = get_first(["intangibleassets", "intangible_assets", "intangibleassetsexcludinggoodwill", "intangible_assets_excluding_goodwill", "intangibles"])
+    intangibles = get_first(["intangibleassets", "intangibleassetsexcludinggoodwill", "intangibles"])
 
     # Equity : on réutilise la logique robuste déjà codée dans extract_base_financials (book_equity)
     # car les clés peuvent varier beaucoup selon les tickers.
@@ -833,8 +812,25 @@ def extract_cashflow_snapshot(fundamentals: dict):
     if not row:
         return year, {}
 
-        ocf = pick_first_non_null(row, ["totalCashFromOperatingActivities","TotalCashFromOperatingActivities","NetCashProvidedByOperatingActivities","NetCashFromOperatingActivities","OperatingCashFlow","cfo","operating_cash_flow"])
-        capex = pick_first_non_null(row, ["capitalExpenditures","CapitalExpenditures","investmentsInPropertyPlantAndEquipment","InvestmentsInPropertyPlantAndEquipment","capex","capital_expenditures"])
+    ocf = pick_first_non_null(
+        row,
+        [
+            "totalCashFromOperatingActivities",
+            "TotalCashFromOperatingActivities",
+            "NetCashProvidedByOperatingActivities",
+            "NetCashFromOperatingActivities",
+            "OperatingCashFlow",
+        ],
+    )
+    capex = pick_first_non_null(
+        row,
+        [
+            "capitalExpenditures",
+            "CapitalExpenditures",
+            "investmentsInPropertyPlantAndEquipment",
+            "InvestmentsInPropertyPlantAndEquipment",
+        ],
+    )
 
     fcf = (ocf - capex) if (ocf is not None and capex is not None) else None
     return year, {"cfo": ocf, "capex": capex, "fcf": fcf}
@@ -850,11 +846,14 @@ def extract_income_snapshot(fundamentals: dict):
     if not row:
         return year, {}
 
-        revenue = pick_first_non_null(row, ["TotalRevenue", "Revenue", "totalRevenue", "SalesRevenueNet", "Sales", "revenue", "total_revenue"])
-        ebitda = pick_first_non_null(row, ["EBITDA", "Ebitda", "ebitda", "OperatingIncomeBeforeDepreciation", "operating_income_before_depreciation"])
-        ebit = pick_first_non_null(row, ["OperatingIncome", "OperatingIncomeLoss", "EBIT", "Ebit", "ebit", "operating_income"])
-        net_income = pick_first_non_null(row, ["NetIncome", "netIncome", "NetIncomeCommonStockholders", "NetIncomeIncludingNoncontrollingInterests", "net_income"])
-        gross_profit = pick_first_non_null(row, ["GrossProfit", "grossProfit", "gross_profit"])
+    revenue = pick_first_non_null(row, ["TotalRevenue", "Revenue", "totalRevenue", "SalesRevenueNet", "Sales"])
+    ebitda = pick_first_non_null(row, ["EBITDA", "Ebitda", "ebitda", "OperatingIncomeBeforeDepreciation"])
+    ebit = pick_first_non_null(row, ["OperatingIncome", "OperatingIncomeLoss", "EBIT", "Ebit", "ebit"])
+    net_income = pick_first_non_null(
+        row,
+        ["NetIncome", "netIncome", "NetIncomeCommonStockholders", "NetIncomeIncludingNoncontrollingInterests"],
+    )
+    gross_profit = pick_first_non_null(row, ["GrossProfit", "grossProfit"])
 
     return year, {
         "revenue": revenue,
@@ -987,55 +986,7 @@ def compute_company_health_ratios(
     ratios["fcf_margin"] = safe_div(fcf, revenue)
     ratios["capex_to_revenue"] = safe_div(capex, revenue)
 
-    # --- Solvabilité / service de la dette (si données disponibles) ---
-    # NB : si Net Debt < 0 (net cash), les ratios se comportent comme un signal favorable.
-    ratios["net_debt_to_fcf"] = safe_div(net_debt, fcf)
-    # Inverse utile pour lecture rapide (si net_debt > 0)
-    ratios["fcf_to_net_debt"] = safe_div(fcf, net_debt)
-
-    # --- Moyennes & stabilité (5y) ---
-    # EBIT margin volatility (écart-type) sur l'historique (si possible)
-    if hist_df is not None and not hist_df.empty:
-        try:
-            rev_s = hist_df["Chiffre d'affaires"].astype(float)
-            ebit_s = hist_df["EBIT"].astype(float)
-            m_ebit = (ebit_s / rev_s).replace([math.inf, -math.inf], pd.NA).dropna()
-            ratios["ebit_margin_vol_5y"] = float(m_ebit.std(ddof=0)) if len(m_ebit) >= 3 else None
-        except Exception:
-            ratios["ebit_margin_vol_5y"] = None
-
-        # FCF margin moyen (si possible)
-        try:
-            fcf_s = hist_df["FCF (approx)"].astype(float)
-            rev_s2 = hist_df["Chiffre d'affaires"].astype(float)
-            m_fcf = (fcf_s / rev_s2).replace([math.inf, -math.inf], pd.NA).dropna()
-            ratios["fcf_margin_avg_5y"] = float(m_fcf.mean()) if len(m_fcf) >= 3 else None
-        except Exception:
-            ratios["fcf_margin_avg_5y"] = None
-
-        # Conversion en cash sur 5y (moyenne CFO/NI et FCF/NI)
-        try:
-            cfo_s = hist_df["Op. Cash Flow"].astype(float)
-            ni_s = hist_df["Résultat net"].astype(float)
-            conv = (cfo_s / ni_s).replace([math.inf, -math.inf], pd.NA).dropna()
-            ratios["cfo_to_net_income_avg_5y"] = float(conv.mean()) if len(conv) >= 3 else None
-        except Exception:
-            ratios["cfo_to_net_income_avg_5y"] = None
-
-        try:
-            fcf_s = hist_df["FCF (approx)"].astype(float)
-            ni_s = hist_df["Résultat net"].astype(float)
-            conv2 = (fcf_s / ni_s).replace([math.inf, -math.inf], pd.NA).dropna()
-            ratios["fcf_to_net_income_avg_5y"] = float(conv2.mean()) if len(conv2) >= 3 else None
-        except Exception:
-            ratios["fcf_to_net_income_avg_5y"] = None
-    else:
-        ratios["ebit_margin_vol_5y"] = None
-        ratios["fcf_margin_avg_5y"] = None
-        ratios["cfo_to_net_income_avg_5y"] = None
-        ratios["fcf_to_net_income_avg_5y"] = None
-
-# --- Historique ---
+    # --- Historique ---
     rev_cagr = compute_revenue_cagr(hist_df)
     ratios["revenue_cagr_5y"] = rev_cagr
 
@@ -1065,7 +1016,7 @@ HEALTH_METRICS = [
     {"pillar": "Liquidité", "key": "cash_to_current_liabilities", "label": "Cash / Current Liabilities", "higher_better": True, "score_low": 0.20, "score_high": 1.00, "fmt": "x"},
 
     # Qualité des actifs
-    {"pillar": "Actifs", "key": "gw_plus_intang_to_assets", "label": "(Goodwill + Intangibles) / Total Assets", "higher_better": False, "score_low": 0.10, "score_high": 0.60, "fmt": "pct", "peer_only": True},
+    {"pillar": "Actifs", "key": "gw_plus_intang_to_assets", "label": "(Goodwill + Intangibles) / Total Assets", "higher_better": False, "score_low": 0.10, "score_high": 0.60, "fmt": "pct"},
 
     # Opérations / marges
     {"pillar": "Opérations", "key": "gross_margin", "label": "Gross Margin", "higher_better": True, "score_low": 0.20, "score_high": 0.60, "fmt": "pct"},
@@ -1082,16 +1033,6 @@ HEALTH_METRICS = [
     {"pillar": "Cash-flow", "key": "fcf_to_net_income", "label": "FCF / Net Income", "higher_better": True, "score_low": 0.60, "score_high": 1.20, "fmt": "x"},
     {"pillar": "Cash-flow", "key": "fcf_margin", "label": "FCF Margin", "higher_better": True, "score_low": 0.02, "score_high": 0.15, "fmt": "pct"},
     {"pillar": "Cash-flow", "key": "capex_to_revenue", "label": "Capex / Revenue", "higher_better": False, "score_low": 0.02, "score_high": 0.15, "fmt": "pct"},
-    # Solvabilité / service dette
-    {"pillar": "Solvabilité", "key": "net_debt_to_fcf", "label": "Net Debt / FCF", "higher_better": False, "score_low": 0.0, "score_high": 12.0, "fmt": "x"},
-    {"pillar": "Solvabilité", "key": "fcf_to_net_debt", "label": "FCF / Net Debt", "higher_better": True, "score_low": 0.05, "score_high": 1.00, "fmt": "x"},
-
-    # Qualité cash & stabilité (5y)
-    {"pillar": "Stabilité", "key": "ebit_margin_vol_5y", "label": "EBIT margin volatility (std, 5y)", "higher_better": False, "score_low": 0.00, "score_high": 0.08, "fmt": "pct"},
-    {"pillar": "Stabilité", "key": "fcf_margin_avg_5y", "label": "FCF margin (avg, 5y)", "higher_better": True, "score_low": 0.02, "score_high": 0.15, "fmt": "pct"},
-    {"pillar": "Stabilité", "key": "cfo_to_net_income_avg_5y", "label": "CFO / Net Income (avg, 5y)", "higher_better": True, "score_low": 0.80, "score_high": 1.50, "fmt": "x"},
-    {"pillar": "Stabilité", "key": "fcf_to_net_income_avg_5y", "label": "FCF / Net Income (avg, 5y)", "higher_better": True, "score_low": 0.60, "score_high": 1.20, "fmt": "x"},
-
 
     # Historique
     {"pillar": "Croissance", "key": "revenue_cagr_5y", "label": "Revenue CAGR (approx, 5y)", "higher_better": True, "score_low": 0.00, "score_high": 0.12, "fmt": "pct"},
@@ -1114,16 +1055,10 @@ def _format_metric_value(value, fmt):
 def build_health_table(company_ratios: dict, peer_distribution: dict | None = None) -> pd.DataFrame:
     """
     Construit le tableau Health.
-
-    - Si peer_distribution est fourni (dict key -> list[values]) :
-        score = percentile (0-100) vs comparables, converti en /10.
-    - Sinon :
-        score = basé sur des seuils génériques (non sectorisés),
-        SAUF pour certaines métriques "structurelles" (ex: intangibles) où l'on affiche un FLAG
-        et on réserve le scoring au mode sectorisé (peer_only=True).
+    - Si peer_distribution est fourni (dict key -> list[values]) : score = percentile sectoriel (comparables).
+    - Sinon : score = basé sur des seuils génériques (non sectorisés).
     """
     rows = []
-
     for m in HEALTH_METRICS:
         key = m["key"]
         val = company_ratios.get(key)
@@ -1132,50 +1067,20 @@ def build_health_table(company_ratios: dict, peer_distribution: dict | None = No
         percentile = None
         score = None
         scoring_method = None
-        signal = None  # flag / commentaire court
 
-        # Métriques qui doivent être scorées uniquement en mode sectorisé (peer_only)
-        if m.get("peer_only") and not (peer_distribution and key in peer_distribution and peer_distribution[key]):
-            # Flag lisible sans sur-interpréter
-            if val is None:
-                signal = "N/A"
-            else:
-                try:
-                    x = float(val)
-                    if x >= 0.60:
-                        signal = "Très élevé (à vérifier)"
-                    elif x >= 0.40:
-                        signal = "Élevé (à contextualiser)"
-                    else:
-                        signal = "Modéré"
-                except Exception:
-                    signal = "N/A"
-
-            scoring_method = "Flag (sectorisé requis)"
-            score = None
-
-        # Scoring par percentiles (comparables)
-        elif peer_distribution and key in peer_distribution and peer_distribution[key]:
+        if peer_distribution and key in peer_distribution and peer_distribution[key]:
             values = [v for v in peer_distribution[key] if v is not None]
             values = [float(v) for v in values if not (isinstance(v, float) and math.isnan(v))]
-
             if values and val is not None:
                 values_sorted = sorted(values)
-                median_peer = statistics.median(values_sorted)
-
-                # percentile brut (0-100) : part des peers <= val
-                pct_raw = 100.0 * (sum(1 for x in values_sorted if x <= float(val)) / len(values_sorted))
-
-                # Si "plus bas = mieux", on inverse
-                pct_adj = (100.0 - pct_raw) if not m.get("higher_better", True) else pct_raw
-
-                percentile = pct_adj
-                score = max(0.0, min(10.0, pct_adj / 10.0))
+                median_peer = values_sorted[len(values_sorted)//2]
+                # percentile
+                pct = 100.0 * (sum(1 for x in values_sorted if x <= val) / len(values_sorted))
+                if not m["higher_better"]:
+                    pct = 100.0 - pct
+                percentile = pct
+                score = max(0.0, min(10.0, pct / 10.0))
                 scoring_method = "Comparables (percentile)"
-            else:
-                scoring_method = "Comparables (insuffisant)"
-
-        # Scoring générique par seuils
         else:
             score = _linear_score(
                 value=val,
@@ -1192,7 +1097,6 @@ def build_health_table(company_ratios: dict, peer_distribution: dict | None = No
             "Médiane comparables": _format_metric_value(median_peer, m.get("fmt")) if median_peer is not None else None,
             "Percentile": percentile,
             "Score /10": score,
-            "Signal": signal,
             "Méthode scoring": scoring_method,
             "_color": _color_from_score(score),
         })
@@ -1251,142 +1155,21 @@ def compute_peer_distribution(peer_tickers: list, api_key: str) -> dict:
 
     return dist
 
-# =========================================
-# BENCHMARK SECTORISÉ : PEERS (SCREENER) + CACHE DISK
-# =========================================
-
-SECTOR_CACHE_DIR = Path("./sector_cache")
-SECTOR_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-def _sanitize_cache_token(x: str) -> str:
-    x = (x or "").strip()
-    if not x:
-        return "unknown"
-    out = []
-    for ch in x:
-        if ch.isalnum() or ch in ("-", "_"):
-            out.append(ch)
-        else:
-            out.append("_")
-    return "".join(out)[:80].lower()
-
-def _sector_cache_path(sector: str, exchange: str | None, limit: int) -> Path:
-    sec = _sanitize_cache_token(sector)
-    exch = _sanitize_cache_token(exchange or "any")
-    return SECTOR_CACHE_DIR / f"sector_{sec}__exch_{exch}__limit_{int(limit)}.pkl"
-
-def load_sector_cache(sector: str, exchange: str | None, limit: int):
-    """Retourne (distribution, meta) ou (None, None) si absent/illisible."""
-    p = _sector_cache_path(sector, exchange, limit)
-    if not p.exists():
-        return None, None
-    try:
-        obj = pickle.loads(p.read_bytes())
-        dist = obj.get("dist")
-        meta = obj.get("meta", {})
-        if not isinstance(dist, dict):
-            return None, None
-        return dist, meta
-    except Exception:
-        return None, None
-
-def save_sector_cache(sector: str, exchange: str | None, limit: int, dist: dict, meta: dict):
-    p = _sector_cache_path(sector, exchange, limit)
-    payload = {"dist": dist, "meta": meta}
-    try:
-        p.write_bytes(pickle.dumps(payload))
-    except Exception:
-        pass
-
-def cache_is_stale(meta: dict, max_age_days: int = 31) -> bool:
-    try:
-        ts = meta.get("updated_at_iso")
-        if not ts:
-            return True
-        dt = datetime.fromisoformat(ts)
-        return (datetime.utcnow() - dt) > timedelta(days=int(max_age_days))
-    except Exception:
-        return True
-
-def fetch_sector_peers_via_screener(
-    api_key: str,
-    sector: str,
-    exchange: str | None,
-    limit: int = 25,
-    exclude_ticker: str | None = None,
-):
-    """
-    Tente de récupérer des tickers via l'endpoint /screener (EODHD).
-    Si l'endpoint est indisponible (plan / quota), retourne [].
-    """
-    if not sector:
-        return []
-
-    exch = (exchange or "").lower().strip()
-    sec = str(sector).strip()
-
-    op = "match" if " " in sec else "="
-
-    filters = []
-    if exch:
-        filters.append(["exchange", "=", exch])
-    filters.append(["sector", op, sec])
-
-    params = {
-        "api_token": api_key,
-        "sort": "market_capitalization.desc",
-        "filters": json.dumps(filters),
-        "limit": int(max(1, min(100, limit))),
-        "offset": 0,
-        "fmt": "json",
-    }
-
-    try:
-        url = f"{EODHD_BASE_URL}/screener"
-        r = requests.get(url, params=params, timeout=30)
-        if r.status_code != 200:
-            return []
-        data = r.json()
-        if not isinstance(data, list):
-            return []
-
-        out = []
-        for row in data:
-            if not isinstance(row, dict):
-                continue
-            code_ = row.get("code") or row.get("Code") or row.get("ticker") or row.get("Ticker")
-            exch_ = row.get("exchange") or row.get("Exchange") or exch
-            if not code_ or not exch_:
-                continue
-            t = f"{str(code_).upper()}.{str(exch_).upper()}"
-            if exclude_ticker and t.upper() == exclude_ticker.upper():
-                continue
-            out.append(t)
-
-        # Dé-doublonnage
-        seen = set()
-        uniq = []
-        for t in out:
-            if t in seen:
-                continue
-            seen.add(t)
-            uniq.append(t)
-        return uniq
-    except Exception:
-        return []
-
 
 def style_health_table(df: pd.DataFrame):
     """
-    Renvoie un Styler Streamlit-friendly : applique une couleur de fond à la colonne 'Score /10'.
-
-    Note :
-    - On conserve '_color' uniquement pour la mise en forme, puis on la masque.
+    Renvoie un Styler Streamlit-friendly : applique une couleur de fond au score.
     """
     if df is None or df.empty:
         return df
 
-    df_work = df.copy()
+    def _apply(row):
+        color = row.get("_color", "#E5E7EB")
+        return [""] * (len(row) - 1) + [""]
+
+    # Mise en forme : colorer uniquement la colonne Score /10
+    def color_score(val, row_color):
+        return f"background-color: {row_color};"
 
     def apply_colors(data):
         styles = pd.DataFrame("", index=data.index, columns=data.columns)
@@ -1395,16 +1178,14 @@ def style_health_table(df: pd.DataFrame):
                 styles.loc[i, "Score /10"] = f"background-color: {data.loc[i, '_color']};"
         return styles
 
-    styler = df_work.style.apply(apply_colors, axis=None)
+    df_disp = df.drop(columns=["_color"], errors="ignore").copy()
 
-    # Masquer la colonne interne
-    try:
-        styler = styler.hide(columns=["_color"])
-    except Exception:
-        # compat anciennes versions pandas
+    # Formats
+    if "Valeur" in df_disp.columns:
+        # on ne force pas de format global; Streamlit affichera proprement
         pass
 
-    return styler
+    return df_disp.style.apply(apply_colors, axis=None)
 
 
 # =========================================
@@ -2309,27 +2090,6 @@ def main():
         value="",
     )
 
-    use_sector_benchmark = st.sidebar.checkbox(
-        "Benchmark sectorisé (auto + cache)",
-        value=False,
-        help="Si aucun comparable manuel n'est fourni, l'app peut tenter de récupérer des pairs du même secteur via /screener, puis mettre en cache la distribution de ratios sur disque (MAJ recommandée ~1 fois/mois).",
-    )
-    sector_peers_limit = st.sidebar.slider(
-        "Nombre de comparables secteur (max 100)",
-        min_value=10,
-        max_value=60,
-        value=25,
-        step=5,
-    )
-    max_cache_age_days = st.sidebar.number_input(
-        "Rafraîchir auto si cache plus vieux que (jours)",
-        min_value=7,
-        max_value=90,
-        value=31,
-        step=1,
-    )
-    refresh_sector_cache = st.sidebar.button("Mettre à jour le cache secteur maintenant")
-
     wacc = wacc_input / 100.0
     growth_fcf = growth_fcf_input / 100.0
     g_terminal = g_terminal_input / 100.0
@@ -2387,73 +2147,15 @@ def main():
 
     peer_distribution = None
     peer_list = []
-    benchmark_source = None
-    benchmark_meta = None
-
-    raw = (peer_tickers_raw or "").strip()
-
-    # 1) Comparables manuels (prioritaire)
-    if raw:
-        peer_list = [x.strip() for x in raw.split(",") if x.strip()]
-        if peer_list:
-            try:
+    try:
+        raw = (peer_tickers_raw or "").strip()
+        if raw:
+            peer_list = [x.strip() for x in raw.split(",") if x.strip()]
+            if peer_list:
                 peer_distribution = compute_peer_distribution(peer_list, api_key)
-                benchmark_source = "manual"
-            except Exception:
-                peer_distribution = None
-                peer_list = []
-                benchmark_source = None
+    except Exception:
+        peer_distribution = None
 
-    # 2) Benchmark sectorisé (auto + cache) si activé et si pas de comparables manuels
-    elif use_sector_benchmark:
-        sector = (company or {}).get("Sector")
-        exch = (company or {}).get("Exchange")
-
-        cached_dist, meta = None, None
-        try:
-            cached_dist, meta = load_sector_cache(sector, exch, int(sector_peers_limit))
-        except Exception:
-            cached_dist, meta = None, None
-
-        needs_refresh = bool(refresh_sector_cache)
-        if cached_dist is None:
-            needs_refresh = True
-        else:
-            try:
-                if cache_is_stale(meta or {}, max_age_days=int(max_cache_age_days)):
-                    needs_refresh = True
-            except Exception:
-                needs_refresh = True
-
-        if needs_refresh:
-            try:
-                peers = fetch_sector_peers_via_screener(
-                    api_key=api_key,
-                    sector=str(sector or ""),
-                    exchange=exch,
-                    limit=int(sector_peers_limit),
-                    exclude_ticker=query,
-                )
-                if peers:
-                    peer_distribution = compute_peer_distribution(peers, api_key)
-                    benchmark_source = "sector"
-                    benchmark_meta = {
-                        "sector": sector,
-                        "exchange": exch,
-                        "n_peers": len(peers),
-                    }
-                    try:
-                        save_sector_cache(sector, exch, int(sector_peers_limit), peer_distribution, benchmark_meta)
-                    except Exception:
-                        pass
-            except Exception:
-                peer_distribution = None
-                benchmark_source = None
-                benchmark_meta = None
-        else:
-            peer_distribution = cached_dist
-            benchmark_source = "sector_cache"
-            benchmark_meta = meta
     health_df_raw, pillar_scores = build_health_table(company_ratios, peer_distribution=peer_distribution)
     health_df_styled = style_health_table(health_df_raw)
 
@@ -2505,18 +2207,10 @@ def main():
     # ----- TAB 0 : Santé financière -----
     with tab_health:
         st.subheader("🩺 Santé financière (ratios scorés)")
+
         # Indication de méthode
-        if peer_distribution is not None:
-            if benchmark_source == "manual":
-                st.caption(f"Scoring basé sur le percentile au sein des comparables fournis (n={len(peer_list)}).")
-            elif benchmark_source == "sector":
-                st.caption(f"Scoring sectorisé : comparables auto via /screener (n={len(peer_list)}).")
-            elif benchmark_source == "sector_cache":
-                ts = (benchmark_meta or {}).get("updated_at_iso")
-                info = f" (cache mis à jour le {ts} UTC)" if ts else ""
-                st.caption(f"Scoring sectorisé : distribution chargée depuis le cache{info}.")
-            else:
-                st.caption("Scoring basé sur le percentile au sein d'un benchmark comparables.")
+        if peer_list:
+            st.caption("Scoring basé sur le percentile au sein des comparables fournis (comparables = benchmark).")
         else:
             st.caption("Scoring basé sur des seuils génériques (aucun benchmark comparables/secteur fourni).")
 
