@@ -2388,6 +2388,9 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     wacc_missing: List[str] = []
 
     if auto_wacc:
+        # Mode auto : on tente de calculer la WACC à partir des données EODHD.
+        # Si des champs clés manquent (fréquent : interestExpense pour Rd), on n'interrompt pas l'analyse :
+        # on bascule sur la WACC manuelle et on expose les champs manquants dans le résumé.
         wacc_mode = "auto"
         wacc_auto, wacc_details, wacc_missing = compute_wacc_auto(
             fundamentals=fundamentals,
@@ -2398,13 +2401,18 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             api_key=api_key,
             overrides=wacc_overrides or {},
         )
-        if wacc_missing:
-            raise ValueError(
-                "Données manquantes pour calculer la WACC (auto) : " + ", ".join(sorted(set(wacc_missing)))
+
+        if wacc_missing or (wacc_auto is None):
+            # Pas de crash : fallback sur la WACC manuelle déjà saisie en sidebar
+            wacc_mode = "auto_failed_fallback_manual"
+            wacc_details = wacc_details or {"mode": "auto"}
+            wacc_details["note"] = (
+                "WACC auto indisponible : utilisation de la WACC manuelle. "
+                "Pour activer le mode auto, renseigne un override Rd (%) ou désactive WACC auto."
             )
-        if wacc_auto is None:
-            raise ValueError("Impossible de calculer la WACC (auto) malgré les données disponibles.")
-        wacc = float(wacc_auto)
+            # wacc reste la valeur manuelle (wacc_input)
+        else:
+            wacc = float(wacc_auto)
 
     profile = classify_company_profile(company, base_metrics, hist_df)
 
@@ -2853,12 +2861,18 @@ def main():
             wacc_mode = result.get("wacc_mode", "manual")
             wacc_used_pct = (float(wacc_used) * 100.0) if wacc_used is not None else None
 
-            if wacc_mode == "auto" and wacc_used_pct is not None:
-                st.write(f"- WACC : **{wacc_used_pct:.2f} % (auto)**")
+            if isinstance(wacc_mode, str) and wacc_mode.startswith("auto") and wacc_used_pct is not None:
+                st.write(f"- WACC : **{wacc_used_pct:.2f} % ({'auto' if wacc_mode == 'auto' else 'auto → manuel'})**")
                 details = result.get("wacc_details") or {}
                 with st.expander("Détail du calcul de WACC (auto)"):
                     if not details or details.get("wacc") is None:
-                        st.warning("Détail WACC indisponible.")
+                        missing_fields = result.get("wacc_missing") or []
+                        note = (details or {}).get("note")
+                        if missing_fields:
+                            st.error("WACC auto non calculable (données manquantes) : " + ", ".join(missing_fields))
+                        if note:
+                            st.info(note)
+                        st.warning("Utilisation de la WACC manuelle tant que ces données ne sont pas renseignées.")
                     else:
                         rows = [
                             ("Devise", details.get("currency")),
