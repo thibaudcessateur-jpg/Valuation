@@ -3,7 +3,6 @@ import math
 import requests
 import pandas as pd
 import streamlit as st
-from typing import Optional, Dict, Any, List, Tuple
 
 # =========================================
 # CONFIG DE BASE
@@ -1034,48 +1033,563 @@ def extract_cashflow_snapshot(fundamentals: dict):
 
 def extract_income_snapshot(fundamentals: dict):
     """
-    Extrait un snapshot compte de résultat (dernier exercice annuel) : revenue, ebitda, ebit, net_income, gross_profit.
-    Retourne aussi l'année.
+    Extrait un snapshot compte de résultat (dernier exercice annuel) avec des clés standardisées.
+    Inclut aussi les champs nécessaires au calcul d'une WACC (Rd via interestExpense, et ETR via pretax/tax).
+
+    Retourne (year, snapshot_dict)
 
     Conventions EODHD (glossaire Fundamentals):
-    - totalRevenue, grossProfit, ebit, ebitda, netIncome 
+    - totalRevenue, grossProfit, ebit, ebitda, netIncome
+    - interestExpense (ou variantes), incomeBeforeTax (pretax), incomeTaxExpense / taxProvision
     """
     inc = fundamentals.get("Financials", {}).get("Income_Statement", {}).get("yearly", {})
     year, row = _extract_latest_year_row(inc)
-    if not row:
+    if not row or not isinstance(row, dict):
         return year, {}
 
-    revenue = pick_first_non_null(
-        row,
-        ["totalRevenue", "TotalRevenue", "revenue", "Revenue", "SalesRevenueNet", "Sales"],
-    )
-    ebitda = pick_first_non_null(
-        row,
-        ["ebitda", "EBITDA", "Ebitda", "OperatingIncomeBeforeDepreciation"],
-    )
-    ebit = pick_first_non_null(
-        row,
-        ["ebit", "EBIT", "operatingIncome", "OperatingIncome", "OperatingIncomeLoss"],
-    )
-    net_income = pick_first_non_null(
-        row,
-        [
-            "netIncome",
-            "NetIncome",
-            "net_income",
-            "NetIncomeCommonStockholders",
-            "NetIncomeIncludingNoncontrollingInterests",
-        ],
-    )
-    gross_profit = pick_first_non_null(row, ["grossProfit", "GrossProfit", "gross_profit"])
+    # Normalisation simple des clés -> permet de gérer les variations de casse/underscore
+    def _norm_key(k: str) -> str:
+        return "".join(ch.lower() for ch in str(k) if ch.isalnum())
 
-    return year, {
+    normalized = {}
+    for k, v in row.items():
+        normalized[_norm_key(k)] = v
+
+    def get_first(keys):
+        for k in keys:
+            v = normalized.get(_norm_key(k))
+            if v is None:
+                continue
+            try:
+                return float(v)
+            except Exception:
+                continue
+        return None
+
+    revenue = get_first(["totalRevenue", "revenue", "TotalRevenue", "Revenue", "SalesRevenueNet", "Sales"])
+    ebitda = get_first(["ebitda", "EBITDA", "Ebitda", "OperatingIncomeBeforeDepreciation"])
+    ebit = get_first(["ebit", "EBIT", "operatingIncome", "OperatingIncome", "OperatingIncomeLoss"])
+    net_income = get_first([
+        "netIncome",
+        "NetIncome",
+        "NetIncomeCommonStockholders",
+        "NetIncomeIncludingNoncontrollingInterests",
+    ])
+    gross_profit = get_first(["grossProfit", "GrossProfit", "gross_profit"])
+
+    # Champs WACC / fiscalité
+    interest_expense = get_first([
+        "interestExpense",
+        "InterestExpense",
+        "interestExpenseNonOperating",
+        "InterestExpenseNonOperating",
+        "interest_expense",
+    ])
+    # convention: expense peut être négative, on stocke en valeur absolue
+    if interest_expense is not None:
+        interest_expense = abs(interest_expense)
+
+    pretax_income = get_first([
+        "incomeBeforeTax",
+        "IncomeBeforeTax",
+        "pretaxIncome",
+        "PretaxIncome",
+        "incomeBeforeIncomeTaxes",
+        "IncomeBeforeIncomeTaxes",
+    ])
+
+    tax_provision = get_first([
+        "incomeTaxExpense",
+        "IncomeTaxExpense",
+        "taxProvision",
+        "TaxProvision",
+        "provisionForIncomeTaxes",
+        "ProvisionForIncomeTaxes",
+    ])
+    if tax_provision is not None:
+        tax_provision = abs(tax_provision)
+
+    snap = {
         "revenue": revenue,
         "ebitda": ebitda,
         "ebit": ebit,
         "net_income": net_income,
         "gross_profit": gross_profit,
+        "interest_expense": interest_expense,
+        "pretax_income": pretax_income,
+        "tax_provision": tax_provision,
     }
+    return year, snap
+
+# =========================================
+# WACC AUTO (EODHD) - helpers robustes
+# =========================================
+
+def fetch_latest_eod_close(ticker: str, api_key: str):
+    """
+    Récupère le dernier 'close' via l'endpoint EOD.
+    Exemple doc EODHD (GBOND): /api/eod/UK10Y.GBOND?api_token=...&fmt=json
+    Renvoie float close ou None.
+    """
+    if not ticker or not api_key:
+        return None
+    try:
+        url = f"https://eodhd.com/api/eod/{ticker}"
+        params = {
+            "api_token": api_key,
+            "fmt": "json",
+            "order": "d",
+            "limit": 1,
+        }
+        r = requests.get(url, params=params, timeout=15)
+        r.raise_for_status()
+        data = r.json()
+        if isinstance(data, dict) and "close" in data:
+            # certains endpoints peuvent renvoyer un dict unique
+            try:
+                return float(data.get("close"))
+            except Exception:
+                return None
+        if not isinstance(data, list) or len(data) == 0:
+            return None
+        last = data[0]  # order=d => plus récent en premier
+        try:
+            return float(last.get("close"))
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def get_currency_code(fundamentals: dict):
+    gen = fundamentals.get("General", {}) if isinstance(fundamentals, dict) else {}
+    cc = gen.get("CurrencyCode") or gen.get("currencyCode") or gen.get("currency_code")
+    if cc:
+        return str(cc).upper()
+    return None
+
+
+def get_country_iso(fundamentals: dict):
+    gen = fundamentals.get("General", {}) if isinstance(fundamentals, dict) else {}
+    ci = gen.get("CountryISO") or gen.get("countryISO") or gen.get("country_iso")
+    if ci:
+        return str(ci).upper()
+    return None
+
+
+def get_beta(fundamentals: dict):
+    tech = fundamentals.get("Technicals", {}) if isinstance(fundamentals, dict) else {}
+    b = tech.get("Beta") or tech.get("beta")
+    try:
+        return float(b) if b is not None else None
+    except Exception:
+        return None
+
+
+def get_market_cap(fundamentals: dict):
+    hi = fundamentals.get("Highlights", {}) if isinstance(fundamentals, dict) else {}
+    mc = hi.get("MarketCapitalization") or hi.get("marketCapitalization") or hi.get("market_cap")
+    try:
+        return float(mc) if mc is not None else None
+    except Exception:
+        return None
+
+
+def _extract_total_debt_from_bs_row(row: dict):
+    """
+    Extrait une dette totale (interest-bearing) depuis une ligne de bilan EODHD.
+    """
+    if not row or not isinstance(row, dict):
+        return None
+
+    def _norm_key(k: str) -> str:
+        return "".join(ch.lower() for ch in str(k) if ch.isalnum())
+
+    normalized = { _norm_key(k): v for k, v in row.items() }
+
+    def get_first(keys):
+        for k in keys:
+            v = normalized.get(_norm_key(k))
+            if v is None:
+                continue
+            try:
+                return float(v)
+            except Exception:
+                continue
+        return None
+
+    # priorités usuelles EODHD
+    total_debt = get_first([
+        "shortLongTermDebtTotal",
+        "shortLongTermDebt",
+        "totalDebt",
+        "TotalDebt",
+        "total_debt",
+    ])
+    if total_debt is not None:
+        return total_debt
+
+    st = get_first(["shortTermDebt", "ShortTermDebt", "short_term_debt", "currentDebt", "CurrentDebt"])
+    lt = get_first([
+        "longTermDebtTotal",
+        "LongTermDebtTotal",
+        "longTermDebt",
+        "LongTermDebt",
+        "long_term_debt_total",
+        "long_term_debt",
+        "longTermDebtNonCurrent",
+    ])
+
+    if st is None and lt is None:
+        return None
+    return (st or 0.0) + (lt or 0.0)
+
+
+def compute_effective_tax_rate(fundamentals: dict, max_years: int = 5):
+    """
+    Calcule un taux d'imposition effectif (ETR) robuste sur une médiane multi-années:
+    ETR = tax_provision / pretax_income
+    Ignore les années à pretax <= 0 (ratio non interprétable).
+    Renvoie (etr_decimal, details_dict)
+    """
+    details = {"source": None, "values": [], "used_years": []}
+
+    inc = fundamentals.get("Financials", {}).get("Income_Statement", {}).get("yearly", {}) if isinstance(fundamentals, dict) else {}
+    if not inc or not isinstance(inc, dict):
+        return None, details
+
+    # inc: {year: row}
+    years_sorted = sorted(inc.keys(), reverse=True)
+    etrs = []
+    used = []
+    for y in years_sorted[:max_years]:
+        row = inc.get(y)
+        if not isinstance(row, dict):
+            continue
+
+        # reuse snapshot extractor for consistent key handling
+        _, snap = extract_income_snapshot({"Financials": {"Income_Statement": {"yearly": {y: row}}}})
+        pretax = snap.get("pretax_income")
+        tax = snap.get("tax_provision")
+        if pretax is None or tax is None:
+            continue
+        if pretax <= 0:
+            continue
+        etr = tax / pretax
+        if etr is None:
+            continue
+        # clamp raisonnable
+        etr = max(0.0, min(0.45, float(etr)))
+        etrs.append(etr)
+        used.append(y)
+
+    if not etrs:
+        return None, details
+
+    details["source"] = "ETR_median_multi_years"
+    details["values"] = etrs
+    details["used_years"] = used
+    etr_med = float(np.median(np.array(etrs)))
+    return etr_med, details
+
+
+def estimate_cost_of_debt(
+    fundamentals: dict,
+    bs_snap: dict,
+    is_snap: dict,
+    net_debt: float,
+    rf_decimal: float,
+    api_key: str,
+    rd_override_pct: float = None,
+    allow_heuristic: bool = True,
+):
+    """
+    Calcule Rd (pré-tax) de façon robuste.
+    Hiérarchie:
+    1) override utilisateur (Rd %)
+    2) interestExpense / avgDebt (si calculable)
+    3) heuristique: rf + spread selon levier (NetDebt/EBITDA si dispo, sinon rf + 2%)
+    Renvoie (rd_decimal, rd_details)
+    """
+    details = {"source": None, "warnings": [], "inputs": {}}
+
+    if rd_override_pct is not None:
+        try:
+            rd = float(rd_override_pct) / 100.0
+            details["source"] = "override"
+            details["inputs"]["rd_override_pct"] = float(rd_override_pct)
+            return rd, details
+        except Exception:
+            details["warnings"].append("Rd override invalide (non numérique).")
+
+    interest = is_snap.get("interest_expense") if isinstance(is_snap, dict) else None
+    debt = bs_snap.get("total_debt") if isinstance(bs_snap, dict) else None
+
+    details["inputs"]["interest_expense"] = interest
+    details["inputs"]["total_debt"] = debt
+
+    # moyenne de dette sur 2 ans si possible
+    avg_debt = None
+    try:
+        bs_yearly = fundamentals.get("Financials", {}).get("Balance_Sheet", {}).get("yearly", {})
+        if isinstance(bs_yearly, dict) and len(bs_yearly) >= 2:
+            years_sorted = sorted(bs_yearly.keys(), reverse=True)
+            y0 = years_sorted[0]
+            y1 = years_sorted[1]
+            d0 = _extract_total_debt_from_bs_row(bs_yearly.get(y0, {}))
+            d1 = _extract_total_debt_from_bs_row(bs_yearly.get(y1, {}))
+            if d0 is not None and d1 is not None and d0 > 0 and d1 > 0:
+                avg_debt = (d0 + d1) / 2.0
+                details["inputs"]["avg_debt_2y"] = avg_debt
+    except Exception:
+        pass
+
+    if avg_debt is None:
+        avg_debt = debt
+
+    if interest is not None and avg_debt is not None and avg_debt > 0:
+        rd = interest / avg_debt
+        # clamp raisonnable
+        rd = max(0.0, min(0.25, float(rd)))
+        details["source"] = "interestExpense/avgDebt"
+        return rd, details
+
+    if not allow_heuristic:
+        details["source"] = None
+        details["warnings"].append("Rd non calculable (interestExpense ou dette manquante) et heuristique désactivée.")
+        return None, details
+
+    # Heuristique leverage-based: spread selon NetDebt/EBITDA
+    ebitda = is_snap.get("ebitda") if isinstance(is_snap, dict) else None
+    lev = None
+    if net_debt is not None and ebitda is not None and ebitda > 0:
+        lev = float(net_debt) / float(ebitda)
+    details["inputs"]["net_debt_to_ebitda"] = lev
+
+    # table de spread (en décimal)
+    if lev is None:
+        spread = 0.02
+        details["warnings"].append("Levier NetDebt/EBITDA indisponible → spread par défaut 2.0%.")
+    else:
+        if lev < 1.0:
+            spread = 0.012
+        elif lev < 2.0:
+            spread = 0.018
+        elif lev < 3.0:
+            spread = 0.025
+        elif lev < 4.0:
+            spread = 0.035
+        else:
+            spread = 0.050
+        details["warnings"].append("Rd estimé via spread basé sur NetDebt/EBITDA (heuristique).")
+
+    rd = max(0.0, min(0.25, float(rf_decimal + spread)))
+    details["source"] = "heuristic_rf_plus_spread"
+    details["inputs"]["spread_used"] = spread
+    return rd, details
+
+
+def compute_wacc_auto(
+    fundamentals: dict,
+    bs_snap: dict,
+    is_snap: dict,
+    net_debt: float,
+    api_key: str,
+    config: dict,
+):
+    """
+    Calcule une WACC automatique.
+    Renvoie (wacc_pct, details_dict). wacc_pct peut être None si impossible même avec fallbacks.
+    """
+    details = {
+        "enabled": bool(config.get("enabled", False)),
+        "missing": [],
+        "warnings": [],
+        "sources": {},
+        "inputs": {},
+        "results": {},
+    }
+
+    cc = get_currency_code(fundamentals)
+    ci = get_country_iso(fundamentals)
+    details["inputs"]["currency_code"] = cc
+    details["inputs"]["country_iso"] = ci
+
+    # 1) Risk-free via GBOND (close = yield %)
+    rf_map = {
+        "EUR": "DE10Y.GBOND",
+        "USD": "US10Y.GBOND",
+        "GBP": "UK10Y.GBOND",
+        "CHF": "SW10Y.GBOND",
+        "JPY": "JP10Y.GBOND",
+        "CAD": "CA10Y.GBOND",
+        "AUD": "AU10Y.GBOND",
+    }
+    rf_ticker = rf_map.get(cc, "US10Y.GBOND")
+    rf_close = fetch_latest_eod_close(rf_ticker, api_key)
+    if rf_close is None:
+        details["missing"].append("risk_free_rate")
+    else:
+        details["sources"]["risk_free_rate"] = f"EODHD EOD close {rf_ticker}"
+        details["inputs"]["rf_ticker"] = rf_ticker
+        details["inputs"]["rf_close_pct"] = rf_close
+
+    rf_decimal = (rf_close / 100.0) if rf_close is not None else None
+
+    # 2) ERP
+    erp_us = config.get("erp_us_pct")
+    erp_eur = config.get("erp_eur_pct")
+    erp_default = config.get("erp_default_pct")
+    erp_pct = None
+    if cc == "USD" and erp_us is not None:
+        erp_pct = erp_us
+    elif cc == "EUR" and erp_eur is not None:
+        erp_pct = erp_eur
+    elif erp_default is not None:
+        erp_pct = erp_default
+
+    if erp_pct is None:
+        details["missing"].append("equity_risk_premium")
+    else:
+        details["inputs"]["erp_pct"] = float(erp_pct)
+        details["sources"]["equity_risk_premium"] = "sidebar_default_or_override"
+
+    erp_decimal = (float(erp_pct) / 100.0) if erp_pct is not None else None
+
+    # 3) Beta
+    beta_override = config.get("beta_override")
+    beta = None
+    if beta_override is not None:
+        try:
+            beta = float(beta_override)
+            details["sources"]["beta"] = "override"
+        except Exception:
+            details["warnings"].append("Beta override invalide.")
+            beta = None
+    if beta is None:
+        beta = get_beta(fundamentals)
+        if beta is not None:
+            details["sources"]["beta"] = "EODHD Technicals.Beta"
+    if beta is None:
+        details["missing"].append("beta")
+    details["inputs"]["beta"] = beta
+
+    # 4) Cost of equity Re
+    re_decimal = None
+    if rf_decimal is not None and beta is not None and erp_decimal is not None:
+        re_decimal = rf_decimal + beta * erp_decimal
+        details["results"]["cost_of_equity_pct"] = re_decimal * 100.0
+    else:
+        details["missing"].append("cost_of_equity")
+
+    # 5) Rd
+    rd_override_pct = config.get("rd_override_pct")
+    allow_heuristic_rd = bool(config.get("allow_heuristic_rd", True))
+    rd_decimal, rd_details = estimate_cost_of_debt(
+        fundamentals=fundamentals,
+        bs_snap=bs_snap,
+        is_snap=is_snap,
+        net_debt=net_debt,
+        rf_decimal=rf_decimal or 0.0,
+        api_key=api_key,
+        rd_override_pct=rd_override_pct,
+        allow_heuristic=allow_heuristic_rd,
+    )
+    details["inputs"]["rd_details"] = rd_details
+    if rd_decimal is None:
+        details["missing"].append("cost_of_debt")
+    else:
+        details["results"]["cost_of_debt_pct"] = rd_decimal * 100.0
+        details["sources"]["cost_of_debt"] = rd_details.get("source")
+
+    # 6) Tax rate
+    tax_override_pct = config.get("tax_override_pct")
+    allow_tax_fallback = bool(config.get("allow_tax_fallback", True))
+    tax_decimal = None
+    tax_details = {"source": None, "warnings": []}
+
+    if tax_override_pct is not None:
+        try:
+            tax_decimal = max(0.0, min(0.45, float(tax_override_pct) / 100.0))
+            tax_details["source"] = "override"
+        except Exception:
+            tax_details["warnings"].append("Tax override invalide.")
+            tax_decimal = None
+
+    if tax_decimal is None:
+        etr, etr_details = compute_effective_tax_rate(fundamentals, max_years=5)
+        if etr is not None:
+            tax_decimal = etr
+            tax_details["source"] = "ETR_median_multi_years"
+            tax_details["etr_details"] = etr_details
+
+    if tax_decimal is None and allow_tax_fallback:
+        # fallback simple par pays/currency (proxy)
+        if ci == "US" or cc == "USD":
+            tax_decimal = 0.258  # proxy combiné moyen (fédéral + états)
+            tax_details["source"] = "regional_default_US"
+        elif ci == "FR":
+            tax_decimal = 0.25
+            tax_details["source"] = "statutory_FR"
+        elif cc == "EUR":
+            tax_decimal = 0.25
+            tax_details["source"] = "regional_default_EUR"
+        else:
+            tax_decimal = 0.25
+            tax_details["source"] = "regional_default_generic"
+
+    details["inputs"]["tax_details"] = tax_details
+    if tax_decimal is None:
+        details["missing"].append("tax_rate")
+    else:
+        details["results"]["tax_rate_pct"] = tax_decimal * 100.0
+        details["sources"]["tax_rate"] = tax_details.get("source")
+
+    # 7) Weights (Market values)
+    debt_val = None
+    equity_val = None
+
+    try:
+        debt_val = float(bs_snap.get("total_debt")) if bs_snap and bs_snap.get("total_debt") is not None else None
+    except Exception:
+        debt_val = None
+
+    equity_val = get_market_cap(fundamentals)
+    if equity_val is None:
+        # fallback book equity si market cap absent
+        try:
+            equity_val = float(bs_snap.get("total_equity")) if bs_snap and bs_snap.get("total_equity") is not None else None
+            if equity_val is not None:
+                details["warnings"].append("Market cap manquante → pondération equity basée sur book equity (approx).")
+                details["sources"]["equity_value_for_weights"] = "book_equity_fallback"
+        except Exception:
+            equity_val = None
+    else:
+        details["sources"]["equity_value_for_weights"] = "EODHD Highlights.MarketCapitalization"
+
+    details["inputs"]["debt_value"] = debt_val
+    details["inputs"]["equity_value"] = equity_val
+
+    if debt_val is None or debt_val < 0:
+        details["missing"].append("debt_value_for_weights")
+    if equity_val is None or equity_val <= 0:
+        details["missing"].append("equity_value_for_weights")
+
+    # 8) WACC
+    if re_decimal is None or rd_decimal is None or tax_decimal is None or debt_val is None or equity_val is None or (debt_val + equity_val) <= 0:
+        # impossible de conclure
+        return None, details
+
+    d_w = debt_val / (debt_val + equity_val)
+    e_w = equity_val / (debt_val + equity_val)
+
+    wacc_decimal = e_w * re_decimal + d_w * rd_decimal * (1.0 - tax_decimal)
+    details["results"]["weights"] = {"D": d_w, "E": e_w}
+    details["results"]["wacc_pct"] = wacc_decimal * 100.0
+    details["sources"]["wacc"] = "computed"
+
+    return wacc_decimal * 100.0, details
+
 
 
 def _linear_score(value, low, high, higher_better=True):
@@ -1405,280 +1919,6 @@ def style_health_table(df: pd.DataFrame):
 # =========================================
 # MOTEUR DCF
 # =========================================
-# =========================================
-# WACC AUTO (EODHD) - calcul personnalisé
-# =========================================
-
-def _bond_ticker_for_currency(currency_code: Optional[str]) -> Optional[str]:
-    """Retourne le ticker GBOND 10Y utilisé comme proxy du risk-free.
-    - EUR -> DE10Y.GBOND (Bund 10 ans)
-    - USD -> US10Y.GBOND (Treasury 10 ans)
-    - GBP -> UK10Y.GBOND
-    """
-    if not currency_code:
-        return None
-    c = str(currency_code).strip().upper()
-    if c == "EUR":
-        return "DE10Y.GBOND"
-    if c == "USD":
-        return "US10Y.GBOND"
-    if c == "GBP":
-        return "UK10Y.GBOND"
-    return None
-
-
-def fetch_risk_free_rate(currency_code: Optional[str], api_key: str) -> Optional[float]:
-    """Risk-free annualisé en décimal (ex: 0.0285)."""
-    bond_ticker = _bond_ticker_for_currency(currency_code)
-    if not bond_ticker:
-        return None
-    y = fetch_eod_price(bond_ticker, api_key)
-    if y is None:
-        return None
-    try:
-        return float(y) / 100.0
-    except (TypeError, ValueError):
-        return None
-
-
-def extract_beta_from_fundamentals(fundamentals: dict) -> Optional[float]:
-    """Essaye d'extraire le bêta depuis fundamentals (Technicals)."""
-    tech = fundamentals.get("Technicals", {}) or {}
-    beta = pick_first_non_null(tech, ["Beta", "beta"])
-    if beta is not None:
-        return beta
-    gen = fundamentals.get("General", {}) or {}
-    beta = pick_first_non_null(gen, ["Beta", "beta"])
-    return beta
-
-
-def estimate_effective_tax_rate(
-    fundamentals: dict,
-    country_name: Optional[str],
-    currency_code: Optional[str],
-    allow_fallback: bool = True,
-) -> Tuple[Optional[float], str]:
-    """Taux d'impôt effectif (décimal).
-    - tente: IncomeTaxExpense / IncomeBeforeTax sur 3-5 ans
-    - fallback (optionnel): taux statutaire proxy par zone
-    Retourne (tax_rate, source_label).
-    """
-    tax_rates: List[float] = []
-
-    is_yearly = (
-        fundamentals.get("Financials", {})
-        .get("Income_Statement", {})
-        .get("yearly", {})
-        or {}
-    )
-    if isinstance(is_yearly, dict) and is_yearly:
-        for y in sorted(is_yearly.keys(), reverse=True)[:5]:
-            row = is_yearly.get(y, {}) or {}
-            pretax = pick_first_non_null(
-                row,
-                ["incomeBeforeTax", "IncomeBeforeTax", "pretaxIncome", "preTaxIncome", "income_before_tax"],
-            )
-            tax = pick_first_non_null(
-                row,
-                ["incomeTaxExpense", "IncomeTaxExpense", "taxProvision", "TaxProvision", "incomeTax", "IncomeTax"],
-            )
-            if pretax is None or tax is None:
-                continue
-            if pretax == 0:
-                continue
-            rate = tax / pretax
-            if rate < 0:
-                continue
-            if rate > 0.60:
-                continue
-            tax_rates.append(rate)
-
-    if tax_rates:
-        tax_rates_sorted = sorted(tax_rates)
-        mid = len(tax_rates_sorted) // 2
-        if len(tax_rates_sorted) % 2 == 1:
-            med = tax_rates_sorted[mid]
-        else:
-            med = (tax_rates_sorted[mid - 1] + tax_rates_sorted[mid]) / 2
-        return float(med), "effective_median_5y"
-
-    if not allow_fallback:
-        return None, "missing"
-
-    ctry = (country_name or "").strip().lower()
-    cur = (currency_code or "").strip().upper()
-
-    if cur == "USD" or "united states" in ctry or ctry in ("usa", "us"):
-        return 0.21, "fallback_statutory_us"
-
-    if "france" in ctry:
-        return 0.25, "fallback_statutory_fr"
-
-    if cur == "EUR":
-        return 0.215, "fallback_europe_avg"
-
-    return 0.212, "fallback_oecd_avg"
-
-
-def estimate_cost_of_debt(
-    is_snap: dict,
-    total_debt: Optional[float],
-    override_rd: Optional[float] = None,
-) -> Tuple[Optional[float], str]:
-    """Coût de la dette (Rd) en décimal.
-    - si override_rd fourni -> utilisé
-    - sinon -> interestExpense / totalDebt (proxy)
-    Retourne (rd, source_label).
-    """
-    if override_rd is not None and override_rd > 0:
-        return float(override_rd), "override"
-
-    if total_debt in (None, 0) or not isinstance(is_snap, dict):
-        return None, "missing"
-
-    interest = pick_first_non_null(
-        is_snap,
-        ["interestExpense", "InterestExpense", "interest_expense", "interestExpenseNonOperating", "InterestExpenseNonOperating"],
-    )
-    if interest is None:
-        return None, "missing"
-
-    try:
-        rd = float(interest) / float(total_debt)
-    except Exception:
-        return None, "missing"
-
-    if rd < 0:
-        return None, "missing"
-    if rd > 0.30:
-        return None, "missing"
-
-    return rd, "interestExpense/totalDebt"
-
-
-def compute_wacc_auto(
-    fundamentals: dict,
-    company: dict,
-    bs_snap: dict,
-    is_snap: dict,
-    base_metrics: dict,
-    api_key: str,
-    overrides: Optional[Dict[str, Any]] = None,
-) -> Tuple[Optional[float], Dict[str, Any], List[str]]:
-    """Calcule une WACC personnalisée.
-    Retourne (wacc_decimal, details_dict, missing_fields_list).
-    """
-    overrides = overrides or {}
-    missing: List[str] = []
-
-    general = fundamentals.get("General", {}) or {}
-    country_name = general.get("CountryName") or general.get("Country") or company.get("country")
-    currency_code = general.get("CurrencyCode") or general.get("Currency") or company.get("currency")
-
-    # Risk-free
-    rf = fetch_risk_free_rate(currency_code, api_key)
-    bond_ticker = _bond_ticker_for_currency(currency_code)
-    if rf is None:
-        missing.append("risk_free_rate (bond 10Y)")
-
-    # Beta
-    beta_override = overrides.get("beta_override")
-    if isinstance(beta_override, (int, float)) and beta_override > 0:
-        beta = float(beta_override)
-        beta_source = "override"
-    else:
-        beta = extract_beta_from_fundamentals(fundamentals)
-        beta_source = "eodhd_technicals_beta"
-    if beta is None:
-        missing.append("beta")
-
-    # ERP (assumption)
-    erp_us = overrides.get("erp_us")
-    erp_eur = overrides.get("erp_eur")
-    if currency_code and str(currency_code).upper() == "USD":
-        erp = float(erp_us) if isinstance(erp_us, (int, float)) and erp_us > 0 else 0.0433
-        erp_source = "default_us_erp"
-    else:
-        erp = float(erp_eur) if isinstance(erp_eur, (int, float)) and erp_eur > 0 else 0.055
-        erp_source = "default_eur_erp"
-
-    # Capital structure
-    market_cap = base_metrics.get("market_cap")
-    if market_cap is None or market_cap <= 0:
-        missing.append("market_cap")
-
-    total_debt = pick_first_non_null(bs_snap, ["total_debt", "totalDebt", "shortLongTermDebtTotal", "shortLongTermDebt"])
-    if total_debt is None or total_debt < 0:
-        missing.append("total_debt")
-
-    # Tax rate
-    allow_tax_fallback = bool(overrides.get("allow_tax_fallback", True))
-    tax_rate, tax_source = estimate_effective_tax_rate(
-        fundamentals=fundamentals,
-        country_name=country_name,
-        currency_code=currency_code,
-        allow_fallback=allow_tax_fallback,
-    )
-    if tax_rate is None:
-        missing.append("tax_rate")
-
-    # Cost of debt
-    rd_override = overrides.get("rd_override")
-    if isinstance(rd_override, (int, float)) and rd_override > 0:
-        rd_override = float(rd_override)
-    else:
-        rd_override = None
-    rd, rd_source = estimate_cost_of_debt(is_snap=is_snap, total_debt=total_debt, override_rd=rd_override)
-    if rd is None:
-        missing.append("cost_of_debt (Rd)")
-
-    # Cost of equity
-    re_cost = None
-    if rf is not None and beta is not None:
-        re_cost = rf + beta * erp
-    else:
-        missing.append("cost_of_equity (Re)")
-
-    # Weights
-    we = wd = None
-    if market_cap is not None and market_cap > 0 and total_debt is not None and total_debt >= 0:
-        denom = market_cap + total_debt
-        if denom > 0:
-            we = market_cap / denom
-            wd = total_debt / denom
-        else:
-            missing.append("capital_structure_weights")
-    else:
-        missing.append("capital_structure_weights")
-
-    wacc = None
-    if re_cost is not None and rd is not None and tax_rate is not None and we is not None and wd is not None:
-        wacc = we * re_cost + wd * rd * (1 - tax_rate)
-
-    details = {
-        "mode": "auto",
-        "country": country_name,
-        "currency": currency_code,
-        "bond_ticker": bond_ticker,
-        "rf": rf,
-        "beta": beta,
-        "beta_source": beta_source,
-        "erp": erp,
-        "erp_source": erp_source,
-        "re": re_cost,
-        "total_debt": total_debt,
-        "market_cap": market_cap,
-        "we": we,
-        "wd": wd,
-        "rd": rd,
-        "rd_source": rd_source,
-        "tax_rate": tax_rate,
-        "tax_source": tax_source,
-        "wacc": wacc,
-    }
-
-    return wacc, details, missing
-
 
 def project_fcf(fcf_start: float, growth_rate: float, years: int):
     """
@@ -1733,7 +1973,7 @@ def dcf_fair_value_per_share(
         return None, None, None, None, None
 
     projected_fcfs = project_fcf(fcf_start, growth_fcf, years)
-    discounted_fcfs, sum_discounted_fcfs = discount_cash_flows(projected_fcfs, wacc)
+    discounted_fcfs, sum_discounted_fcfs = discount_cash_flows(projected_fcfs, wacc_used)
 
     tv = terminal_value(projected_fcfs[-1], wacc, g_terminal)
     if tv is None:
@@ -2291,7 +2531,7 @@ def combine_global_valuation(dcf_value: float, multiples_vals: dict, weights: di
 # =========================================
 # PIPELINE PRINCIPAL POUR UNE SOCIÉTÉ
 # =========================================
-def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fcf: float, g_terminal: float, auto_wacc: bool = False, wacc_overrides: Optional[Dict[str, Any]] = None):
+def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fcf: float, g_terminal: float, wacc_cfg: dict = None):
     """
     Pipeline complet :
     - Recherche par nom/ticker
@@ -2364,6 +2604,32 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     is_year, is_snap = extract_income_snapshot(fundamentals)
     cf_year, cf_snap = extract_cashflow_snapshot(fundamentals)
 
+    # =========================
+    # WACC automatique (si activée)
+    # =========================
+    wacc_used = wacc
+    wacc_details = None
+    wacc_source = "manual"
+
+    if wacc_cfg and wacc_cfg.get("enabled"):
+        wacc_auto, details = compute_wacc_auto(
+            fundamentals=fundamentals,
+            bs_snap=bs_snap,
+            is_snap=is_snap,
+            net_debt=net_debt,
+            api_key=api_key,
+            config=wacc_cfg,
+        )
+        wacc_details = details
+        if wacc_auto is not None:
+            wacc_used = float(wacc_auto)
+            wacc_source = "auto"
+        else:
+            # On garde la WACC manuelle comme fallback, mais on documente clairement le pourquoi.
+            wacc_source = "manual_fallback"
+
+
+
     health_ratios = compute_company_health_ratios(
         company=company,
         bs_snap=bs_snap,
@@ -2379,41 +2645,6 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     # =========================
     base_financials = extract_base_financials(fundamentals)
     base_metrics = compute_base_multiples(price, shares, net_debt, base_financials)
-
-    # =========================
-    # WACC auto (optionnel) : basé sur données EODHD + assumptions explicites
-    # =========================
-    wacc_mode = "manual"
-    wacc_details: Dict[str, Any] = {"mode": "manual", "wacc": wacc}
-    wacc_missing: List[str] = []
-
-    if auto_wacc:
-        # Mode auto : on tente de calculer la WACC à partir des données EODHD.
-        # Si des champs clés manquent (fréquent : interestExpense pour Rd), on n'interrompt pas l'analyse :
-        # on bascule sur la WACC manuelle et on expose les champs manquants dans le résumé.
-        wacc_mode = "auto"
-        wacc_auto, wacc_details, wacc_missing = compute_wacc_auto(
-            fundamentals=fundamentals,
-            company=company,
-            bs_snap=bs_snap,
-            is_snap=is_snap,
-            base_metrics=base_metrics,
-            api_key=api_key,
-            overrides=wacc_overrides or {},
-        )
-
-        if wacc_missing or (wacc_auto is None):
-            # Pas de crash : fallback sur la WACC manuelle déjà saisie en sidebar
-            wacc_mode = "auto_failed_fallback_manual"
-            wacc_details = wacc_details or {"mode": "auto"}
-            wacc_details["note"] = (
-                "WACC auto indisponible : utilisation de la WACC manuelle. "
-                "Pour activer le mode auto, renseigne un override Rd (%) ou désactive WACC auto."
-            )
-            # wacc reste la valeur manuelle (wacc_input)
-        else:
-            wacc = float(wacc_auto)
-
     profile = classify_company_profile(company, base_metrics, hist_df)
 
     # =========================
@@ -2438,7 +2669,7 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             fcf_start=fcf_start,
             growth_fcf=growth_fcf,
             years=years,
-            wacc=wacc,
+            wacc=wacc_used,
             g_terminal=g_terminal,
             net_debt=net_debt,
             shares=shares,
@@ -2451,7 +2682,7 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
 
         # Projections FCF & sensibilité
         projected_fcfs = project_fcf(fcf_start, growth_fcf, years)
-        discounted_fcfs, _ = discount_cash_flows(projected_fcfs, wacc)
+        discounted_fcfs, _ = discount_cash_flows(projected_fcfs, wacc_used)
         proj_df = pd.DataFrame(
             {
                 "Année": [f"Année {i}" for i in range(1, years + 1)],
@@ -2464,7 +2695,7 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             fcf_start=fcf_start,
             growth_fcf=growth_fcf,
             years=years,
-            base_wacc=wacc,
+            base_wacc=wacc_used,
             base_g=g_terminal,
             net_debt=net_debt,
             shares=shares,
@@ -2502,10 +2733,6 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         "price": price,
         "shares": shares,
         "net_debt": net_debt,
-        "wacc_used": wacc,
-        "wacc_mode": wacc_mode,
-        "wacc_details": wacc_details,
-        "wacc_missing": wacc_missing,
         "hist_df": hist_df,
         "health": {
             "bs_year": bs_year,
@@ -2519,14 +2746,16 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         "fcf_start": fcf_start,
         "proj_df": proj_df,
         "dcf": {
+
+            "wacc_used": wacc_used,
+            "wacc_source": wacc_source,
+            "wacc_details": wacc_details,
             "fair_value_per_share": fv_dcf,
             "ev": ev,
             "equity_value": equity_value,
             "tv_discounted": tv_discounted,
             "sum_disc_fcfs": sum_disc_fcfs,
             "upside_pct": upside_dcf,
-            "wacc_used": wacc,
-            "wacc_mode": wacc_mode,
         },
         "sensitivity": sens_matrix,
         "base_financials": base_financials,
@@ -2588,64 +2817,44 @@ def main():
         value=5,
         step=1,
     )
+        # WACC manuelle (fallback ou mode manuel)
     wacc_input = st.sidebar.number_input(
-        "WACC (%)",
-        min_value=5.5,
-        max_value=8.0,
+        "WACC manuelle (%)",
+        min_value=3.0,
+        max_value=15.0,
         value=6.8,
         step=0.1,
     )
-    
-    auto_wacc = st.sidebar.checkbox(
-        "Calculer la WACC automatiquement (EODHD)",
-        value=True,
-        help="Calcule Rf (10Y), Beta (EODHD), structure D/E, coût de la dette et taux d'impôt (effectif si dispo)."
-    )
 
-    # Overrides (si besoin)
-    if auto_wacc:
-        st.sidebar.markdown("##### Paramètres WACC auto (optionnels)")
-        allow_tax_fallback = st.sidebar.checkbox(
-            "Autoriser un taux d'impôt de fallback si l'effectif n'est pas disponible",
-            value=True
-        )
-        beta_override = st.sidebar.number_input(
-            "Beta (override, 0 = auto)",
-            min_value=0.0,
-            max_value=5.0,
-            value=0.0,
-            step=0.05,
-        )
-        rd_override_pct = st.sidebar.number_input(
-            "Coût de la dette Rd (override, 0 = auto) %",
-            min_value=0.0,
-            max_value=20.0,
-            value=0.0,
-            step=0.1,
-        )
-        erp_us_pct = st.sidebar.number_input(
-            "Equity Risk Premium US (%)",
-            min_value=0.0,
-            max_value=15.0,
-            value=4.33,
-            step=0.1,
-        )
-        erp_eur_pct = st.sidebar.number_input(
-            "Equity Risk Premium EUR (%)",
-            min_value=0.0,
-            max_value=15.0,
-            value=5.50,
-            step=0.1,
-        )
-        wacc_overrides = {
-            "allow_tax_fallback": allow_tax_fallback,
-            "beta_override": beta_override if beta_override > 0 else None,
-            "rd_override": (rd_override_pct / 100.0) if rd_override_pct > 0 else None,
-            "erp_us": (erp_us_pct / 100.0) if erp_us_pct > 0 else None,
-            "erp_eur": (erp_eur_pct / 100.0) if erp_eur_pct > 0 else None,
-        }
-    else:
-        wacc_overrides = {}
+    st.sidebar.markdown("### WACC automatique (EODHD)")
+    use_auto_wacc = st.sidebar.checkbox("Activer WACC auto", value=True)
+
+    # ERP par zone (en %)
+    erp_us = st.sidebar.number_input("Equity Risk Premium US (%)", min_value=0.0, max_value=15.0, value=4.3, step=0.1)
+    erp_eur = st.sidebar.number_input("Equity Risk Premium EUR (%)", min_value=0.0, max_value=15.0, value=5.5, step=0.1)
+
+    # Overrides optionnels
+    col1, col2 = st.sidebar.columns(2)
+    with col1:
+        override_beta = st.checkbox("Override Beta", value=False)
+    with col2:
+        override_rd = st.checkbox("Override Rd", value=False)
+
+    beta_override = None
+    if override_beta:
+        beta_override = st.sidebar.number_input("Beta override", min_value=0.0, max_value=5.0, value=1.0, step=0.05)
+
+    rd_override_pct = None
+    if override_rd:
+        rd_override_pct = st.sidebar.number_input("Rd override (%)", min_value=0.0, max_value=25.0, value=4.5, step=0.1)
+
+    override_tax = st.sidebar.checkbox("Override Tax rate", value=False)
+    tax_override_pct = None
+    if override_tax:
+        tax_override_pct = st.sidebar.number_input("Tax rate override (%)", min_value=0.0, max_value=45.0, value=25.0, step=0.5)
+
+    allow_heuristic_rd = st.sidebar.checkbox("Autoriser estimation Rd si interestExpense manquant", value=True)
+    allow_tax_fallback = st.sidebar.checkbox("Autoriser fallback tax par zone", value=True)
 
     growth_fcf_input = st.sidebar.number_input(
         "Croissance annuelle FCF (%)",
@@ -2691,24 +2900,34 @@ def main():
 
     if not run_button:
         st.stop()
-
     try:
         with st.spinner("Analyse en cours..."):
+            wacc_cfg = {
+                "enabled": bool(use_auto_wacc),
+                "erp_us_pct": float(erp_us),
+                "erp_eur_pct": float(erp_eur),
+                "erp_default_pct": float(erp_us),
+                "beta_override": beta_override,
+                "rd_override_pct": rd_override_pct,
+                "tax_override_pct": tax_override_pct,
+                "allow_heuristic_rd": bool(allow_heuristic_rd),
+                "allow_tax_fallback": bool(allow_tax_fallback),
+            }
+
             result = analyze_company(
-                query=query,
-                api_key=api_key,
-                years=years,
-                wacc=wacc,
-                growth_fcf=growth_fcf,
-                g_terminal=g_terminal,
-                auto_wacc=auto_wacc,
-                wacc_overrides=wacc_overrides,
+                query,
+                api_key,
+                years,
+                wacc_input,
+                growth_fcf_input,
+                g_terminal_input,
+                wacc_cfg=wacc_cfg,
             )
+
     except Exception as e:
         st.error(f"Erreur lors de l'analyse : {e}")
         st.stop()
         return
-
     # =========================================
     # MISE EN PAGE AVEC TABS
     # =========================================
@@ -2857,52 +3076,53 @@ def main():
 
             st.markdown("#### Hypothèses retenues (base case)")
             st.write(f"- Horizon de projection : **{years} ans**")
-            wacc_used = result.get("wacc_used")
-            wacc_mode = result.get("wacc_mode", "manual")
-            wacc_used_pct = (float(wacc_used) * 100.0) if wacc_used is not None else None
-
-            if isinstance(wacc_mode, str) and wacc_mode.startswith("auto") and wacc_used_pct is not None:
-                st.write(f"- WACC : **{wacc_used_pct:.2f} % ({'auto' if wacc_mode == 'auto' else 'auto → manuel'})**")
-                details = result.get("wacc_details") or {}
-                with st.expander("Détail du calcul de WACC (auto)"):
-                    if not details or details.get("wacc") is None:
-                        missing_fields = result.get("wacc_missing") or []
-                        note = (details or {}).get("note")
-                        if missing_fields:
-                            st.error("WACC auto non calculable (données manquantes) : " + ", ".join(missing_fields))
-                        if note:
-                            st.info(note)
-                        st.warning("Utilisation de la WACC manuelle tant que ces données ne sont pas renseignées.")
-                    else:
-                        rows = [
-                            ("Devise", details.get("currency")),
-                            ("Pays", details.get("country")),
-                            ("Risk-free (10Y)", details.get("rf")),
-                            ("Proxy risk-free", details.get("bond_ticker")),
-                            ("Beta", details.get("beta")),
-                            ("Source Beta", details.get("beta_source")),
-                            ("Equity Risk Premium", details.get("erp")),
-                            ("Source ERP", details.get("erp_source")),
-                            ("Coût des fonds propres Re", details.get("re")),
-                            ("Total Debt (proxy D)", details.get("total_debt")),
-                            ("Market Cap (proxy E)", details.get("market_cap")),
-                            ("Poids Equity We", details.get("we")),
-                            ("Poids Debt Wd", details.get("wd")),
-                            ("Coût de la dette Rd", details.get("rd")),
-                            ("Source Rd", details.get("rd_source")),
-                            ("Taux d'impôt", details.get("tax_rate")),
-                            ("Source tax", details.get("tax_source")),
-                            ("WACC", details.get("wacc")),
-                        ]
-                        df_w = pd.DataFrame(rows, columns=["Paramètre", "Valeur"])
-                        st.dataframe(df_w, use_container_width=True)
-            else:
-                st.write(f"- WACC : **{wacc_input:.2f} % (manuel)**")
-
+            st.write(f"- WACC utilisée : **{dcf.get('wacc_used', wacc_input):.2f} %** ({dcf.get('wacc_source', 'manual')})")
             st.write(f"- Croissance FCF : **{growth_fcf_input:.2f} % par an**")
             st.write(f"- g de long terme : **{g_terminal_input:.2f} %**")
             st.write(f"- Dette nette utilisée : **{format_large_number(net_debt)}**")
             st.write(f"- FCF de départ estimé : **{format_large_number(fcf_start)}**")
+            # Détail WACC automatique (audit trail)
+            wacc_details = dcf.get("wacc_details") if isinstance(dcf, dict) else None
+            if wacc_details:
+                with st.expander("Détail du calcul WACC (auto)"):
+                    inputs = wacc_details.get("inputs", {})
+                    results = wacc_details.get("results", {})
+                    sources = wacc_details.get("sources", {})
+                    missing = wacc_details.get("missing", [])
+                    warnings = wacc_details.get("warnings", [])
+
+                    st.markdown("##### Inputs & sources")
+                    rows = []
+                    rows.append({"Champ": "Currency", "Valeur": inputs.get("currency_code"), "Source": ""})
+                    rows.append({"Champ": "Risk-free ticker", "Valeur": inputs.get("rf_ticker"), "Source": sources.get("risk_free_rate")})
+                    rows.append({"Champ": "Risk-free (close, %)", "Valeur": inputs.get("rf_close_pct"), "Source": sources.get("risk_free_rate")})
+                    rows.append({"Champ": "Beta", "Valeur": inputs.get("beta"), "Source": sources.get("beta")})
+                    rows.append({"Champ": "ERP (%)", "Valeur": inputs.get("erp_pct"), "Source": sources.get("equity_risk_premium")})
+                    rd_det = inputs.get("rd_details", {})
+                    rows.append({"Champ": "Rd method", "Valeur": rd_det.get("source"), "Source": sources.get("cost_of_debt")})
+                    rows.append({"Champ": "Tax method", "Valeur": (inputs.get("tax_details") or {}).get("source"), "Source": sources.get("tax_rate")})
+                    rows.append({"Champ": "Debt value", "Valeur": inputs.get("debt_value"), "Source": ""})
+                    rows.append({"Champ": "Equity value", "Valeur": inputs.get("equity_value"), "Source": sources.get("equity_value_for_weights")})
+
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True)
+
+                    st.markdown("##### Résultats")
+                    out = []
+                    out.append({"Champ": "Cost of equity (%)", "Valeur": results.get("cost_of_equity_pct")})
+                    out.append({"Champ": "Cost of debt (%)", "Valeur": results.get("cost_of_debt_pct")})
+                    out.append({"Champ": "Tax rate (%)", "Valeur": results.get("tax_rate_pct")})
+                    w = results.get("weights") or {}
+                    out.append({"Champ": "Weight E", "Valeur": w.get("E")})
+                    out.append({"Champ": "Weight D", "Valeur": w.get("D")})
+                    out.append({"Champ": "WACC (%)", "Valeur": results.get("wacc_pct")})
+                    st.dataframe(pd.DataFrame(out), use_container_width=True)
+
+                    if missing:
+                        st.warning("Champs manquants (auto) : " + ", ".join(map(str, missing)))
+                    if warnings:
+                        st.warning("Avertissements :\n- " + "\n- ".join(map(str, warnings)))
+                    if rd_det and rd_det.get("warnings"):
+                        st.info("Rd (détails) :\n- " + "\n- ".join(map(str, rd_det.get("warnings"))))
 
             st.info(
                 "Ce résumé présente le scénario central (base case). "
@@ -2975,7 +3195,7 @@ def main():
             )
 
         st.markdown("#### Rappel des paramètres du scénario central")
-        st.write(f"- WACC base : **{wacc_input:.2f} %**")
+        st.write(f"- WACC base : **{dcf.get('wacc_used', wacc_input):.2f} %** ({dcf.get('wacc_source', 'manual')})")
         st.write(f"- g base : **{g_terminal_input:.2f} %**")
         st.write(f"- Croissance FCF : **{growth_fcf_input:.2f} %/an**")
         st.write(f"- Horizon : **{years} ans**")
