@@ -1438,8 +1438,14 @@ def compute_wacc_auto(
     config: dict,
 ):
     """
-    Calcule une WACC automatique.
-    Renvoie (wacc_pct, details_dict). wacc_pct peut être None si impossible même avec fallbacks.
+    WACC automatique (robuste) :
+    - Risk-free : GBOND 10Y (DE10Y pour EUR, US10Y pour USD, etc.) via EODHD /eod/{ticker}.GBOND
+    - ERP : paramétré en sidebar (US / EUR / défaut)
+    - Beta : EODHD + option override + option bottom-up override + floor + blend
+    - Rd : calcul comptable (interest/avg debt) sinon heuristique rf+spread (NetDebt/EBITDA)
+    - Tax : ETR médiane multi-années, sinon override, sinon fallback optionnel
+
+    Retourne (wacc_decimal, details_dict). wacc_decimal est un taux décimal (ex 0.0878).
     """
     details = {
         "enabled": bool(config.get("enabled", False)),
@@ -1450,12 +1456,16 @@ def compute_wacc_auto(
         "results": {},
     }
 
+    if not details["enabled"]:
+        details["warnings"].append("WACC auto désactivée.")
+        return None, details
+
+    # ---------- 1) Risk-free (GBOND) ----------
     cc = get_currency_code(fundamentals)
     ci = get_country_iso(fundamentals)
     details["inputs"]["currency_code"] = cc
     details["inputs"]["country_iso"] = ci
 
-    # 1) Risk-free via GBOND (close = yield %)
     rf_map = {
         "EUR": "DE10Y.GBOND",
         "USD": "US10Y.GBOND",
@@ -1466,194 +1476,192 @@ def compute_wacc_auto(
         "AUD": "AU10Y.GBOND",
     }
     rf_ticker = rf_map.get(cc, "US10Y.GBOND")
-    rf_close = fetch_latest_eod_close(rf_ticker, api_key)
-    if rf_close is None:
+    details["inputs"]["rf_ticker"] = rf_ticker
+
+    rf_pct = None
+    try:
+        rf_pct = fetch_latest_eod_close(rf_ticker, api_key)
+        if rf_pct is not None:
+            rf_pct = float(rf_pct)
+            details["sources"]["risk_free"] = f"EODHD eod/{rf_ticker} close"
+    except Exception as e:
+        details["warnings"].append(f"Risk-free non récupérable via {rf_ticker} : {e}")
+        rf_pct = None
+
+    if rf_pct is None:
         details["missing"].append("risk_free_rate")
-    else:
-        details["sources"]["risk_free_rate"] = f"EODHD EOD close {rf_ticker}"
-        details["inputs"]["rf_ticker"] = rf_ticker
-        details["inputs"]["rf_close_pct"] = rf_close
+        return None, details
 
-    rf_decimal = (rf_close / 100.0) if rf_close is not None else None
+    rf_decimal = rf_pct / 100.0
+    details["results"]["rf_pct"] = rf_pct
 
-    # 2) ERP
-    erp_us = config.get("erp_us_pct")
-    erp_eur = config.get("erp_eur_pct")
-    erp_default = config.get("erp_default_pct")
+    # ---------- 2) Equity Risk Premium ----------
     erp_pct = None
-    if cc == "USD" and erp_us is not None:
-        erp_pct = erp_us
-    elif cc == "EUR" and erp_eur is not None:
-        erp_pct = erp_eur
-    elif erp_default is not None:
-        erp_pct = erp_default
+    if cc == "EUR":
+        erp_pct = config.get("erp_eur_pct")
+    elif cc == "USD":
+        erp_pct = config.get("erp_us_pct")
+    else:
+        erp_pct = config.get("erp_default_pct")
 
     if erp_pct is None:
         details["missing"].append("equity_risk_premium")
-    else:
-        details["inputs"]["erp_pct"] = float(erp_pct)
-        details["sources"]["equity_risk_premium"] = "sidebar_default_or_override"
+        return None, details
 
-    erp_decimal = (float(erp_pct) / 100.0) if erp_pct is not None else None
+    erp_pct = float(erp_pct)
+    erp_decimal = erp_pct / 100.0
+    details["results"]["erp_pct"] = erp_pct
 
-    
-# 3) Beta
-beta_override = config.get("beta_override")
-beta_floor = config.get("beta_floor")
-beta_bottom_up_override = config.get("beta_bottom_up_override")
-beta_blend_weight = config.get("beta_blend_weight", 0.5)
-
-beta_raw = None
-beta = None
-
-# (a) Override direct
-if beta_override is not None:
-    try:
-        beta = float(beta_override)
-        details["sources"]["beta"] = "override"
-    except Exception:
-        details["warnings"].append("Beta override invalide.")
-        beta = None
-
-# (b) Beta EODHD (si pas d'override)
-if beta is None:
+    # ---------- 3) Beta (avec garde-fous) ----------
     beta_raw = get_beta(fundamentals)
-    if beta_raw is not None:
-        beta = float(beta_raw)
-        details["sources"]["beta"] = "EODHD Technicals.Beta"
+    details["inputs"]["beta_raw"] = beta_raw
+    details["sources"]["beta_raw"] = "EODHD Highlights.Beta (si dispo)"
 
-# (c) Beta bottom-up (manuel) + blend optionnel
-if beta_bottom_up_override is not None:
-    try:
-        beta_bu = float(beta_bottom_up_override)
-        if beta is None:
-            beta = beta_bu
-            details["sources"]["beta"] = "bottom_up_override"
-        else:
-            # Blend : w * beta_market + (1-w) * beta_bottom_up
-            w = float(beta_blend_weight)
+    beta_override = config.get("beta_override")
+    beta_bottom_up = config.get("beta_bottom_up_override")
+    beta_blend_weight = config.get("beta_blend_weight", 0.5)
+    beta_floor = config.get("beta_floor")
+
+    beta_used = None
+    # override total
+    if beta_override is not None:
+        try:
+            beta_used = float(beta_override)
+            details["sources"]["beta_used"] = "override"
+        except Exception:
+            details["warnings"].append("Override beta invalide (non numérique).")
+
+    # sinon blend
+    if beta_used is None:
+        b0 = None
+        try:
+            b0 = float(beta_raw) if beta_raw is not None else None
+        except Exception:
+            b0 = None
+
+        bbu = None
+        if beta_bottom_up is not None:
+            try:
+                bbu = float(beta_bottom_up)
+                details["sources"]["beta_bottom_up"] = "override_bottom_up"
+            except Exception:
+                details["warnings"].append("Beta bottom-up override invalide (non numérique).")
+                bbu = None
+
+        if b0 is not None and bbu is not None:
+            try:
+                w = float(beta_blend_weight)
+            except Exception:
+                w = 0.5
             w = max(0.0, min(1.0, w))
-            beta = w * float(beta) + (1.0 - w) * beta_bu
-            details["sources"]["beta"] = "blended(market,bottom_up)"
-    except Exception:
-        details["warnings"].append("Beta bottom-up override invalide.")
+            beta_used = (1.0 - w) * b0 + w * bbu
+            details["sources"]["beta_used"] = "blend(beta_raw, beta_bottom_up)"
+            details["inputs"]["beta_blend_weight"] = w
+        elif b0 is not None:
+            beta_used = b0
+            details["sources"]["beta_used"] = "beta_raw"
+        elif bbu is not None:
+            beta_used = bbu
+            details["sources"]["beta_used"] = "beta_bottom_up_only"
 
-# (d) Plancher beta (garde-fou)
-try:
-    bf = float(beta_floor) if beta_floor is not None else None
-except Exception:
-    bf = None
+    if beta_used is None:
+        details["missing"].append("beta")
+        return None, details
 
-if beta is None:
-    details["missing"].append("beta")
-else:
-    if bf is not None and beta < bf:
-        details["warnings"].append(f"Beta trop faible ({beta:.2f}) → plancher appliqué ({bf:.2f}).")
-        beta = bf
-    details["results"]["beta_used"] = beta
+    # floor beta
+    if beta_floor is not None:
+        try:
+            bf = float(beta_floor)
+            if beta_used < bf:
+                details["warnings"].append(f"Beta trop faible ({beta_used:.2f}) < floor ({bf:.2f}) → floor appliqué.")
+                beta_used = bf
+        except Exception:
+            pass
 
-    # 4) Cost of equity Re
-    re_decimal = None
-    if rf_decimal is not None and beta is not None and erp_decimal is not None:
-        re_decimal = rf_decimal + beta * erp_decimal
-        details["results"]["cost_of_equity_pct"] = re_decimal * 100.0
-    else:
-        details["missing"].append("cost_of_equity")
+    details["results"]["beta_used"] = float(beta_used)
 
-    # 5) Rd
-    rd_override_pct = config.get("rd_override_pct")
-    allow_heuristic_rd = bool(config.get("allow_heuristic_rd", True))
+    # ---------- 4) Cost of Equity (Re) ----------
+    re_decimal = rf_decimal + float(beta_used) * erp_decimal
+    # clamp raisonnable
+    re_decimal = max(0.0, min(0.30, float(re_decimal)))
+    details["results"]["re_pct"] = re_decimal * 100.0
+
+    # ---------- 5) Tax rate ----------
+    tax_override_pct = config.get("tax_override_pct")
+    tax_decimal = None
+    tax_details = None
+    if tax_override_pct is not None:
+        try:
+            tax_decimal = float(tax_override_pct) / 100.0
+            details["sources"]["tax"] = "override"
+        except Exception:
+            details["warnings"].append("Override tax invalide (non numérique).")
+            tax_decimal = None
+
+    if tax_decimal is None:
+        tax_decimal, tax_details = compute_effective_tax_rate(fundamentals, max_years=5)
+        if tax_decimal is not None:
+            details["sources"]["tax"] = "computed_effective_tax_rate"
+            details["inputs"]["tax_details"] = tax_details
+        else:
+            if config.get("allow_tax_fallback"):
+                # fallback prudent : 25% par défaut (générique)
+                tax_decimal = 0.25
+                details["warnings"].append("ETR indisponible → fallback tax=25% (générique).")
+                details["sources"]["tax"] = "fallback_generic_25pct"
+            else:
+                details["missing"].append("tax_rate")
+                return None, details
+
+    tax_decimal = max(0.0, min(0.45, float(tax_decimal)))
+    details["results"]["tax_pct"] = tax_decimal * 100.0
+
+    # ---------- 6) Cost of Debt (Rd) ----------
+    allow_heuristic = bool(config.get("allow_heuristic_rd", True))
     rd_decimal, rd_details = estimate_cost_of_debt(
         fundamentals=fundamentals,
-        bs_snap=bs_snap,
-        is_snap=is_snap,
+        bs_snap=bs_snap or {},
+        is_snap=is_snap or {},
         net_debt=net_debt,
-        rf_decimal=rf_decimal or 0.0,
+        rf_decimal=rf_decimal,
         api_key=api_key,
-        rd_override_pct=rd_override_pct,
-        allow_heuristic=allow_heuristic_rd,
+        allow_heuristic=allow_heuristic,
+        config=config,
     )
     details["inputs"]["rd_details"] = rd_details
     if rd_decimal is None:
         details["missing"].append("cost_of_debt")
-    else:
-        details["results"]["cost_of_debt_pct"] = rd_decimal * 100.0
-        details["sources"]["cost_of_debt"] = rd_details.get("source")
+        return None, details
+    rd_decimal = max(0.0, min(0.25, float(rd_decimal)))
+    details["results"]["rd_pct"] = rd_decimal * 100.0
 
-    # 6) Tax rate
-    tax_override_pct = config.get("tax_override_pct")
-    allow_tax_fallback = bool(config.get("allow_tax_fallback", True))
-    tax_decimal = None
-    tax_details = {"source": None, "warnings": []}
-
-    if tax_override_pct is not None:
-        try:
-            tax_decimal = max(0.0, min(0.45, float(tax_override_pct) / 100.0))
-            tax_details["source"] = "override"
-        except Exception:
-            tax_details["warnings"].append("Tax override invalide.")
-            tax_decimal = None
-
-    if tax_decimal is None:
-        etr, etr_details = compute_effective_tax_rate(fundamentals, max_years=5)
-        if etr is not None:
-            tax_decimal = etr
-            tax_details["source"] = "ETR_median_multi_years"
-            tax_details["etr_details"] = etr_details
-
-    if tax_decimal is None and allow_tax_fallback:
-        # fallback simple par pays/currency (proxy)
-        if ci == "US" or cc == "USD":
-            tax_decimal = 0.258  # proxy combiné moyen (fédéral + états)
-            tax_details["source"] = "regional_default_US"
-        elif ci == "FR":
-            tax_decimal = 0.25
-            tax_details["source"] = "statutory_FR"
-        elif cc == "EUR":
-            tax_decimal = 0.25
-            tax_details["source"] = "regional_default_EUR"
-        else:
-            tax_decimal = 0.25
-            tax_details["source"] = "regional_default_generic"
-
-    details["inputs"]["tax_details"] = tax_details
-    if tax_decimal is None:
-        details["missing"].append("tax_rate")
-    else:
-        details["results"]["tax_rate_pct"] = tax_decimal * 100.0
-        details["sources"]["tax_rate"] = tax_details.get("source")
-
-    # 7) Weights (Market values)
+    # ---------- 7) Weights (E/D) ----------
     debt_val = None
-    equity_val = None
-
     try:
         debt_val = float(bs_snap.get("total_debt")) if bs_snap and bs_snap.get("total_debt") is not None else None
     except Exception:
         debt_val = None
 
-    # Fallback : si dette brute indisponible mais que net debt + cash sont connus,
-    # on peut reconstruire approximativement la dette brute : GrossDebt ≈ NetDebt + Cash
     if debt_val is None:
+        # fallback : GrossDebt ≈ NetDebt + Cash
         try:
             cash_val = float(bs_snap.get("cash")) if bs_snap and bs_snap.get("cash") is not None else None
+            if cash_val is not None and net_debt is not None:
+                derived = float(net_debt) + float(cash_val)
+                if derived > 0:
+                    debt_val = derived
+                    details["warnings"].append("Dette brute manquante → approximée via NetDebt + Cash.")
+                    details["sources"]["debt_value_for_weights"] = "derived_from_net_debt_plus_cash"
         except Exception:
-            cash_val = None
-        if cash_val is not None and net_debt is not None:
-            try:
-                nd = float(net_debt)
-                if nd >= 0:
-                    derived = nd + cash_val
-                    if derived > 0:
-                        debt_val = derived
-                        details["warnings"].append("Dette brute manquante → approximée via NetDebt + Cash (GrossDebt≈NetDebt+Cash).")
-                        details["sources"]["debt_value_for_weights"] = "derived_from_net_debt_plus_cash"
-            except Exception:
-                pass
+            pass
+
+    if debt_val is None:
+        details["missing"].append("debt_value_for_weights")
+        return None, details
 
     equity_val = get_market_cap(fundamentals)
     if equity_val is None:
-        # fallback book equity si market cap absent
+        # fallback book equity
         try:
             equity_val = float(bs_snap.get("total_equity")) if bs_snap and bs_snap.get("total_equity") is not None else None
             if equity_val is not None:
@@ -1664,48 +1672,37 @@ else:
     else:
         details["sources"]["equity_value_for_weights"] = "EODHD Highlights.MarketCapitalization"
 
-    details["inputs"]["debt_value"] = debt_val
-    details["inputs"]["equity_value"] = equity_val
-
-    if debt_val is None or debt_val < 0:
-        details["missing"].append("debt_value_for_weights")
     if equity_val is None or equity_val <= 0:
         details["missing"].append("equity_value_for_weights")
-
-    # 8) WACC
-    if re_decimal is None or rd_decimal is None or tax_decimal is None or debt_val is None or equity_val is None or (debt_val + equity_val) <= 0:
-        # impossible de conclure
         return None, details
+
+    details["inputs"]["debt_value"] = debt_val
+    details["inputs"]["equity_value"] = equity_val
 
     d_w = debt_val / (debt_val + equity_val)
     e_w = equity_val / (debt_val + equity_val)
 
+    # ---------- 8) WACC ----------
     wacc_decimal = e_w * re_decimal + d_w * rd_decimal * (1.0 - tax_decimal)
 
-# 9) Garde-fous WACC (optionnels)
-try:
-    wacc_floor_over_rf_pct = config.get("wacc_floor_over_rf_pct")
-    if wacc_floor_over_rf_pct is not None and rf_decimal is not None:
-        floor = float(rf_decimal) + float(wacc_floor_over_rf_pct) / 100.0
-        if wacc_decimal < floor:
-            details["warnings"].append(
-                f"WACC trop basse vs risk-free : {wacc_decimal*100:.2f}% < {floor*100:.2f}% (rf + {float(wacc_floor_over_rf_pct):.2f}%). Plancher appliqué."
-            )
-            wacc_decimal = floor
-except Exception:
-    pass
+    # ---------- 9) Garde-fous WACC ----------
+    try:
+        wacc_floor_over_rf_pct = config.get("wacc_floor_over_rf_pct")
+        if wacc_floor_over_rf_pct is not None:
+            floor = float(rf_decimal) + float(wacc_floor_over_rf_pct) / 100.0
+            if wacc_decimal < floor:
+                details["warnings"].append(
+                    f"WACC trop basse vs risk-free : {wacc_decimal*100:.2f}% < {floor*100:.2f}% (rf + {float(wacc_floor_over_rf_pct):.2f}%). Plancher appliqué."
+                )
+                wacc_decimal = floor
+    except Exception:
+        pass
+
     details["results"]["weights"] = {"D": d_w, "E": e_w}
     details["results"]["wacc_pct"] = wacc_decimal * 100.0
     details["sources"]["wacc"] = "computed"
 
     return wacc_decimal, details
-
-
-
-
-
-
-
 def _linear_score(value, low, high, higher_better=True):
     """
     Score linéaire 0-10 sur une plage [low, high].
