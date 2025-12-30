@@ -170,11 +170,29 @@ def get_company_summary(fundamentals: dict):
 
 def get_shares_outstanding(fundamentals: dict):
     """
-    Récupère le nombre d'actions si disponible.
+    Nombre d'actions en circulation (Shares Outstanding).
+
+    EODHD peut le fournir via:
+    - SharesStats.SharesOutstanding
+    - Highlights.SharesOutstanding (selon instruments)
+    Si non disponible, le fallback MarketCap/Price est géré dans analyze_company().
     """
     try:
-        shares = fundamentals["SharesStats"].get("SharesOutstanding")
-        return shares
+        if not isinstance(fundamentals, dict):
+            return None
+        ss = fundamentals.get("SharesStats", {}) or {}
+        hi = fundamentals.get("Highlights", {}) or {}
+
+        candidates = [
+            ss.get("SharesOutstanding"),
+            ss.get("sharesOutstanding"),
+            hi.get("SharesOutstanding"),
+            hi.get("sharesOutstanding"),
+        ]
+        shares = next((c for c in candidates if c not in (None, "", 0, "0")), None)
+        if shares is None:
+            return None
+        return float(shares)
     except Exception:
         return None
 
@@ -2635,6 +2653,14 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     fundamentals = fetch_fundamentals(ticker, api_key)
     company = get_company_summary(fundamentals)
     shares = get_shares_outstanding(fundamentals)
+    # Fallback robuste : si SharesOutstanding absent, approx = MarketCap / Price
+    if shares in (None, 0) and price not in (None, 0):
+        mc = get_market_cap(fundamentals)
+        if mc not in (None, 0):
+            try:
+                shares = float(mc) / float(price)
+            except Exception:
+                shares = None
     net_debt = get_net_debt(fundamentals)
     hist_df = build_historical_table(fundamentals, max_years=5)
 
@@ -2698,12 +2724,32 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
 
     # =========================
     # DCF : seulement si la société n'est PAS small cap et si données suffisantes
+    # Initialisation pour éviter les variables non définies si DCF non calculable
+    fv_dcf = None
+    ev = None
+    equity_value = None
+    tv_discounted = None
+    sum_disc_fcfs = None
+    upside_dcf = None
+    proj_df = None
+    sens_matrix = None
+
     # =========================
+    dcf_missing = []
+    if fcf_start is None:
+        dcf_missing.append('fcf_start')
+    if shares in (None, 0):
+        dcf_missing.append('shares')
+    if net_debt is None:
+        dcf_missing.append('net_debt')
+    if wacc_used in (None, 0):
+        dcf_missing.append('wacc')
+    if (wacc_used not in (None, 0)) and (g_terminal is not None) and (wacc_used <= g_terminal):
+        dcf_missing.append('wacc<=g_terminal')
+
     dcf_allowed = (
-        profile.get("cap_size") != "SmallCap"
-        and fcf_start is not None
-        and shares not in (None, 0)
-        and net_debt is not None
+        profile.get('cap_size') != 'SmallCap'
+        and len(dcf_missing) == 0
     )
 
     if dcf_allowed:
@@ -2793,6 +2839,7 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             "wacc_used_pct": (wacc_used * 100.0) if wacc_used is not None else None,
             "wacc_source": wacc_source,
             "wacc_details": wacc_details,
+            "dcf_missing": dcf_missing,
             "fair_value_per_share": fv_dcf,
             "ev": ev,
             "equity_value": equity_value,
@@ -2961,9 +3008,9 @@ def main():
                 query,
                 api_key,
                 years,
-                wacc_input,
-                growth_fcf_input,
-                g_terminal_input,
+                wacc,
+                growth_fcf,
+                g_terminal,
                 wacc_cfg=wacc_cfg,
             )
 
@@ -3090,11 +3137,18 @@ def main():
         st.subheader("🎯 Résumé de la valorisation DCF (base case)")
 
         if not dcf_active:
-            st.warning(
-                "Le modèle DCF n'est pas utilisé pour cette société "
-                "(profil small cap ou données de cash-flow insuffisantes). "
-                "Les valorisations reposent principalement sur les méthodes par multiples."
-            )
+            missing = dcf.get('dcf_missing') or []
+            if missing:
+                st.warning(
+                    "DCF non calculable avec les données actuelles. Champs manquants / bloquants : "
+                    + ", ".join(missing)
+                )
+            else:
+                st.warning(
+                    "Le modèle DCF n'est pas utilisé pour cette société "
+                    "(profil small cap ou données de cash-flow insuffisantes). "
+                    "Les valorisations reposent principalement sur les méthodes par multiples."
+                )
         else:
             ev = dcf.get("ev", 0) or 0
             sum_disc_fcfs = dcf.get("sum_disc_fcfs", 0) or 0
@@ -3197,10 +3251,16 @@ def main():
         proj_df = result["proj_df"]
 
         if (not dcf_active) or (proj_df is None) or proj_df.empty:
-            st.warning(
-                "Projections de FCF non disponibles ou non pertinentes pour cette société "
-                "(profil small cap ou absence de données suffisantes)."
-            )
+            missing = dcf.get('dcf_missing') or []
+            if missing:
+                st.warning(
+                    "Projections FCF indisponibles car la DCF n'a pas pu être calculée (" + ", ".join(missing) + ")."
+                )
+            else:
+                st.warning(
+                    "Projections de FCF non disponibles ou non pertinentes pour cette société "
+                    "(profil small cap ou absence de données suffisantes)."
+                )
         else:
             proj_df = proj_df.copy()
             proj_df["FCF projeté"] = proj_df["FCF projeté"].round(0)
@@ -3220,10 +3280,16 @@ def main():
         sens_df = result["sensitivity"]
 
         if (not dcf_active) or (sens_df is None) or sens_df.empty:
-            st.warning(
-                "Matrice de sensibilité DCF non disponible pour cette société "
-                "(profil small cap ou données cash-flow insuffisantes)."
-            )
+            missing = dcf.get('dcf_missing') or []
+            if missing:
+                st.warning(
+                    "Matrice de sensibilité indisponible car la DCF n'a pas pu être calculée (" + ", ".join(missing) + ")."
+                )
+            else:
+                st.warning(
+                    "Matrice de sensibilité DCF non disponible pour cette société "
+                    "(profil small cap ou données cash-flow insuffisantes)."
+                )
         else:
             st.markdown("#### Matrice de sensibilité (juste valeur / action)")
             sens_df = sens_df.round(2)
