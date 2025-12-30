@@ -1626,7 +1626,6 @@ def compute_wacc_auto(
         rf_decimal=rf_decimal,
         api_key=api_key,
         allow_heuristic=allow_heuristic,
-        config=config,
     )
     details["inputs"]["rd_details"] = rd_details
     if rd_decimal is None:
