@@ -1496,23 +1496,61 @@ def compute_wacc_auto(
 
     erp_decimal = (float(erp_pct) / 100.0) if erp_pct is not None else None
 
-    # 3) Beta
-    beta_override = config.get("beta_override")
-    beta = None
-    if beta_override is not None:
-        try:
-            beta = float(beta_override)
-            details["sources"]["beta"] = "override"
-        except Exception:
-            details["warnings"].append("Beta override invalide.")
-            beta = None
-    if beta is None:
-        beta = get_beta(fundamentals)
-        if beta is not None:
-            details["sources"]["beta"] = "EODHD Technicals.Beta"
-    if beta is None:
-        details["missing"].append("beta")
-    details["inputs"]["beta"] = beta
+    
+# 3) Beta
+beta_override = config.get("beta_override")
+beta_floor = config.get("beta_floor")
+beta_bottom_up_override = config.get("beta_bottom_up_override")
+beta_blend_weight = config.get("beta_blend_weight", 0.5)
+
+beta_raw = None
+beta = None
+
+# (a) Override direct
+if beta_override is not None:
+    try:
+        beta = float(beta_override)
+        details["sources"]["beta"] = "override"
+    except Exception:
+        details["warnings"].append("Beta override invalide.")
+        beta = None
+
+# (b) Beta EODHD (si pas d'override)
+if beta is None:
+    beta_raw = get_beta(fundamentals)
+    if beta_raw is not None:
+        beta = float(beta_raw)
+        details["sources"]["beta"] = "EODHD Technicals.Beta"
+
+# (c) Beta bottom-up (manuel) + blend optionnel
+if beta_bottom_up_override is not None:
+    try:
+        beta_bu = float(beta_bottom_up_override)
+        if beta is None:
+            beta = beta_bu
+            details["sources"]["beta"] = "bottom_up_override"
+        else:
+            # Blend : w * beta_market + (1-w) * beta_bottom_up
+            w = float(beta_blend_weight)
+            w = max(0.0, min(1.0, w))
+            beta = w * float(beta) + (1.0 - w) * beta_bu
+            details["sources"]["beta"] = "blended(market,bottom_up)"
+    except Exception:
+        details["warnings"].append("Beta bottom-up override invalide.")
+
+# (d) Plancher beta (garde-fou)
+try:
+    bf = float(beta_floor) if beta_floor is not None else None
+except Exception:
+    bf = None
+
+if beta is None:
+    details["missing"].append("beta")
+else:
+    if bf is not None and beta < bf:
+        details["warnings"].append(f"Beta trop faible ({beta:.2f}) → plancher appliqué ({bf:.2f}).")
+        beta = bf
+    details["results"]["beta_used"] = beta
 
     # 4) Cost of equity Re
     re_decimal = None
@@ -1643,11 +1681,28 @@ def compute_wacc_auto(
     e_w = equity_val / (debt_val + equity_val)
 
     wacc_decimal = e_w * re_decimal + d_w * rd_decimal * (1.0 - tax_decimal)
+
+# 9) Garde-fous WACC (optionnels)
+try:
+    wacc_floor_over_rf_pct = config.get("wacc_floor_over_rf_pct")
+    if wacc_floor_over_rf_pct is not None and rf_decimal is not None:
+        floor = float(rf_decimal) + float(wacc_floor_over_rf_pct) / 100.0
+        if wacc_decimal < floor:
+            details["warnings"].append(
+                f"WACC trop basse vs risk-free : {wacc_decimal*100:.2f}% < {floor*100:.2f}% (rf + {float(wacc_floor_over_rf_pct):.2f}%). Plancher appliqué."
+            )
+            wacc_decimal = floor
+except Exception:
+    pass
     details["results"]["weights"] = {"D": d_w, "E": e_w}
     details["results"]["wacc_pct"] = wacc_decimal * 100.0
     details["sources"]["wacc"] = "computed"
 
     return wacc_decimal, details
+
+
+
+
 
 
 
@@ -1979,18 +2034,50 @@ def style_health_table(df: pd.DataFrame):
 # MOTEUR DCF
 # =========================================
 
-def project_fcf(fcf_start: float, growth_rate: float, years: int):
+def project_fcf(
+    fcf_start: float,
+    growth_rate: float,
+    years: int,
+    g_terminal: float = None,
+    mode: str = "constant",
+):
     """
-    Projette un FCF sur 'years' années avec une croissance annuelle constante.
+    Projette des FCF sur 'years' années.
+
+    Modes :
+    - "constant" : croissance annuelle constante = growth_rate
+    - "fade_to_terminal" : croissance qui converge linéairement de growth_rate vers g_terminal
+      au fil de l'horizon (plus réaliste / moins sensible qu'une croissance constante).
+
     Retourne la liste FCF1...FCFn.
     """
-    fcfs = []
-    current_fcf = fcf_start
-    for _ in range(1, years + 1):
-        current_fcf *= (1 + growth_rate)
-        fcfs.append(current_fcf)
-    return fcfs
+    if fcf_start is None or years is None or years <= 0:
+        return []
 
+    mode = (mode or "constant").strip().lower()
+
+    # Fallback : si g_terminal absent, la version "fade" redevient constante
+    if mode in ("fade", "fade_to_terminal", "linear_fade") and g_terminal is None:
+        mode = "constant"
+
+    fcfs = []
+    current_fcf = float(fcf_start)
+
+    for t in range(1, years + 1):
+        if mode in ("fade", "fade_to_terminal", "linear_fade"):
+            # croissance_t : interpole growth_rate -> g_terminal sur l'horizon
+            if years == 1:
+                growth_t = float(g_terminal)
+            else:
+                alpha = (t - 1) / (years - 1)
+                growth_t = float(growth_rate) + alpha * (float(g_terminal) - float(growth_rate))
+        else:
+            growth_t = float(growth_rate)
+
+        current_fcf *= (1.0 + growth_t)
+        fcfs.append(current_fcf)
+
+    return fcfs
 
 def discount_cash_flows(fcfs, wacc: float):
     """
@@ -2005,15 +2092,43 @@ def discount_cash_flows(fcfs, wacc: float):
     return discounted, total
 
 
-def terminal_value(last_fcf: float, wacc: float, g: float):
+def terminal_value(
+    last_fcf: float,
+    wacc: float,
+    g: float,
+    method: str = "gordon",
+    exit_multiple_fcf: float = None,
+):
     """
-    Valeur terminale (Gordon-Shapiro) : TV = FCF_{n+1} / (WACC - g)
+    Valeur terminale (au temps n, avant actualisation).
+
+    Méthodes :
+    - "gordon" : Gordon-Shapiro TV = FCF_{n+1} / (WACC - g)
+    - "exit_fcf" : TV = FCF_n * multiple (multiple = EV/FCF)
+
+    Remarque : la méthode "exit_fcf" est une approximation (multiple de marché).
     """
-    fcf_next = last_fcf * (1 + g)
+    if last_fcf is None or wacc is None:
+        return None
+
+    method = (method or "gordon").strip().lower()
+
+    if method in ("exit", "exit_fcf", "multiple_fcf", "ev_fcf"):
+        try:
+            m = float(exit_multiple_fcf) if exit_multiple_fcf is not None else None
+        except Exception:
+            m = None
+        if m is None or m <= 0:
+            return None
+        return float(last_fcf) * m
+
+    # Default : Gordon
+    if g is None:
+        return None
     if wacc <= g:
         return None
-    return fcf_next / (wacc - g)
-
+    fcf_next = float(last_fcf) * (1.0 + float(g))
+    return fcf_next / (float(wacc) - float(g))
 
 def dcf_fair_value_per_share(
     fcf_start: float,
@@ -2023,18 +2138,51 @@ def dcf_fair_value_per_share(
     g_terminal: float,
     net_debt: float,
     shares: float,
+    projection_mode: str = "fade_to_terminal",
+    terminal_method: str = "gordon",
+    exit_multiple_fcf: float = None,
 ):
     """
     Calcule une juste valeur par action pour un ensemble de paramètres DCF.
+
+    Améliorations buy-side (simplifiées) :
+    - Projection FCF "fade_to_terminal" (croissance qui converge vers g LT)
+    - Valeur terminale au choix : Gordon (par défaut) ou multiple EV/FCF
+
     Retourne (fair_value_per_share, EV, equity_value, tv_discounted, sum_discounted_fcfs).
     """
     if shares is None or shares <= 0 or fcf_start is None:
         return None, None, None, None, None
 
-    projected_fcfs = project_fcf(fcf_start, growth_fcf, years)
+    if years is None or years <= 0:
+        return None, None, None, None, None
+
+    if wacc is None or wacc <= 0:
+        return None, None, None, None, None
+
+    # Garde-fou minimal : éviter un WACC trop proche du g (sinon TV explose)
+    if g_terminal is not None and (wacc <= g_terminal):
+        return None, None, None, None, None
+
+    projected_fcfs = project_fcf(
+        fcf_start=fcf_start,
+        growth_rate=growth_fcf,
+        years=years,
+        g_terminal=g_terminal,
+        mode=projection_mode,
+    )
+    if not projected_fcfs:
+        return None, None, None, None, None
+
     discounted_fcfs, sum_discounted_fcfs = discount_cash_flows(projected_fcfs, wacc)
 
-    tv = terminal_value(projected_fcfs[-1], wacc, g_terminal)
+    tv = terminal_value(
+        projected_fcfs[-1],
+        wacc=wacc,
+        g=g_terminal,
+        method=terminal_method,
+        exit_multiple_fcf=exit_multiple_fcf,
+    )
     if tv is None:
         return None, None, None, None, None
 
@@ -2047,7 +2195,6 @@ def dcf_fair_value_per_share(
 
     return fair_value_per_share, ev, equity_value, tv_discounted, sum_discounted_fcfs
 
-
 def build_sensitivity_matrix(
     fcf_start: float,
     growth_fcf: float,
@@ -2056,29 +2203,38 @@ def build_sensitivity_matrix(
     base_g: float,
     net_debt: float,
     shares: float,
+    projection_mode: str = "fade_to_terminal",
+    terminal_method: str = "gordon",
+    exit_multiple_fcf: float = None,
+    wacc_shifts: list = None,
+    g_shifts: list = None,
 ):
     """
     Construit une matrice de sensibilité DCF en faisant varier WACC et g.
     Les cellules contiennent la juste valeur par action.
-    """
-    wacc_values = sorted(
-        {
-            max(0.01, base_wacc - 0.01),
-            max(0.01, base_wacc - 0.005),
-            base_wacc,
-            base_wacc + 0.005,
-            base_wacc + 0.01,
-        }
-    )
-    g_values = sorted(
-        {
-            max(0.0, base_g - 0.005),
-            base_g,
-            base_g + 0.005,
-        }
-    )
 
-    g_values = [g for g in g_values if g < max(wacc_values)]
+    Par défaut : matrice 3x3 centrée sur les hypothèses de base.
+    """
+    if wacc_shifts is None:
+        wacc_shifts = [-0.005, 0.0, 0.005]  # -0.5%, base, +0.5%
+    if g_shifts is None:
+        g_shifts = [-0.005, 0.0, 0.005]     # -0.5%, base, +0.5%
+
+    wacc_values = []
+    for s in wacc_shifts:
+        try:
+            wacc_values.append(max(0.01, float(base_wacc) + float(s)))
+        except Exception:
+            continue
+    wacc_values = sorted(set(wacc_values))
+
+    g_values = []
+    for s in g_shifts:
+        try:
+            g_values.append(max(-0.02, float(base_g) + float(s)))
+        except Exception:
+            continue
+    g_values = sorted(set(g_values))
 
     data = {}
     for g in g_values:
@@ -2092,6 +2248,9 @@ def build_sensitivity_matrix(
                 g_terminal=g,
                 net_debt=net_debt,
                 shares=shares,
+                projection_mode=projection_mode,
+                terminal_method=terminal_method,
+                exit_multiple_fcf=exit_multiple_fcf,
             )
             row.append(fv if fv is not None else float("nan"))
         data[f"g = {g*100:.2f} %"] = row
@@ -2101,9 +2260,73 @@ def build_sensitivity_matrix(
     return df_matrix
 
 
-# =========================================
-# MÉTHODES PAR MULTIPLES (FAIR VALUES)
-# =========================================
+
+def compute_dcf_scenarios(
+    fcf_start: float,
+    growth_fcf: float,
+    years: int,
+    wacc_base: float,
+    g_terminal: float,
+    net_debt: float,
+    shares: float,
+    projection_mode: str = "fade_to_terminal",
+    terminal_method: str = "gordon",
+    exit_multiple_fcf: float = None,
+):
+    """
+    Calcule 3 scénarios DCF (Bull / Base / Bear) autour du cas central.
+
+    Écarts (par défaut) :
+    - WACC : +/- 0,50%
+    - Croissance FCF : +/- 0,50%
+    - g LT : +/- 0,25%
+
+    Retourne un dict {scenario: {...}}.
+    """
+    def _cap_g(g, w):
+        # Garde-fou : éviter WACC trop proche de g
+        if g is None or w is None:
+            return g
+        return min(float(g), float(w) - 0.01)
+
+    scenarios = {}
+
+    shifts = {
+        "Bear": {"dw": +0.005, "dg": -0.005, "dgt": -0.0025},
+        "Base": {"dw": 0.0,   "dg": 0.0,    "dgt": 0.0},
+        "Bull": {"dw": -0.005,"dg": +0.005, "dgt": +0.0025},
+    }
+
+    for name, s in shifts.items():
+        w = max(0.01, float(wacc_base) + s["dw"])
+        gr = float(growth_fcf) + s["dg"]
+        gt = float(g_terminal) + s["dgt"]
+        gt = _cap_g(gt, w)
+
+        fv, ev, eq, tvd, sumd = dcf_fair_value_per_share(
+            fcf_start=fcf_start,
+            growth_fcf=gr,
+            years=years,
+            wacc=w,
+            g_terminal=gt,
+            net_debt=net_debt,
+            shares=shares,
+            projection_mode=projection_mode,
+            terminal_method=terminal_method,
+            exit_multiple_fcf=exit_multiple_fcf,
+        )
+        scenarios[name] = {
+            "fair_value_per_share": fv,
+            "ev": ev,
+            "equity_value": eq,
+            "tv_discounted": tvd,
+            "sum_disc_fcfs": sumd,
+            "wacc": w,
+            "growth_fcf": gr,
+            "g_terminal": gt,
+        }
+
+    return scenarios
 
 def pe_valuation(eps, pe_target):
     if eps is None or pe_target is None:
@@ -2590,7 +2813,7 @@ def combine_global_valuation(dcf_value: float, multiples_vals: dict, weights: di
 # =========================================
 # PIPELINE PRINCIPAL POUR UNE SOCIÉTÉ
 # =========================================
-def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fcf: float, g_terminal: float, wacc_cfg: dict = None):
+def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fcf: float, g_terminal: float, wacc_cfg: dict = None, dcf_cfg: dict = None):
     """
     Pipeline complet :
     - Recherche par nom/ticker
@@ -2601,6 +2824,14 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     - DCF (uniquement si pertinent)
     - Classification + pondération + synthèse globale
     """
+    dcf_cfg = dcf_cfg or {}
+    projection_mode = (dcf_cfg.get('projection_mode') or 'fade_to_terminal')
+    terminal_method = (dcf_cfg.get('terminal_method') or 'gordon')
+    exit_multiple_fcf = dcf_cfg.get('exit_multiple_fcf')
+    use_normalized_fcf = bool(dcf_cfg.get('use_normalized_fcf', True))
+    sens_wacc_shifts = dcf_cfg.get('sens_wacc_shifts')
+    sens_g_shifts = dcf_cfg.get('sens_g_shifts')
+
     ticker = None
     search_results = []
 
@@ -2720,7 +2951,10 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     fcf_last = estimate_starting_fcf(fundamentals)
     fcf_norm = estimate_normalized_fcf(hist_df)
 
-    fcf_start = fcf_norm if fcf_norm is not None else fcf_last
+    if use_normalized_fcf and (fcf_norm is not None):
+        fcf_start = fcf_norm
+    else:
+        fcf_start = fcf_last
 
     # =========================
     # DCF : seulement si la société n'est PAS small cap et si données suffisantes
@@ -2736,6 +2970,7 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
 
     # =========================
     dcf_missing = []
+    dcf_assumption_warnings = []
     if fcf_start is None:
         dcf_missing.append('fcf_start')
     if shares in (None, 0):
@@ -2744,8 +2979,12 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         dcf_missing.append('net_debt')
     if wacc_used in (None, 0):
         dcf_missing.append('wacc')
+    if terminal_method.lower() in ('exit', 'exit_fcf', 'multiple_fcf', 'ev_fcf') and (exit_multiple_fcf is None or exit_multiple_fcf <= 0):
+        dcf_missing.append('exit_multiple_fcf')
     if (wacc_used not in (None, 0)) and (g_terminal is not None) and (wacc_used <= g_terminal):
         dcf_missing.append('wacc<=g_terminal')
+    if (wacc_used not in (None, 0)) and (g_terminal is not None) and ((wacc_used - g_terminal) < 0.015):
+        dcf_assumption_warnings.append('WACC très proche de g (TV très sensible).')
 
     dcf_allowed = (
         profile.get('cap_size') != 'SmallCap'
@@ -2761,6 +3000,9 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             g_terminal=g_terminal,
             net_debt=net_debt,
             shares=shares,
+            projection_mode=projection_mode,
+            terminal_method=terminal_method,
+            exit_multiple_fcf=exit_multiple_fcf,
         )
 
         if fv_dcf is not None and price not in (None, 0):
@@ -2769,7 +3011,7 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             upside_dcf = None
 
         # Projections FCF & sensibilité
-        projected_fcfs = project_fcf(fcf_start, growth_fcf, years)
+        projected_fcfs = project_fcf(fcf_start, growth_fcf, years, g_terminal=g_terminal, mode=projection_mode)
         discounted_fcfs, _ = discount_cash_flows(projected_fcfs, wacc_used)
         proj_df = pd.DataFrame(
             {
@@ -2787,6 +3029,24 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             base_g=g_terminal,
             net_debt=net_debt,
             shares=shares,
+            projection_mode=projection_mode,
+            terminal_method=terminal_method,
+            exit_multiple_fcf=exit_multiple_fcf,
+            wacc_shifts=sens_wacc_shifts,
+            g_shifts=sens_g_shifts,
+        )
+
+        dcf_scenarios = compute_dcf_scenarios(
+            fcf_start=fcf_start,
+            growth_fcf=growth_fcf,
+            years=years,
+            wacc_base=wacc_used,
+            g_terminal=g_terminal,
+            net_debt=net_debt,
+            shares=shares,
+            projection_mode=projection_mode,
+            terminal_method=terminal_method,
+            exit_multiple_fcf=exit_multiple_fcf,
         )
     else:
         # DCF non pertinent ou impossible → on neutralise toutes les sorties DCF
@@ -2798,6 +3058,7 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         upside_dcf = None
         proj_df = pd.DataFrame()
         sens_matrix = pd.DataFrame()
+        dcf_scenarios = {}
 
     # =========================
     # Multiples : cibles & valorisations (INCHANGÉ)
@@ -2832,6 +3093,9 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             "ratios": health_ratios,
         },
         "fcf_start": fcf_start,
+        "fcf_last": fcf_last,
+        "fcf_normalized": fcf_norm,
+        "fcf_start_mode": ("normalized" if (use_normalized_fcf and (fcf_norm is not None)) else "last"),
         "proj_df": proj_df,
         "dcf": {
 
@@ -2846,6 +3110,11 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             "tv_discounted": tv_discounted,
             "sum_disc_fcfs": sum_disc_fcfs,
             "upside_pct": upside_dcf,
+            "projection_mode": projection_mode,
+            "terminal_method": terminal_method,
+            "exit_multiple_fcf": exit_multiple_fcf,
+            "assumption_warnings": dcf_assumption_warnings,
+            "scenarios": dcf_scenarios,
         },
         "sensitivity": sens_matrix,
         "base_financials": base_financials,
@@ -2861,6 +3130,7 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
 # =========================================
 # STREAMLIT APP
 # =========================================
+
 
 def main():
     st.set_page_config(
@@ -2943,6 +3213,21 @@ def main():
     if override_tax:
         tax_override_pct = st.sidebar.number_input("Tax rate override (%)", min_value=0.0, max_value=45.0, value=25.0, step=0.5)
 
+    with st.sidebar.expander('Options avancées WACC auto', expanded=False):
+        beta_floor = st.number_input('Plancher Beta (garde-fou)', min_value=0.0, max_value=3.0, value=0.8, step=0.05)
+        beta_bottom_up_raw = st.text_input('Beta bottom-up (optionnel, pour blend)', value='')
+        beta_bottom_up_override = None
+        if beta_bottom_up_raw.strip():
+            try:
+                beta_bottom_up_override = float(beta_bottom_up_raw.strip())
+            except Exception:
+                st.warning('Beta bottom-up invalide : ignoré.')
+                beta_bottom_up_override = None
+        beta_blend_weight = 0.5
+        if beta_bottom_up_override is not None:
+            beta_blend_weight = st.slider('Poids beta marché (blend)', min_value=0.0, max_value=1.0, value=0.5, step=0.05)
+        wacc_floor_over_rf_pct = st.number_input('Plancher WACC = rf + (%)', min_value=0.0, max_value=6.0, value=1.0, step=0.1)
+
     allow_heuristic_rd = st.sidebar.checkbox("Autoriser estimation Rd si interestExpense manquant", value=True)
     allow_tax_fallback = st.sidebar.checkbox("Autoriser fallback tax par zone", value=True)
 
@@ -2960,6 +3245,30 @@ def main():
         value=1.75,
         step=0.05,
     )
+
+    st.sidebar.markdown('### Options avancées DCF')
+    use_normalized_fcf = st.sidebar.checkbox('FCF de départ normalisé (moyenne 3 ans si dispo)', value=True)
+    projection_mode = st.sidebar.selectbox(
+        'Projection FCF',
+        options=['fade_to_terminal', 'constant'],
+        index=0,
+        format_func=lambda x: 'Fade vers g LT (recommandé)' if x=='fade_to_terminal' else 'Croissance constante',
+    )
+    terminal_method = st.sidebar.selectbox(
+        'Valeur terminale',
+        options=['gordon', 'exit_fcf'],
+        index=0,
+        format_func=lambda x: 'Gordon-Shapiro (perpetuité)' if x=='gordon' else 'Multiple EV/FCF (exit)',
+    )
+    exit_multiple_fcf = None
+    if terminal_method == 'exit_fcf':
+        exit_multiple_fcf = st.sidebar.number_input('Multiple EV/FCF terminal', min_value=5.0, max_value=40.0, value=18.0, step=0.5)
+
+    with st.sidebar.expander('Sensibilité (matrice DCF)', expanded=False):
+        sens_wacc_step = st.number_input('Pas WACC (points %)', min_value=0.1, max_value=2.0, value=0.5, step=0.1)
+        sens_g_step = st.number_input('Pas g LT (points %)', min_value=0.1, max_value=1.0, value=0.5, step=0.1)
+        sens_wacc_shifts = [-(sens_wacc_step/100.0), 0.0, (sens_wacc_step/100.0)]
+        sens_g_shifts = [-(sens_g_step/100.0), 0.0, (sens_g_step/100.0)]
 
     wacc = wacc_input / 100.0
 
@@ -2998,10 +3307,24 @@ def main():
                 "erp_eur_pct": float(erp_eur),
                 "erp_default_pct": float(erp_us),
                 "beta_override": beta_override,
+                "beta_floor": beta_floor,
+                "beta_bottom_up_override": beta_bottom_up_override,
+                "beta_blend_weight": beta_blend_weight,
+                "wacc_floor_over_rf_pct": wacc_floor_over_rf_pct,
                 "rd_override_pct": rd_override_pct,
                 "tax_override_pct": tax_override_pct,
                 "allow_heuristic_rd": bool(allow_heuristic_rd),
                 "allow_tax_fallback": bool(allow_tax_fallback),
+            }
+
+
+            dcf_cfg = {
+                'use_normalized_fcf': bool(use_normalized_fcf),
+                'projection_mode': projection_mode,
+                'terminal_method': terminal_method,
+                'exit_multiple_fcf': exit_multiple_fcf,
+                'sens_wacc_shifts': sens_wacc_shifts,
+                'sens_g_shifts': sens_g_shifts,
             }
 
             result = analyze_company(
@@ -3012,6 +3335,7 @@ def main():
                 growth_fcf,
                 g_terminal,
                 wacc_cfg=wacc_cfg,
+                dcf_cfg=dcf_cfg,
             )
 
     except Exception as e:
@@ -3178,6 +3502,42 @@ def main():
             st.write(f"- g de long terme : **{g_terminal_input:.2f} %**")
             st.write(f"- Dette nette utilisée : **{format_large_number(net_debt)}**")
             st.write(f"- FCF de départ estimé : **{format_large_number(fcf_start)}**")
+            # Options avancées DCF (pour contextualiser la valorisation)
+            pm = dcf.get('projection_mode') if isinstance(dcf, dict) else None
+            if pm:
+                pm_label = 'Fade vers g LT' if str(pm).lower().startswith('fade') else 'Croissance constante'
+                st.write(f"- Projection FCF : **{pm_label}**")
+            tm = dcf.get('terminal_method') if isinstance(dcf, dict) else None
+            if tm:
+                if str(tm).lower() in ('exit', 'exit_fcf', 'multiple_fcf', 'ev_fcf'):
+                    st.write(f"- Valeur terminale : **Multiple EV/FCF = {format_float(dcf.get('exit_multiple_fcf'), 2)}x**")
+                else:
+                    st.write("- Valeur terminale : **Gordon-Shapiro (perpetuité)**")
+
+            # Warnings DCF (assumptions)
+            dcf_warn = dcf.get('assumption_warnings') if isinstance(dcf, dict) else None
+            if dcf_warn:
+                st.warning(' | '.join([str(x) for x in dcf_warn]))
+
+            # Scénarios bull/base/bear (utile pour discussion buy-side)
+            scen = dcf.get('scenarios') if isinstance(dcf, dict) else None
+            if scen and isinstance(scen, dict) and len(scen) > 0:
+                try:
+                    scen_rows = []
+                    for name in ['Bear','Base','Bull']:
+                        s = scen.get(name, {}) if isinstance(scen.get(name, {}), dict) else {}
+                        scen_rows.append({
+                            'Scénario': name,
+                            'WACC (%)': (s.get('wacc')*100.0) if s.get('wacc') is not None else None,
+                            'Croissance FCF (%)': (s.get('growth_fcf')*100.0) if s.get('growth_fcf') is not None else None,
+                            'g LT (%)': (s.get('g_terminal')*100.0) if s.get('g_terminal') is not None else None,
+                            'Juste valeur / action': s.get('fair_value_per_share'),
+                        })
+                    scen_df = pd.DataFrame(scen_rows)
+                    st.dataframe(scen_df, use_container_width=True)
+                except Exception:
+                    pass
+
             # Détail WACC automatique (audit trail)
             wacc_details = dcf.get("wacc_details") if isinstance(dcf, dict) else None
             if wacc_details:
