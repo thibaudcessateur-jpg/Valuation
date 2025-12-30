@@ -1555,6 +1555,25 @@ def compute_wacc_auto(
     except Exception:
         debt_val = None
 
+    # Fallback : si dette brute indisponible mais que net debt + cash sont connus,
+    # on peut reconstruire approximativement la dette brute : GrossDebt ≈ NetDebt + Cash
+    if debt_val is None:
+        try:
+            cash_val = float(bs_snap.get("cash")) if bs_snap and bs_snap.get("cash") is not None else None
+        except Exception:
+            cash_val = None
+        if cash_val is not None and net_debt is not None:
+            try:
+                nd = float(net_debt)
+                if nd >= 0:
+                    derived = nd + cash_val
+                    if derived > 0:
+                        debt_val = derived
+                        details["warnings"].append("Dette brute manquante → approximée via NetDebt + Cash (GrossDebt≈NetDebt+Cash).")
+                        details["sources"]["debt_value_for_weights"] = "derived_from_net_debt_plus_cash"
+            except Exception:
+                pass
+
     equity_val = get_market_cap(fundamentals)
     if equity_val is None:
         # fallback book equity si market cap absent
@@ -1589,7 +1608,7 @@ def compute_wacc_auto(
     details["results"]["wacc_pct"] = wacc_decimal * 100.0
     details["sources"]["wacc"] = "computed"
 
-    return wacc_decimal * 100.0, details
+    return wacc_decimal, details
 
 
 
@@ -1974,7 +1993,7 @@ def dcf_fair_value_per_share(
         return None, None, None, None, None
 
     projected_fcfs = project_fcf(fcf_start, growth_fcf, years)
-    discounted_fcfs, sum_discounted_fcfs = discount_cash_flows(projected_fcfs, wacc_used)
+    discounted_fcfs, sum_discounted_fcfs = discount_cash_flows(projected_fcfs, wacc)
 
     tv = terminal_value(projected_fcfs[-1], wacc, g_terminal)
     if tv is None:
@@ -2663,6 +2682,7 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         profile.get("cap_size") != "SmallCap"
         and fcf_start is not None
         and shares not in (None, 0)
+        and net_debt is not None
     )
 
     if dcf_allowed:
@@ -2749,6 +2769,7 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         "dcf": {
 
             "wacc_used": wacc_used,
+            "wacc_used_pct": (wacc_used * 100.0) if wacc_used is not None else None,
             "wacc_source": wacc_source,
             "wacc_details": wacc_details,
             "fair_value_per_share": fv_dcf,
@@ -3077,7 +3098,7 @@ def main():
 
             st.markdown("#### Hypothèses retenues (base case)")
             st.write(f"- Horizon de projection : **{years} ans**")
-            st.write(f"- WACC utilisée : **{dcf.get('wacc_used', wacc_input):.2f} %** ({dcf.get('wacc_source', 'manual')})")
+            st.write(f"- WACC utilisée : **{dcf.get('wacc_used_pct', wacc_input):.2f} %** ({dcf.get('wacc_source', 'manual')})")
             st.write(f"- Croissance FCF : **{growth_fcf_input:.2f} % par an**")
             st.write(f"- g de long terme : **{g_terminal_input:.2f} %**")
             st.write(f"- Dette nette utilisée : **{format_large_number(net_debt)}**")
@@ -3196,7 +3217,7 @@ def main():
             )
 
         st.markdown("#### Rappel des paramètres du scénario central")
-        st.write(f"- WACC base : **{dcf.get('wacc_used', wacc_input):.2f} %** ({dcf.get('wacc_source', 'manual')})")
+        st.write(f"- WACC base : **{dcf.get('wacc_used_pct', wacc_input):.2f} %** ({dcf.get('wacc_source', 'manual')})")
         st.write(f"- g base : **{g_terminal_input:.2f} %**")
         st.write(f"- Croissance FCF : **{growth_fcf_input:.2f} %/an**")
         st.write(f"- Horizon : **{years} ans**")
