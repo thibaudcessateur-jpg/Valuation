@@ -1438,14 +1438,8 @@ def compute_wacc_auto(
     config: dict,
 ):
     """
-    WACC automatique (robuste) :
-    - Risk-free : GBOND 10Y (DE10Y pour EUR, US10Y pour USD, etc.) via EODHD /eod/{ticker}.GBOND
-    - ERP : paramétré en sidebar (US / EUR / défaut)
-    - Beta : EODHD + option override + option bottom-up override + floor + blend
-    - Rd : calcul comptable (interest/avg debt) sinon heuristique rf+spread (NetDebt/EBITDA)
-    - Tax : ETR médiane multi-années, sinon override, sinon fallback optionnel
-
-    Retourne (wacc_decimal, details_dict). wacc_decimal est un taux décimal (ex 0.0878).
+    Calcule une WACC automatique.
+    Renvoie (wacc_pct, details_dict). wacc_pct peut être None si impossible même avec fallbacks.
     """
     details = {
         "enabled": bool(config.get("enabled", False)),
@@ -1456,16 +1450,12 @@ def compute_wacc_auto(
         "results": {},
     }
 
-    if not details["enabled"]:
-        details["warnings"].append("WACC auto désactivée.")
-        return None, details
-
-    # ---------- 1) Risk-free (GBOND) ----------
     cc = get_currency_code(fundamentals)
     ci = get_country_iso(fundamentals)
     details["inputs"]["currency_code"] = cc
     details["inputs"]["country_iso"] = ci
 
+    # 1) Risk-free via GBOND (close = yield %)
     rf_map = {
         "EUR": "DE10Y.GBOND",
         "USD": "US10Y.GBOND",
@@ -1476,191 +1466,156 @@ def compute_wacc_auto(
         "AUD": "AU10Y.GBOND",
     }
     rf_ticker = rf_map.get(cc, "US10Y.GBOND")
-    details["inputs"]["rf_ticker"] = rf_ticker
-
-    rf_pct = None
-    try:
-        rf_pct = fetch_latest_eod_close(rf_ticker, api_key)
-        if rf_pct is not None:
-            rf_pct = float(rf_pct)
-            details["sources"]["risk_free"] = f"EODHD eod/{rf_ticker} close"
-    except Exception as e:
-        details["warnings"].append(f"Risk-free non récupérable via {rf_ticker} : {e}")
-        rf_pct = None
-
-    if rf_pct is None:
+    rf_close = fetch_latest_eod_close(rf_ticker, api_key)
+    if rf_close is None:
         details["missing"].append("risk_free_rate")
-        return None, details
-
-    rf_decimal = rf_pct / 100.0
-    details["results"]["rf_pct"] = rf_pct
-
-    # ---------- 2) Equity Risk Premium ----------
-    erp_pct = None
-    if cc == "EUR":
-        erp_pct = config.get("erp_eur_pct")
-    elif cc == "USD":
-        erp_pct = config.get("erp_us_pct")
     else:
-        erp_pct = config.get("erp_default_pct")
+        details["sources"]["risk_free_rate"] = f"EODHD EOD close {rf_ticker}"
+        details["inputs"]["rf_ticker"] = rf_ticker
+        details["inputs"]["rf_close_pct"] = rf_close
+
+    rf_decimal = (rf_close / 100.0) if rf_close is not None else None
+
+    # 2) ERP
+    erp_us = config.get("erp_us_pct")
+    erp_eur = config.get("erp_eur_pct")
+    erp_default = config.get("erp_default_pct")
+    erp_pct = None
+    if cc == "USD" and erp_us is not None:
+        erp_pct = erp_us
+    elif cc == "EUR" and erp_eur is not None:
+        erp_pct = erp_eur
+    elif erp_default is not None:
+        erp_pct = erp_default
 
     if erp_pct is None:
         details["missing"].append("equity_risk_premium")
-        return None, details
+    else:
+        details["inputs"]["erp_pct"] = float(erp_pct)
+        details["sources"]["equity_risk_premium"] = "sidebar_default_or_override"
 
-    erp_pct = float(erp_pct)
-    erp_decimal = erp_pct / 100.0
-    details["results"]["erp_pct"] = erp_pct
+    erp_decimal = (float(erp_pct) / 100.0) if erp_pct is not None else None
 
-    # ---------- 3) Beta (avec garde-fous) ----------
-    beta_raw = get_beta(fundamentals)
-    details["inputs"]["beta_raw"] = beta_raw
-    details["sources"]["beta_raw"] = "EODHD Highlights.Beta (si dispo)"
-
+    # 3) Beta
     beta_override = config.get("beta_override")
-    beta_bottom_up = config.get("beta_bottom_up_override")
-    beta_blend_weight = config.get("beta_blend_weight", 0.5)
-    beta_floor = config.get("beta_floor")
-
-    beta_used = None
-    # override total
+    beta = None
     if beta_override is not None:
         try:
-            beta_used = float(beta_override)
-            details["sources"]["beta_used"] = "override"
+            beta = float(beta_override)
+            details["sources"]["beta"] = "override"
         except Exception:
-            details["warnings"].append("Override beta invalide (non numérique).")
-
-    # sinon blend
-    if beta_used is None:
-        b0 = None
-        try:
-            b0 = float(beta_raw) if beta_raw is not None else None
-        except Exception:
-            b0 = None
-
-        bbu = None
-        if beta_bottom_up is not None:
-            try:
-                bbu = float(beta_bottom_up)
-                details["sources"]["beta_bottom_up"] = "override_bottom_up"
-            except Exception:
-                details["warnings"].append("Beta bottom-up override invalide (non numérique).")
-                bbu = None
-
-        if b0 is not None and bbu is not None:
-            try:
-                w = float(beta_blend_weight)
-            except Exception:
-                w = 0.5
-            w = max(0.0, min(1.0, w))
-            beta_used = (1.0 - w) * b0 + w * bbu
-            details["sources"]["beta_used"] = "blend(beta_raw, beta_bottom_up)"
-            details["inputs"]["beta_blend_weight"] = w
-        elif b0 is not None:
-            beta_used = b0
-            details["sources"]["beta_used"] = "beta_raw"
-        elif bbu is not None:
-            beta_used = bbu
-            details["sources"]["beta_used"] = "beta_bottom_up_only"
-
-    if beta_used is None:
+            details["warnings"].append("Beta override invalide.")
+            beta = None
+    if beta is None:
+        beta = get_beta(fundamentals)
+        if beta is not None:
+            details["sources"]["beta"] = "EODHD Technicals.Beta"
+    if beta is None:
         details["missing"].append("beta")
-        return None, details
+    details["inputs"]["beta"] = beta
 
-    # floor beta
-    if beta_floor is not None:
-        try:
-            bf = float(beta_floor)
-            if beta_used < bf:
-                details["warnings"].append(f"Beta trop faible ({beta_used:.2f}) < floor ({bf:.2f}) → floor appliqué.")
-                beta_used = bf
-        except Exception:
-            pass
+    # 4) Cost of equity Re
+    re_decimal = None
+    if rf_decimal is not None and beta is not None and erp_decimal is not None:
+        re_decimal = rf_decimal + beta * erp_decimal
+        details["results"]["cost_of_equity_pct"] = re_decimal * 100.0
+    else:
+        details["missing"].append("cost_of_equity")
 
-    details["results"]["beta_used"] = float(beta_used)
-
-    # ---------- 4) Cost of Equity (Re) ----------
-    re_decimal = rf_decimal + float(beta_used) * erp_decimal
-    # clamp raisonnable
-    re_decimal = max(0.0, min(0.30, float(re_decimal)))
-    details["results"]["re_pct"] = re_decimal * 100.0
-
-    # ---------- 5) Tax rate ----------
-    tax_override_pct = config.get("tax_override_pct")
-    tax_decimal = None
-    tax_details = None
-    if tax_override_pct is not None:
-        try:
-            tax_decimal = float(tax_override_pct) / 100.0
-            details["sources"]["tax"] = "override"
-        except Exception:
-            details["warnings"].append("Override tax invalide (non numérique).")
-            tax_decimal = None
-
-    if tax_decimal is None:
-        tax_decimal, tax_details = compute_effective_tax_rate(fundamentals, max_years=5)
-        if tax_decimal is not None:
-            details["sources"]["tax"] = "computed_effective_tax_rate"
-            details["inputs"]["tax_details"] = tax_details
-        else:
-            if config.get("allow_tax_fallback"):
-                # fallback prudent : 25% par défaut (générique)
-                tax_decimal = 0.25
-                details["warnings"].append("ETR indisponible → fallback tax=25% (générique).")
-                details["sources"]["tax"] = "fallback_generic_25pct"
-            else:
-                details["missing"].append("tax_rate")
-                return None, details
-
-    tax_decimal = max(0.0, min(0.45, float(tax_decimal)))
-    details["results"]["tax_pct"] = tax_decimal * 100.0
-
-    # ---------- 6) Cost of Debt (Rd) ----------
-    allow_heuristic = bool(config.get("allow_heuristic_rd", True))
+    # 5) Rd
+    rd_override_pct = config.get("rd_override_pct")
+    allow_heuristic_rd = bool(config.get("allow_heuristic_rd", True))
     rd_decimal, rd_details = estimate_cost_of_debt(
         fundamentals=fundamentals,
-        bs_snap=bs_snap or {},
-        is_snap=is_snap or {},
+        bs_snap=bs_snap,
+        is_snap=is_snap,
         net_debt=net_debt,
-        rf_decimal=rf_decimal,
+        rf_decimal=rf_decimal or 0.0,
         api_key=api_key,
-        allow_heuristic=allow_heuristic,
+        rd_override_pct=rd_override_pct,
+        allow_heuristic=allow_heuristic_rd,
     )
     details["inputs"]["rd_details"] = rd_details
     if rd_decimal is None:
         details["missing"].append("cost_of_debt")
-        return None, details
-    rd_decimal = max(0.0, min(0.25, float(rd_decimal)))
-    details["results"]["rd_pct"] = rd_decimal * 100.0
+    else:
+        details["results"]["cost_of_debt_pct"] = rd_decimal * 100.0
+        details["sources"]["cost_of_debt"] = rd_details.get("source")
 
-    # ---------- 7) Weights (E/D) ----------
+    # 6) Tax rate
+    tax_override_pct = config.get("tax_override_pct")
+    allow_tax_fallback = bool(config.get("allow_tax_fallback", True))
+    tax_decimal = None
+    tax_details = {"source": None, "warnings": []}
+
+    if tax_override_pct is not None:
+        try:
+            tax_decimal = max(0.0, min(0.45, float(tax_override_pct) / 100.0))
+            tax_details["source"] = "override"
+        except Exception:
+            tax_details["warnings"].append("Tax override invalide.")
+            tax_decimal = None
+
+    if tax_decimal is None:
+        etr, etr_details = compute_effective_tax_rate(fundamentals, max_years=5)
+        if etr is not None:
+            tax_decimal = etr
+            tax_details["source"] = "ETR_median_multi_years"
+            tax_details["etr_details"] = etr_details
+
+    if tax_decimal is None and allow_tax_fallback:
+        # fallback simple par pays/currency (proxy)
+        if ci == "US" or cc == "USD":
+            tax_decimal = 0.258  # proxy combiné moyen (fédéral + états)
+            tax_details["source"] = "regional_default_US"
+        elif ci == "FR":
+            tax_decimal = 0.25
+            tax_details["source"] = "statutory_FR"
+        elif cc == "EUR":
+            tax_decimal = 0.25
+            tax_details["source"] = "regional_default_EUR"
+        else:
+            tax_decimal = 0.25
+            tax_details["source"] = "regional_default_generic"
+
+    details["inputs"]["tax_details"] = tax_details
+    if tax_decimal is None:
+        details["missing"].append("tax_rate")
+    else:
+        details["results"]["tax_rate_pct"] = tax_decimal * 100.0
+        details["sources"]["tax_rate"] = tax_details.get("source")
+
+    # 7) Weights (Market values)
     debt_val = None
+    equity_val = None
+
     try:
         debt_val = float(bs_snap.get("total_debt")) if bs_snap and bs_snap.get("total_debt") is not None else None
     except Exception:
         debt_val = None
 
+    # Fallback : si dette brute indisponible mais que net debt + cash sont connus,
+    # on peut reconstruire approximativement la dette brute : GrossDebt ≈ NetDebt + Cash
     if debt_val is None:
-        # fallback : GrossDebt ≈ NetDebt + Cash
         try:
             cash_val = float(bs_snap.get("cash")) if bs_snap and bs_snap.get("cash") is not None else None
-            if cash_val is not None and net_debt is not None:
-                derived = float(net_debt) + float(cash_val)
-                if derived > 0:
-                    debt_val = derived
-                    details["warnings"].append("Dette brute manquante → approximée via NetDebt + Cash.")
-                    details["sources"]["debt_value_for_weights"] = "derived_from_net_debt_plus_cash"
         except Exception:
-            pass
-
-    if debt_val is None:
-        details["missing"].append("debt_value_for_weights")
-        return None, details
+            cash_val = None
+        if cash_val is not None and net_debt is not None:
+            try:
+                nd = float(net_debt)
+                if nd >= 0:
+                    derived = nd + cash_val
+                    if derived > 0:
+                        debt_val = derived
+                        details["warnings"].append("Dette brute manquante → approximée via NetDebt + Cash (GrossDebt≈NetDebt+Cash).")
+                        details["sources"]["debt_value_for_weights"] = "derived_from_net_debt_plus_cash"
+            except Exception:
+                pass
 
     equity_val = get_market_cap(fundamentals)
     if equity_val is None:
-        # fallback book equity
+        # fallback book equity si market cap absent
         try:
             equity_val = float(bs_snap.get("total_equity")) if bs_snap and bs_snap.get("total_equity") is not None else None
             if equity_val is not None:
@@ -1671,37 +1626,31 @@ def compute_wacc_auto(
     else:
         details["sources"]["equity_value_for_weights"] = "EODHD Highlights.MarketCapitalization"
 
-    if equity_val is None or equity_val <= 0:
-        details["missing"].append("equity_value_for_weights")
-        return None, details
-
     details["inputs"]["debt_value"] = debt_val
     details["inputs"]["equity_value"] = equity_val
+
+    if debt_val is None or debt_val < 0:
+        details["missing"].append("debt_value_for_weights")
+    if equity_val is None or equity_val <= 0:
+        details["missing"].append("equity_value_for_weights")
+
+    # 8) WACC
+    if re_decimal is None or rd_decimal is None or tax_decimal is None or debt_val is None or equity_val is None or (debt_val + equity_val) <= 0:
+        # impossible de conclure
+        return None, details
 
     d_w = debt_val / (debt_val + equity_val)
     e_w = equity_val / (debt_val + equity_val)
 
-    # ---------- 8) WACC ----------
     wacc_decimal = e_w * re_decimal + d_w * rd_decimal * (1.0 - tax_decimal)
-
-    # ---------- 9) Garde-fous WACC ----------
-    try:
-        wacc_floor_over_rf_pct = config.get("wacc_floor_over_rf_pct")
-        if wacc_floor_over_rf_pct is not None:
-            floor = float(rf_decimal) + float(wacc_floor_over_rf_pct) / 100.0
-            if wacc_decimal < floor:
-                details["warnings"].append(
-                    f"WACC trop basse vs risk-free : {wacc_decimal*100:.2f}% < {floor*100:.2f}% (rf + {float(wacc_floor_over_rf_pct):.2f}%). Plancher appliqué."
-                )
-                wacc_decimal = floor
-    except Exception:
-        pass
-
     details["results"]["weights"] = {"D": d_w, "E": e_w}
     details["results"]["wacc_pct"] = wacc_decimal * 100.0
     details["sources"]["wacc"] = "computed"
 
     return wacc_decimal, details
+
+
+
 def _linear_score(value, low, high, higher_better=True):
     """
     Score linéaire 0-10 sur une plage [low, high].
@@ -2030,50 +1979,18 @@ def style_health_table(df: pd.DataFrame):
 # MOTEUR DCF
 # =========================================
 
-def project_fcf(
-    fcf_start: float,
-    growth_rate: float,
-    years: int,
-    g_terminal: float = None,
-    mode: str = "constant",
-):
+def project_fcf(fcf_start: float, growth_rate: float, years: int):
     """
-    Projette des FCF sur 'years' années.
-
-    Modes :
-    - "constant" : croissance annuelle constante = growth_rate
-    - "fade_to_terminal" : croissance qui converge linéairement de growth_rate vers g_terminal
-      au fil de l'horizon (plus réaliste / moins sensible qu'une croissance constante).
-
+    Projette un FCF sur 'years' années avec une croissance annuelle constante.
     Retourne la liste FCF1...FCFn.
     """
-    if fcf_start is None or years is None or years <= 0:
-        return []
-
-    mode = (mode or "constant").strip().lower()
-
-    # Fallback : si g_terminal absent, la version "fade" redevient constante
-    if mode in ("fade", "fade_to_terminal", "linear_fade") and g_terminal is None:
-        mode = "constant"
-
     fcfs = []
-    current_fcf = float(fcf_start)
-
-    for t in range(1, years + 1):
-        if mode in ("fade", "fade_to_terminal", "linear_fade"):
-            # croissance_t : interpole growth_rate -> g_terminal sur l'horizon
-            if years == 1:
-                growth_t = float(g_terminal)
-            else:
-                alpha = (t - 1) / (years - 1)
-                growth_t = float(growth_rate) + alpha * (float(g_terminal) - float(growth_rate))
-        else:
-            growth_t = float(growth_rate)
-
-        current_fcf *= (1.0 + growth_t)
+    current_fcf = fcf_start
+    for _ in range(1, years + 1):
+        current_fcf *= (1 + growth_rate)
         fcfs.append(current_fcf)
-
     return fcfs
+
 
 def discount_cash_flows(fcfs, wacc: float):
     """
@@ -2088,43 +2005,15 @@ def discount_cash_flows(fcfs, wacc: float):
     return discounted, total
 
 
-def terminal_value(
-    last_fcf: float,
-    wacc: float,
-    g: float,
-    method: str = "gordon",
-    exit_multiple_fcf: float = None,
-):
+def terminal_value(last_fcf: float, wacc: float, g: float):
     """
-    Valeur terminale (au temps n, avant actualisation).
-
-    Méthodes :
-    - "gordon" : Gordon-Shapiro TV = FCF_{n+1} / (WACC - g)
-    - "exit_fcf" : TV = FCF_n * multiple (multiple = EV/FCF)
-
-    Remarque : la méthode "exit_fcf" est une approximation (multiple de marché).
+    Valeur terminale (Gordon-Shapiro) : TV = FCF_{n+1} / (WACC - g)
     """
-    if last_fcf is None or wacc is None:
-        return None
-
-    method = (method or "gordon").strip().lower()
-
-    if method in ("exit", "exit_fcf", "multiple_fcf", "ev_fcf"):
-        try:
-            m = float(exit_multiple_fcf) if exit_multiple_fcf is not None else None
-        except Exception:
-            m = None
-        if m is None or m <= 0:
-            return None
-        return float(last_fcf) * m
-
-    # Default : Gordon
-    if g is None:
-        return None
+    fcf_next = last_fcf * (1 + g)
     if wacc <= g:
         return None
-    fcf_next = float(last_fcf) * (1.0 + float(g))
-    return fcf_next / (float(wacc) - float(g))
+    return fcf_next / (wacc - g)
+
 
 def dcf_fair_value_per_share(
     fcf_start: float,
@@ -2134,51 +2023,18 @@ def dcf_fair_value_per_share(
     g_terminal: float,
     net_debt: float,
     shares: float,
-    projection_mode: str = "fade_to_terminal",
-    terminal_method: str = "gordon",
-    exit_multiple_fcf: float = None,
 ):
     """
     Calcule une juste valeur par action pour un ensemble de paramètres DCF.
-
-    Améliorations buy-side (simplifiées) :
-    - Projection FCF "fade_to_terminal" (croissance qui converge vers g LT)
-    - Valeur terminale au choix : Gordon (par défaut) ou multiple EV/FCF
-
     Retourne (fair_value_per_share, EV, equity_value, tv_discounted, sum_discounted_fcfs).
     """
     if shares is None or shares <= 0 or fcf_start is None:
         return None, None, None, None, None
 
-    if years is None or years <= 0:
-        return None, None, None, None, None
-
-    if wacc is None or wacc <= 0:
-        return None, None, None, None, None
-
-    # Garde-fou minimal : éviter un WACC trop proche du g (sinon TV explose)
-    if g_terminal is not None and (wacc <= g_terminal):
-        return None, None, None, None, None
-
-    projected_fcfs = project_fcf(
-        fcf_start=fcf_start,
-        growth_rate=growth_fcf,
-        years=years,
-        g_terminal=g_terminal,
-        mode=projection_mode,
-    )
-    if not projected_fcfs:
-        return None, None, None, None, None
-
+    projected_fcfs = project_fcf(fcf_start, growth_fcf, years)
     discounted_fcfs, sum_discounted_fcfs = discount_cash_flows(projected_fcfs, wacc)
 
-    tv = terminal_value(
-        projected_fcfs[-1],
-        wacc=wacc,
-        g=g_terminal,
-        method=terminal_method,
-        exit_multiple_fcf=exit_multiple_fcf,
-    )
+    tv = terminal_value(projected_fcfs[-1], wacc, g_terminal)
     if tv is None:
         return None, None, None, None, None
 
@@ -2191,6 +2047,7 @@ def dcf_fair_value_per_share(
 
     return fair_value_per_share, ev, equity_value, tv_discounted, sum_discounted_fcfs
 
+
 def build_sensitivity_matrix(
     fcf_start: float,
     growth_fcf: float,
@@ -2199,38 +2056,29 @@ def build_sensitivity_matrix(
     base_g: float,
     net_debt: float,
     shares: float,
-    projection_mode: str = "fade_to_terminal",
-    terminal_method: str = "gordon",
-    exit_multiple_fcf: float = None,
-    wacc_shifts: list = None,
-    g_shifts: list = None,
 ):
     """
     Construit une matrice de sensibilité DCF en faisant varier WACC et g.
     Les cellules contiennent la juste valeur par action.
-
-    Par défaut : matrice 3x3 centrée sur les hypothèses de base.
     """
-    if wacc_shifts is None:
-        wacc_shifts = [-0.005, 0.0, 0.005]  # -0.5%, base, +0.5%
-    if g_shifts is None:
-        g_shifts = [-0.005, 0.0, 0.005]     # -0.5%, base, +0.5%
+    wacc_values = sorted(
+        {
+            max(0.01, base_wacc - 0.01),
+            max(0.01, base_wacc - 0.005),
+            base_wacc,
+            base_wacc + 0.005,
+            base_wacc + 0.01,
+        }
+    )
+    g_values = sorted(
+        {
+            max(0.0, base_g - 0.005),
+            base_g,
+            base_g + 0.005,
+        }
+    )
 
-    wacc_values = []
-    for s in wacc_shifts:
-        try:
-            wacc_values.append(max(0.01, float(base_wacc) + float(s)))
-        except Exception:
-            continue
-    wacc_values = sorted(set(wacc_values))
-
-    g_values = []
-    for s in g_shifts:
-        try:
-            g_values.append(max(-0.02, float(base_g) + float(s)))
-        except Exception:
-            continue
-    g_values = sorted(set(g_values))
+    g_values = [g for g in g_values if g < max(wacc_values)]
 
     data = {}
     for g in g_values:
@@ -2244,9 +2092,6 @@ def build_sensitivity_matrix(
                 g_terminal=g,
                 net_debt=net_debt,
                 shares=shares,
-                projection_mode=projection_mode,
-                terminal_method=terminal_method,
-                exit_multiple_fcf=exit_multiple_fcf,
             )
             row.append(fv if fv is not None else float("nan"))
         data[f"g = {g*100:.2f} %"] = row
@@ -2256,73 +2101,9 @@ def build_sensitivity_matrix(
     return df_matrix
 
 
-
-def compute_dcf_scenarios(
-    fcf_start: float,
-    growth_fcf: float,
-    years: int,
-    wacc_base: float,
-    g_terminal: float,
-    net_debt: float,
-    shares: float,
-    projection_mode: str = "fade_to_terminal",
-    terminal_method: str = "gordon",
-    exit_multiple_fcf: float = None,
-):
-    """
-    Calcule 3 scénarios DCF (Bull / Base / Bear) autour du cas central.
-
-    Écarts (par défaut) :
-    - WACC : +/- 0,50%
-    - Croissance FCF : +/- 0,50%
-    - g LT : +/- 0,25%
-
-    Retourne un dict {scenario: {...}}.
-    """
-    def _cap_g(g, w):
-        # Garde-fou : éviter WACC trop proche de g
-        if g is None or w is None:
-            return g
-        return min(float(g), float(w) - 0.01)
-
-    scenarios = {}
-
-    shifts = {
-        "Bear": {"dw": +0.005, "dg": -0.005, "dgt": -0.0025},
-        "Base": {"dw": 0.0,   "dg": 0.0,    "dgt": 0.0},
-        "Bull": {"dw": -0.005,"dg": +0.005, "dgt": +0.0025},
-    }
-
-    for name, s in shifts.items():
-        w = max(0.01, float(wacc_base) + s["dw"])
-        gr = float(growth_fcf) + s["dg"]
-        gt = float(g_terminal) + s["dgt"]
-        gt = _cap_g(gt, w)
-
-        fv, ev, eq, tvd, sumd = dcf_fair_value_per_share(
-            fcf_start=fcf_start,
-            growth_fcf=gr,
-            years=years,
-            wacc=w,
-            g_terminal=gt,
-            net_debt=net_debt,
-            shares=shares,
-            projection_mode=projection_mode,
-            terminal_method=terminal_method,
-            exit_multiple_fcf=exit_multiple_fcf,
-        )
-        scenarios[name] = {
-            "fair_value_per_share": fv,
-            "ev": ev,
-            "equity_value": eq,
-            "tv_discounted": tvd,
-            "sum_disc_fcfs": sumd,
-            "wacc": w,
-            "growth_fcf": gr,
-            "g_terminal": gt,
-        }
-
-    return scenarios
+# =========================================
+# MÉTHODES PAR MULTIPLES (FAIR VALUES)
+# =========================================
 
 def pe_valuation(eps, pe_target):
     if eps is None or pe_target is None:
@@ -2809,7 +2590,7 @@ def combine_global_valuation(dcf_value: float, multiples_vals: dict, weights: di
 # =========================================
 # PIPELINE PRINCIPAL POUR UNE SOCIÉTÉ
 # =========================================
-def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fcf: float, g_terminal: float, wacc_cfg: dict = None, dcf_cfg: dict = None):
+def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fcf: float, g_terminal: float, wacc_cfg: dict = None):
     """
     Pipeline complet :
     - Recherche par nom/ticker
@@ -2820,14 +2601,6 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     - DCF (uniquement si pertinent)
     - Classification + pondération + synthèse globale
     """
-    dcf_cfg = dcf_cfg or {}
-    projection_mode = (dcf_cfg.get('projection_mode') or 'fade_to_terminal')
-    terminal_method = (dcf_cfg.get('terminal_method') or 'gordon')
-    exit_multiple_fcf = dcf_cfg.get('exit_multiple_fcf')
-    use_normalized_fcf = bool(dcf_cfg.get('use_normalized_fcf', True))
-    sens_wacc_shifts = dcf_cfg.get('sens_wacc_shifts')
-    sens_g_shifts = dcf_cfg.get('sens_g_shifts')
-
     ticker = None
     search_results = []
 
@@ -2947,10 +2720,7 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     fcf_last = estimate_starting_fcf(fundamentals)
     fcf_norm = estimate_normalized_fcf(hist_df)
 
-    if use_normalized_fcf and (fcf_norm is not None):
-        fcf_start = fcf_norm
-    else:
-        fcf_start = fcf_last
+    fcf_start = fcf_norm if fcf_norm is not None else fcf_last
 
     # =========================
     # DCF : seulement si la société n'est PAS small cap et si données suffisantes
@@ -2966,7 +2736,6 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
 
     # =========================
     dcf_missing = []
-    dcf_assumption_warnings = []
     if fcf_start is None:
         dcf_missing.append('fcf_start')
     if shares in (None, 0):
@@ -2975,12 +2744,8 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         dcf_missing.append('net_debt')
     if wacc_used in (None, 0):
         dcf_missing.append('wacc')
-    if terminal_method.lower() in ('exit', 'exit_fcf', 'multiple_fcf', 'ev_fcf') and (exit_multiple_fcf is None or exit_multiple_fcf <= 0):
-        dcf_missing.append('exit_multiple_fcf')
     if (wacc_used not in (None, 0)) and (g_terminal is not None) and (wacc_used <= g_terminal):
         dcf_missing.append('wacc<=g_terminal')
-    if (wacc_used not in (None, 0)) and (g_terminal is not None) and ((wacc_used - g_terminal) < 0.015):
-        dcf_assumption_warnings.append('WACC très proche de g (TV très sensible).')
 
     dcf_allowed = (
         profile.get('cap_size') != 'SmallCap'
@@ -2996,9 +2761,6 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             g_terminal=g_terminal,
             net_debt=net_debt,
             shares=shares,
-            projection_mode=projection_mode,
-            terminal_method=terminal_method,
-            exit_multiple_fcf=exit_multiple_fcf,
         )
 
         if fv_dcf is not None and price not in (None, 0):
@@ -3007,7 +2769,7 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             upside_dcf = None
 
         # Projections FCF & sensibilité
-        projected_fcfs = project_fcf(fcf_start, growth_fcf, years, g_terminal=g_terminal, mode=projection_mode)
+        projected_fcfs = project_fcf(fcf_start, growth_fcf, years)
         discounted_fcfs, _ = discount_cash_flows(projected_fcfs, wacc_used)
         proj_df = pd.DataFrame(
             {
@@ -3025,24 +2787,6 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             base_g=g_terminal,
             net_debt=net_debt,
             shares=shares,
-            projection_mode=projection_mode,
-            terminal_method=terminal_method,
-            exit_multiple_fcf=exit_multiple_fcf,
-            wacc_shifts=sens_wacc_shifts,
-            g_shifts=sens_g_shifts,
-        )
-
-        dcf_scenarios = compute_dcf_scenarios(
-            fcf_start=fcf_start,
-            growth_fcf=growth_fcf,
-            years=years,
-            wacc_base=wacc_used,
-            g_terminal=g_terminal,
-            net_debt=net_debt,
-            shares=shares,
-            projection_mode=projection_mode,
-            terminal_method=terminal_method,
-            exit_multiple_fcf=exit_multiple_fcf,
         )
     else:
         # DCF non pertinent ou impossible → on neutralise toutes les sorties DCF
@@ -3054,7 +2798,6 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         upside_dcf = None
         proj_df = pd.DataFrame()
         sens_matrix = pd.DataFrame()
-        dcf_scenarios = {}
 
     # =========================
     # Multiples : cibles & valorisations (INCHANGÉ)
@@ -3089,9 +2832,6 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             "ratios": health_ratios,
         },
         "fcf_start": fcf_start,
-        "fcf_last": fcf_last,
-        "fcf_normalized": fcf_norm,
-        "fcf_start_mode": ("normalized" if (use_normalized_fcf and (fcf_norm is not None)) else "last"),
         "proj_df": proj_df,
         "dcf": {
 
@@ -3106,11 +2846,6 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             "tv_discounted": tv_discounted,
             "sum_disc_fcfs": sum_disc_fcfs,
             "upside_pct": upside_dcf,
-            "projection_mode": projection_mode,
-            "terminal_method": terminal_method,
-            "exit_multiple_fcf": exit_multiple_fcf,
-            "assumption_warnings": dcf_assumption_warnings,
-            "scenarios": dcf_scenarios,
         },
         "sensitivity": sens_matrix,
         "base_financials": base_financials,
@@ -3126,7 +2861,6 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
 # =========================================
 # STREAMLIT APP
 # =========================================
-
 
 def main():
     st.set_page_config(
@@ -3209,21 +2943,6 @@ def main():
     if override_tax:
         tax_override_pct = st.sidebar.number_input("Tax rate override (%)", min_value=0.0, max_value=45.0, value=25.0, step=0.5)
 
-    with st.sidebar.expander('Options avancées WACC auto', expanded=False):
-        beta_floor = st.number_input('Plancher Beta (garde-fou)', min_value=0.0, max_value=3.0, value=0.8, step=0.05)
-        beta_bottom_up_raw = st.text_input('Beta bottom-up (optionnel, pour blend)', value='')
-        beta_bottom_up_override = None
-        if beta_bottom_up_raw.strip():
-            try:
-                beta_bottom_up_override = float(beta_bottom_up_raw.strip())
-            except Exception:
-                st.warning('Beta bottom-up invalide : ignoré.')
-                beta_bottom_up_override = None
-        beta_blend_weight = 0.5
-        if beta_bottom_up_override is not None:
-            beta_blend_weight = st.slider('Poids beta marché (blend)', min_value=0.0, max_value=1.0, value=0.5, step=0.05)
-        wacc_floor_over_rf_pct = st.number_input('Plancher WACC = rf + (%)', min_value=0.0, max_value=6.0, value=1.0, step=0.1)
-
     allow_heuristic_rd = st.sidebar.checkbox("Autoriser estimation Rd si interestExpense manquant", value=True)
     allow_tax_fallback = st.sidebar.checkbox("Autoriser fallback tax par zone", value=True)
 
@@ -3241,30 +2960,6 @@ def main():
         value=1.75,
         step=0.05,
     )
-
-    st.sidebar.markdown('### Options avancées DCF')
-    use_normalized_fcf = st.sidebar.checkbox('FCF de départ normalisé (moyenne 3 ans si dispo)', value=True)
-    projection_mode = st.sidebar.selectbox(
-        'Projection FCF',
-        options=['fade_to_terminal', 'constant'],
-        index=0,
-        format_func=lambda x: 'Fade vers g LT (recommandé)' if x=='fade_to_terminal' else 'Croissance constante',
-    )
-    terminal_method = st.sidebar.selectbox(
-        'Valeur terminale',
-        options=['gordon', 'exit_fcf'],
-        index=0,
-        format_func=lambda x: 'Gordon-Shapiro (perpetuité)' if x=='gordon' else 'Multiple EV/FCF (exit)',
-    )
-    exit_multiple_fcf = None
-    if terminal_method == 'exit_fcf':
-        exit_multiple_fcf = st.sidebar.number_input('Multiple EV/FCF terminal', min_value=5.0, max_value=40.0, value=18.0, step=0.5)
-
-    with st.sidebar.expander('Sensibilité (matrice DCF)', expanded=False):
-        sens_wacc_step = st.number_input('Pas WACC (points %)', min_value=0.1, max_value=2.0, value=0.5, step=0.1)
-        sens_g_step = st.number_input('Pas g LT (points %)', min_value=0.1, max_value=1.0, value=0.5, step=0.1)
-        sens_wacc_shifts = [-(sens_wacc_step/100.0), 0.0, (sens_wacc_step/100.0)]
-        sens_g_shifts = [-(sens_g_step/100.0), 0.0, (sens_g_step/100.0)]
 
     wacc = wacc_input / 100.0
 
@@ -3303,24 +2998,10 @@ def main():
                 "erp_eur_pct": float(erp_eur),
                 "erp_default_pct": float(erp_us),
                 "beta_override": beta_override,
-                "beta_floor": beta_floor,
-                "beta_bottom_up_override": beta_bottom_up_override,
-                "beta_blend_weight": beta_blend_weight,
-                "wacc_floor_over_rf_pct": wacc_floor_over_rf_pct,
                 "rd_override_pct": rd_override_pct,
                 "tax_override_pct": tax_override_pct,
                 "allow_heuristic_rd": bool(allow_heuristic_rd),
                 "allow_tax_fallback": bool(allow_tax_fallback),
-            }
-
-
-            dcf_cfg = {
-                'use_normalized_fcf': bool(use_normalized_fcf),
-                'projection_mode': projection_mode,
-                'terminal_method': terminal_method,
-                'exit_multiple_fcf': exit_multiple_fcf,
-                'sens_wacc_shifts': sens_wacc_shifts,
-                'sens_g_shifts': sens_g_shifts,
             }
 
             result = analyze_company(
@@ -3331,7 +3012,6 @@ def main():
                 growth_fcf,
                 g_terminal,
                 wacc_cfg=wacc_cfg,
-                dcf_cfg=dcf_cfg,
             )
 
     except Exception as e:
@@ -3498,42 +3178,6 @@ def main():
             st.write(f"- g de long terme : **{g_terminal_input:.2f} %**")
             st.write(f"- Dette nette utilisée : **{format_large_number(net_debt)}**")
             st.write(f"- FCF de départ estimé : **{format_large_number(fcf_start)}**")
-            # Options avancées DCF (pour contextualiser la valorisation)
-            pm = dcf.get('projection_mode') if isinstance(dcf, dict) else None
-            if pm:
-                pm_label = 'Fade vers g LT' if str(pm).lower().startswith('fade') else 'Croissance constante'
-                st.write(f"- Projection FCF : **{pm_label}**")
-            tm = dcf.get('terminal_method') if isinstance(dcf, dict) else None
-            if tm:
-                if str(tm).lower() in ('exit', 'exit_fcf', 'multiple_fcf', 'ev_fcf'):
-                    st.write(f"- Valeur terminale : **Multiple EV/FCF = {format_float(dcf.get('exit_multiple_fcf'), 2)}x**")
-                else:
-                    st.write("- Valeur terminale : **Gordon-Shapiro (perpetuité)**")
-
-            # Warnings DCF (assumptions)
-            dcf_warn = dcf.get('assumption_warnings') if isinstance(dcf, dict) else None
-            if dcf_warn:
-                st.warning(' | '.join([str(x) for x in dcf_warn]))
-
-            # Scénarios bull/base/bear (utile pour discussion buy-side)
-            scen = dcf.get('scenarios') if isinstance(dcf, dict) else None
-            if scen and isinstance(scen, dict) and len(scen) > 0:
-                try:
-                    scen_rows = []
-                    for name in ['Bear','Base','Bull']:
-                        s = scen.get(name, {}) if isinstance(scen.get(name, {}), dict) else {}
-                        scen_rows.append({
-                            'Scénario': name,
-                            'WACC (%)': (s.get('wacc')*100.0) if s.get('wacc') is not None else None,
-                            'Croissance FCF (%)': (s.get('growth_fcf')*100.0) if s.get('growth_fcf') is not None else None,
-                            'g LT (%)': (s.get('g_terminal')*100.0) if s.get('g_terminal') is not None else None,
-                            'Juste valeur / action': s.get('fair_value_per_share'),
-                        })
-                    scen_df = pd.DataFrame(scen_rows)
-                    st.dataframe(scen_df, use_container_width=True)
-                except Exception:
-                    pass
-
             # Détail WACC automatique (audit trail)
             wacc_details = dcf.get("wacc_details") if isinstance(dcf, dict) else None
             if wacc_details:
