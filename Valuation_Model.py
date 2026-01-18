@@ -662,156 +662,13 @@ def extract_base_financials(fundamentals: dict):
             "totalEquity",
             "total_equity",
             "totalEquityGrossMinorityInterest",
-            "totalEquityAndMinorityInterest",
-        )
-        if equity is not None and equity not in (0.0,):
-            book_equity = equity
-
-        # Fallback : book_equity = totalAssets - totalLiab 
-        if book_equity is None:
-            total_assets = _get_float("totalAssets", "total_assets", "totalAssetsReported", "assets")
-            total_liab = _get_float(
-                "totalLiab",
-                "total_liab",
-                "total_liabilities",
-                "totalLiabilitiesNetMinorityInterest",
-                "totalLiabilities",
-                "liabilities",
-            )
-
-            # si totalLiab absent mais assets+equity présents : totalLiab = assets - equity
-            if total_liab is None and total_assets is not None and equity is not None:
-                total_liab = total_assets - equity
-
-            if total_assets is not None and total_liab is not None:
-                try:
-                    book_equity = float(total_assets) - float(total_liab)
-                except Exception:
-                    book_equity = None
-
-    return {
-        "revenue": revenue,
-        "ebitda": ebitda,
-        "ebit": ebit,
-        "net_income": net_income,
-        "book_equity": book_equity,
-    }
-
-
-def extract_base_financials(fundamentals: dict):
-    """
-    Extrait les valeurs de base (dernière année annuelle) nécessaires aux multiples :
-    - revenue
-    - ebitda
-    - ebit
-    - net_income
-    - book_equity (fonds propres comptables)
-
-    Bonnes pratiques EODHD : certaines clés diffèrent selon les exchanges (camelCase vs variantes). 
-    """
-    inc = fundamentals.get("Financials", {}).get("Income_Statement", {}).get("yearly", {})
-    bs = fundamentals.get("Financials", {}).get("Balance_Sheet", {}).get("yearly", {})
-
-    revenue = ebitda = ebit = net_income = book_equity = None
-
-    # ============================================================
-    #                   INCOME STATEMENT
-    # ============================================================
-    if isinstance(inc, dict) and inc:
-        years_inc = sorted(inc.keys())
-        last_year_inc = years_inc[-1]
-        row_inc = inc.get(last_year_inc, {}) or {}
-
-        revenue = pick_first_non_null(
-            row_inc,
-            ["totalRevenue", "TotalRevenue", "revenue", "Revenue", "SalesRevenueNet", "Sales"],
-        )
-
-        ebitda = pick_first_non_null(
-            row_inc,
-            ["ebitda", "EBITDA", "Ebitda", "OperatingIncomeBeforeDepreciation"],
-        )
-
-        ebit = pick_first_non_null(
-            row_inc,
-            ["ebit", "EBIT", "operatingIncome", "OperatingIncome", "OperatingIncomeLoss"],
-        )
-
-        net_income = pick_first_non_null(
-            row_inc,
-            [
-                "netIncome",
-                "NetIncome",
-                "net_income",
-                "NetIncomeCommonStockholders",
-                "NetIncomeIncludingNoncontrollingInterests",
-            ],
-        )
-
-    # ============================================================
-    #                     BALANCE SHEET
-    # ============================================================
-    if isinstance(bs, dict) and bs:
-        years_bs = sorted(bs.keys())
-        last_year_bs = years_bs[-1]
-        row_bs = bs.get(last_year_bs, {}) or {}
-
-        # Normaliser les clés (insensible à la casse + suppression _ / espaces / tirets)
-        def _norm_key(k: str) -> str:
-            return str(k).strip().lower().replace("_", "").replace(" ", "").replace("-", "")
-
-        normalized = {_norm_key(k): v for k, v in row_bs.items()}
-
-        def _get_float(*keys):
-            for k in keys:
-                v = normalized.get(_norm_key(k))
-                if v is None:
-                    continue
-                try:
-                    return float(v)
-                except Exception:
-                    continue
-            return None
-
-        # Equity direct (plusieurs variantes)
-        equity = _get_float(
-            "totalStockholderEquity",
-            "totalStockholdersEquity",
-            "totalstockholderequity",
-            "totalStockholdersequity",
-            "totalShareholdersEquity",
-            "commonStockEquity",
-            "stockholdersEquity",
-            "shareholdersEquity",
-            "totalEquity",
-            "total_equity",
             "totalEquityGrossMinorityInterest",
-            "totalEquityAndMinorityInterest",
+            "totalEquityIncludingMinorityInterest",
+            "totalEquityNetMinorityInterest",
         )
-        if equity is not None and equity not in (0.0,):
+
+        if equity is not None:
             book_equity = equity
-
-        # Fallback : book_equity = totalAssets - totalLiab 
-        if book_equity is None:
-            total_assets = _get_float("totalAssets", "total_assets", "totalAssetsReported", "assets")
-            total_liab = _get_float(
-                "totalLiab",
-                "total_liab",
-                "total_liabilities",
-                "totalLiabilitiesNetMinorityInterest",
-                "totalLiabilities",
-                "liabilities",
-            )
-
-            # si totalLiab absent mais assets+equity présents : totalLiab = assets - equity
-            if total_liab is None and total_assets is not None and equity is not None:
-                total_liab = total_assets - equity
-
-            if total_assets is not None and total_liab is not None:
-                try:
-                    book_equity = float(total_assets) - float(total_liab)
-                except Exception:
-                    book_equity = None
 
     return {
         "revenue": revenue,
@@ -822,321 +679,106 @@ def extract_base_financials(fundamentals: dict):
     }
 
 
-def safe_div(num, den):
-    """
-    Division sécurisée :
-    - renvoie None si num ou den est None
-    - renvoie None si den = 0
-    - évite les erreurs de type
-    """
-    if num is None or den in (None, 0):
-        return None
-    try:
-        return float(num) / float(den)
-    except Exception:
-        return None
+# =========================================
+# MULTIPLES
+# =========================================
 
-def compute_base_multiples(price, shares, net_debt, base_financials: dict):
+def compute_base_multiples(price: float, shares: float, net_debt: float, base_financials: dict):
     """
-    Calcule les métriques de base pour les méthodes par multiples :
-    - EPS, BVPS
-    - Market cap, EV
-    - P/E, P/B, EV/EBITDA, EV/EBIT, EV/Sales
+    Calcule les multiples 'courants' de la société, basés sur le dernier exercice annuel.
+    Renvoie un dict : pe, pb, ev_ebitda, ev_sales, ev_ebit, etc.
     """
+    if shares is None or shares == 0:
+        return {}
+
+    market_cap = price * shares
+    net_debt_used = net_debt if net_debt is not None else 0
+    ev = market_cap + net_debt_used
+
     revenue = base_financials.get("revenue")
     ebitda = base_financials.get("ebitda")
     ebit = base_financials.get("ebit")
     net_income = base_financials.get("net_income")
     book_equity = base_financials.get("book_equity")
 
-    metrics = {}
+    pe = (price / (net_income / shares)) if net_income not in (None, 0) else None
+    pb = (price / (book_equity / shares)) if book_equity not in (None, 0) else None
+    ev_ebitda = (ev / ebitda) if ebitda not in (None, 0) else None
+    ev_ebit = (ev / ebit) if ebit not in (None, 0) else None
+    ev_sales = (ev / revenue) if revenue not in (None, 0) else None
 
-    eps = None
-    bvps = None
-    market_cap = None
-    ev = None
-
-    if price is not None and shares not in (None, 0):
-        market_cap = price * shares
-
-    if shares not in (None, 0):
-        if net_income is not None:
-            eps = net_income / shares
-        if book_equity is not None:
-            bvps = book_equity / shares
-
-    if market_cap is not None:
-        ev = market_cap + (net_debt or 0)
-
-    metrics["revenue"] = revenue
-    metrics["ebitda"] = ebitda
-    metrics["ebit"] = ebit
-    metrics["net_income"] = net_income
-    metrics["book_equity"] = book_equity
-    metrics["eps"] = eps
-    metrics["bvps"] = bvps
-    metrics["market_cap"] = market_cap
-    metrics["ev"] = ev
-
-    # Multiples courants
-    metrics["pe"] = safe_div(price, eps)
-    metrics["pb"] = safe_div(price, bvps)
-    metrics["ev_ebitda"] = safe_div(ev, ebitda)
-    metrics["ev_ebit"] = safe_div(ev, ebit)
-    metrics["ev_sales"] = safe_div(ev, revenue)
-
-    return metrics
-
+    return {
+        "market_cap": market_cap,
+        "ev": ev,
+        "pe": pe,
+        "pb": pb,
+        "ev_ebitda": ev_ebitda,
+        "ev_ebit": ev_ebit,
+        "ev_sales": ev_sales,
+        "revenue": revenue,
+        "ebit": ebit,
+        "ebitda": ebitda,
+        "net_income": net_income,
+        "book_equity": book_equity,
+        "eps": (net_income / shares) if net_income not in (None, 0) else None,
+        "bvps": (book_equity / shares) if book_equity not in (None, 0) else None,
+    }
 
 
 # =========================================
-# FUNDAMENTALS HEALTH TABLE (RATIOS + SCORE)
+# HELPERS : EXTRACTION DERNIER EXERCICE
 # =========================================
 
-@st.cache_data(show_spinner=False, ttl=24*3600)
-def fetch_fundamentals_cached(ticker: str, api_key: str):
-    return fetch_fundamentals(ticker, api_key)
-
-@st.cache_data(show_spinner=False, ttl=6*3600)
-def fetch_eod_price_cached(ticker: str, api_key: str):
-    return fetch_eod_price(ticker, api_key)
-
-
-def _extract_latest_year_row(section: dict):
+def _extract_latest_year_row(yearly_dict: dict):
     """
-    section attendu sous forme de dict {year: {...}}.
-    Retourne (year, row) du dernier exercice disponible.
+    Renvoie (year, row) pour la dernière année disponible.
     """
-    if not isinstance(section, dict) or not section:
+    if not isinstance(yearly_dict, dict) or not yearly_dict:
         return None, {}
-    years = sorted(section.keys())
+    years = sorted(yearly_dict.keys())
     last_year = years[-1]
-    return last_year, (section.get(last_year, {}) or {})
+    return last_year, yearly_dict[last_year] or {}
 
 
 def extract_balance_sheet_snapshot(fundamentals: dict):
     """
-    Extrait un snapshot de bilan (dernier exercice annuel) avec des clés standardisées.
-    Retourne aussi l'année du snapshot.
-
-    Notes EODHD (glossaire Fundamentals):
-    - totalAssets, totalLiab, totalStockholderEquity 
-    - cash vs cashAndEquivalents : peut varier selon l'exchange 
+    Extrait un snapshot de bilan (dernière année annuelle).
+    Renvoie (year, snapshot_dict).
     """
     bs = fundamentals.get("Financials", {}).get("Balance_Sheet", {}).get("yearly", {})
     year, row = _extract_latest_year_row(bs)
 
-    if not row or not isinstance(row, dict):
-        return year, {}
-
-    def _norm_key(k: str) -> str:
-        return str(k).strip().lower().replace("_", "").replace(" ", "").replace("-", "")
-
-    normalized = {_norm_key(k): v for k, v in row.items()}
-
     def get_first(keys):
-        for k in keys:
-            v = normalized.get(_norm_key(k))
-            if v is None:
-                continue
-            try:
-                return float(v)
-            except Exception:
-                continue
-        return None
+        return pick_first_non_null(row, keys)
 
-    total_assets = get_first(["totalAssets", "total_assets", "totalassets", "totalAssetsReported", "assets"])
-
-    # EODHD utilise souvent totalLiab (et non totalLiabilities) 
-    total_liabilities = get_first(
-        [
-            "totalLiab",
-            "total_liab",
-            "total_liabilities",
-            "totalLiabilitiesNetMinorityInterest",
-            "totalLiabilities",
-            "liabilities",
-        ]
-    )
-
-    # Equity (si dispo en direct)
-    total_equity_direct = get_first(
-        [
-            "totalStockholderEquity",
-            "total_stockholder_equity",
-            "totalStockholdersEquity",
-            "totalEquity",
-            "total_equity",
-            "commonStockEquity",
-            "stockholdersEquity",
-            "shareholdersEquity",
-        ]
-    )
-
-    # Si liabilities est manquant mais assets+equity sont dispo :
-    # totalLiab = totalAssets - totalStockholderEquity 
-    if total_liabilities is None and total_assets is not None and total_equity_direct is not None:
-        total_liabilities = total_assets - total_equity_direct
-
-    # Dette totale
-    total_debt = get_first(
-        [
-            "shortLongTermDebtTotal",
-            "totalDebt",
-            "total_debt",
-            "totalDebtGrossMinorityInterest",
-            "debt",
-        ]
-    )
-    if total_debt is None:
-        st_debt = get_first(["shortTermDebt", "short_term_debt", "currentDebt", "current_debt", "shortLongTermDebt"])
-        lt_debt = get_first(
-            [
-                "longTermDebtTotal",
-                "longTermDebt",
-                "long_term_debt_total",
-                "long_term_debt",
-                "longTermDebtNonCurrent",
-                "longtermdebtnoncurrent",
-                "longTermDebtAndCapitalLeaseObligation",
-                "nonCurrentDebt",
-            ]
-        )
-        if st_debt is not None or lt_debt is not None:
-            total_debt = (st_debt or 0.0) + (lt_debt or 0.0)
-
-    cash = get_first(
-        [
-            "cashAndEquivalents",
-            "cashAndCashEquivalents",
-            "cashAndCashEquivalentsAndShortTermInvestments",
-            "cashAndShortTermInvestments",
-            "cash",
-        ]
-    )
-
-    current_assets = get_first(["totalCurrentAssets", "currentAssets", "current_assets"])
-    current_liabilities = get_first(["totalCurrentLiabilities", "currentLiabilities", "current_liabilities"])
-
-    goodwill = get_first(["goodWill", "goodwill"])
-    intangibles = get_first(["intangibleAssets", "intangible_assets", "intangibles", "intangibleAssetsExcludingGoodwill"])
-
-    # Equity : on réutilise la logique robuste de extract_base_financials (inclut plusieurs clés + fallback)
-    book_equity = None
-    try:
-        book_equity = extract_base_financials(fundamentals).get("book_equity")
-        if book_equity is not None:
-            book_equity = float(book_equity)
-    except Exception:
-        book_equity = None
-
-    # Fallback final equity si toujours None
-    if book_equity is None and total_equity_direct is not None:
-        book_equity = total_equity_direct
-
-    if book_equity is None and total_assets is not None and total_liabilities is not None:
-        book_equity = total_assets - total_liabilities
-
-    return year, {
-        "total_assets": total_assets,
-        "total_liabilities": total_liabilities,
-        "total_equity": book_equity,
-        "total_debt": total_debt,
-        "cash": cash,
-        "current_assets": current_assets,
-        "current_liabilities": current_liabilities,
-        "goodwill": goodwill,
-        "intangibles": intangibles,
+    snap = {
+        "total_assets": get_first(["totalAssets", "TotalAssets"]),
+        "total_equity": get_first(["totalStockholderEquity", "totalStockholdersEquity", "TotalStockholderEquity", "TotalStockholdersEquity", "totalEquity"]),
+        "total_debt": get_first(["shortLongTermDebtTotal", "totalDebt", "TotalDebt", "shortLongTermDebt", "total_debt"]),
+        "cash": get_first(["cash", "cashAndEquivalents", "CashAndCashEquivalents"]),
+        "current_assets": get_first(["totalCurrentAssets", "TotalCurrentAssets", "currentAssets"]),
+        "current_liabilities": get_first(["totalCurrentLiabilities", "TotalCurrentLiabilities", "currentLiabilities"]),
+        "goodwill": get_first(["goodWill", "Goodwill", "goodwill"]),
+        "intangibles": get_first(["intangibleAssets", "IntangibleAssets", "intangibleAssetsNet", "Intangibles", "intangible_assets"]),
     }
-
-
-def extract_cashflow_snapshot(fundamentals: dict):
-    """
-    Extrait un snapshot de cash-flow (dernier exercice annuel) : CFO, capex, FCF.
-    Retourne aussi l'année.
-
-    Conventions EODHD (glossaire Fundamentals):
-    - totalCashFromOperatingActivities, capitalExpenditures, freeCashFlow 
-    """
-    cf = fundamentals.get("Financials", {}).get("Cash_Flow", {}).get("yearly", {})
-    year, row = _extract_latest_year_row(cf)
-    if not row:
-        return year, {}
-
-    ocf = pick_first_non_null(
-        row,
-        [
-            "totalCashFromOperatingActivities",
-            "TotalCashFromOperatingActivities",
-            "NetCashProvidedByOperatingActivities",
-            "cashFromOperatingActivities",
-            "cfo",
-            "CFO",
-        ],
-    )
-    capex = pick_first_non_null(
-        row,
-        [
-            "capitalExpenditures",
-            "CapitalExpenditures",
-            "investmentsInPropertyPlantAndEquipment",
-            "InvestmentsInPropertyPlantAndEquipment",
-            "capex",
-            "CAPEX",
-        ],
-    )
-    fcf = pick_first_non_null(row, ["freeCashFlow", "FreeCashFlow", "fcf", "FCF"])
-
-    if fcf is None and ocf is not None and capex is not None:
-        fcf = ocf - capex
-
-    return year, {"cfo": ocf, "capex": capex, "fcf": fcf}
+    return year, snap
 
 
 def extract_income_snapshot(fundamentals: dict):
     """
-    Extrait un snapshot compte de résultat (dernier exercice annuel) avec des clés standardisées.
-    Inclut aussi les champs nécessaires au calcul d'une WACC (Rd via interestExpense, et ETR via pretax/tax).
-
-    Retourne (year, snapshot_dict)
-
-    Conventions EODHD (glossaire Fundamentals):
-    - totalRevenue, grossProfit, ebit, ebitda, netIncome
-    - interestExpense (ou variantes), incomeBeforeTax (pretax), incomeTaxExpense / taxProvision
+    Extrait un snapshot d'Income Statement (dernière année annuelle).
+    Renvoie (year, snapshot_dict).
     """
     inc = fundamentals.get("Financials", {}).get("Income_Statement", {}).get("yearly", {})
     year, row = _extract_latest_year_row(inc)
-    if not row or not isinstance(row, dict):
-        return year, {}
-
-    # Normalisation simple des clés -> permet de gérer les variations de casse/underscore
-    def _norm_key(k: str) -> str:
-        return "".join(ch.lower() for ch in str(k) if ch.isalnum())
-
-    normalized = {}
-    for k, v in row.items():
-        normalized[_norm_key(k)] = v
 
     def get_first(keys):
-        for k in keys:
-            v = normalized.get(_norm_key(k))
-            if v is None:
-                continue
-            try:
-                return float(v)
-            except Exception:
-                continue
-        return None
+        return pick_first_non_null(row, keys)
 
-    revenue = get_first(["totalRevenue", "revenue", "TotalRevenue", "Revenue", "SalesRevenueNet", "Sales"])
+    revenue = get_first(["totalRevenue", "TotalRevenue", "revenue", "Revenue", "SalesRevenueNet"])
     ebitda = get_first(["ebitda", "EBITDA", "Ebitda", "OperatingIncomeBeforeDepreciation"])
-    ebit = get_first(["ebit", "EBIT", "operatingIncome", "OperatingIncome", "OperatingIncomeLoss"])
-    net_income = get_first([
-        "netIncome",
-        "NetIncome",
-        "NetIncomeCommonStockholders",
-        "NetIncomeIncludingNoncontrollingInterests",
-    ])
+    ebit = get_first(["operatingIncome", "OperatingIncome", "OperatingIncomeLoss", "ebit", "EBIT"])
+    net_income = get_first(["netIncome", "NetIncome", "NetIncomeCommonStockholders"])
     gross_profit = get_first(["grossProfit", "GrossProfit", "gross_profit"])
 
     # Champs WACC / fiscalité
@@ -1942,24 +1584,27 @@ HEALTH_METRICS = [
     {"pillar": "Cash-flow", "key": "cfo_to_net_income", "label": "CFO / Net Income", "higher_better": True, "score_low": 0.80, "score_high": 1.50, "fmt": "x"},
     {"pillar": "Cash-flow", "key": "fcf_to_net_income", "label": "FCF / Net Income", "higher_better": True, "score_low": 0.60, "score_high": 1.20, "fmt": "x"},
     {"pillar": "Cash-flow", "key": "fcf_margin", "label": "FCF Margin", "higher_better": True, "score_low": 0.02, "score_high": 0.15, "fmt": "pct"},
-    {"pillar": "Cash-flow", "key": "capex_to_revenue", "label": "Capex / Revenue", "higher_better": False, "score_low": 0.02, "score_high": 0.15, "fmt": "pct"},
+    {"pillar": "Cash-flow", "key": "capex_to_revenue", "label": "Capex / Revenue", "higher_better": False, "score_low": 0.00, "score_high": 0.12, "fmt": "pct"},
 
-    # Historique
-    {"pillar": "Croissance", "key": "revenue_cagr_5y", "label": "Revenue CAGR (approx, 5y)", "higher_better": True, "score_low": 0.00, "score_high": 0.12, "fmt": "pct"},
+    # Croissance
+    {"pillar": "Croissance", "key": "revenue_cagr_5y", "label": "CAGR CA (5y)", "higher_better": True, "score_low": 0.00, "score_high": 0.12, "fmt": "pct"},
     {"pillar": "Croissance", "key": "fcf_negative_years_pct", "label": "% années FCF négatif (hist.)", "higher_better": False, "score_low": 0.00, "score_high": 0.50, "fmt": "pct"},
 ]
 
 
-def _format_metric_value(value, fmt):
-    if value is None:
+def _format_metric_value(val, fmt="num"):
+    if val is None:
         return None
     try:
-        x = float(value)
+        v = float(val)
     except Exception:
         return None
+
     if fmt == "pct":
-        return x * 100.0
-    return x
+        return f"{v*100:.1f} %"
+    if fmt == "x":
+        return f"{v:.2f}x"
+    return f"{v:.2f}"
 
 
 def build_health_table(company_ratios: dict, peer_distribution: dict | None = None) -> pd.DataFrame:
@@ -2811,165 +2456,392 @@ def default_target_multiples(profile: dict, base_metrics: dict):
     # -> On ancre sur le courant si exploitable, sinon on fallback sur une cible "absolue"
     # -----------------------------
     # PE
-    if safe_positive(pe_current):
-        targets["PE"] = clamp(pe_current * m["PE"], *pe_bounds)
+    if pe_current is not None and pe_current > 0:
+        pe_tgt = pe_current * m["PE"]
     else:
-        base_pe = 14 if tier in ("value", "low_quality") else 18
-        if tier in ("growth", "quality_growth"):
-            base_pe = 24 if software_like else 20
-        targets["PE"] = clamp(base_pe, *pe_bounds)
+        pe_tgt = 15 * m["PE"]
+    pe_tgt = clamp(pe_tgt, pe_bounds[0], pe_bounds[1])
+    targets["PE"] = pe_tgt
 
     # PB
-    if safe_positive(pb_current):
-        targets["PB"] = clamp(pb_current * m["PB"], *pb_bounds)
+    if pb_current is not None and pb_current > 0:
+        pb_tgt = pb_current * m["PB"]
     else:
-        base_pb = 1.2 if tier in ("value", "low_quality") else 1.8
-        if tier in ("growth", "quality_growth"):
-            base_pb = 4.5 if software_like else 2.5
-        targets["PB"] = clamp(base_pb, *pb_bounds)
+        pb_tgt = 2.0 * m["PB"]
+    pb_tgt = clamp(pb_tgt, pb_bounds[0], pb_bounds[1])
+    targets["PB"] = pb_tgt
 
     # EV/EBITDA
-    if safe_positive(ev_ebitda_current):
-        targets["EV_EBITDA"] = clamp(ev_ebitda_current * m["EV_EBITDA"], *ev_ebitda_bounds)
+    if ev_ebitda_current is not None and ev_ebitda_current > 0:
+        ebitda_tgt = ev_ebitda_current * m["EV_EBITDA"]
     else:
-        base = 9 if tier in ("value", "low_quality") else 12
-        if tier in ("growth", "quality_growth"):
-            base = 20 if software_like else 15
-        targets["EV_EBITDA"] = clamp(base, *ev_ebitda_bounds)
+        ebitda_tgt = 10 * m["EV_EBITDA"]
+    ebitda_tgt = clamp(ebitda_tgt, ev_ebitda_bounds[0], ev_ebitda_bounds[1])
+    targets["EV_EBITDA"] = ebitda_tgt
 
     # EV/EBIT
-    if safe_positive(ev_ebit_current):
-        targets["EV_EBIT"] = clamp(ev_ebit_current * m["EV_EBIT"], *ev_ebit_bounds)
+    if ev_ebit_current is not None and ev_ebit_current > 0:
+        ebit_tgt = ev_ebit_current * m["EV_EBIT"]
     else:
-        base = 11 if tier in ("value", "low_quality") else 14
-        if tier in ("growth", "quality_growth"):
-            base = 24 if software_like else 17
-        targets["EV_EBIT"] = clamp(base, *ev_ebit_bounds)
+        ebit_tgt = 12 * m["EV_EBIT"]
+    ebit_tgt = clamp(ebit_tgt, ev_ebit_bounds[0], ev_ebit_bounds[1])
+    targets["EV_EBIT"] = ebit_tgt
 
     # EV/Sales
-    if safe_positive(ev_sales_current):
-        targets["EV_SALES"] = clamp(ev_sales_current * m["EV_SALES"], *ev_sales_bounds)
+    if ev_sales_current is not None and ev_sales_current > 0:
+        ev_sales_tgt = ev_sales_current * m["EV_SALES"]
     else:
-        base = 1.4 if tier in ("value", "low_quality") else 2.0
-        if tier in ("growth", "quality_growth"):
-            base = 6.0 if software_like else 3.0
-        targets["EV_SALES"] = clamp(base, *ev_sales_bounds)
+        ev_sales_tgt = 2.0 * m["EV_SALES"]
+    ev_sales_tgt = clamp(ev_sales_tgt, ev_sales_bounds[0], ev_sales_bounds[1])
+    targets["EV_SALES"] = ev_sales_tgt
 
     return targets
 
 
+# =========================================
+# MÉTHODES DE VALORISATION VIA MULTIPLES
+# =========================================
 
-
-def compute_multiples_valuations(base_metrics: dict, net_debt, shares, targets: dict, base_financials: dict = None):
+def compute_multiples_valuations(base_metrics: dict, net_debt: float, shares: float, targets: dict, base_financials: dict):
     """
-    Calcule les fair values par méthode de multiples en utilisant les cibles.
-    Retourne un dict par méthode : multiple courant, multiple cible, fair value.
-
-    IMPORTANT :
-    - base_metrics = ratios déjà calculés (PE, EV/EBITDA, EV/Sales, PB...)
-    - base_financials = agrégats comptables bruts (revenue, ebitda, ebit, net_income, book_equity)
-      -> utilisé pour décider si un multiple est interprétable.
+    Calcule des fair values par action à partir des multiples cibles.
+    Renvoie un dict clé -> {target_multiple, fair_value, current_multiple}.
     """
+    results = {}
 
-    price = None
-    if base_metrics.get("market_cap") is not None and shares not in (None, 0):
-        price = base_metrics["market_cap"] / shares
-
-    # Agrégats : on prend en priorité base_metrics s'ils existent,
-    # sinon fallback sur base_financials (cas le plus fréquent chez toi)
-    base_financials = base_financials or {}
-
+    # P/E
     eps = base_metrics.get("eps")
+    pe_target = targets.get("PE")
+    fv_pe = pe_valuation(eps, pe_target)
+    results["PE"] = {
+        "current_multiple": base_metrics.get("pe"),
+        "target_multiple": pe_target,
+        "fair_value": fv_pe,
+    }
+
+    # P/B
     bvps = base_metrics.get("bvps")
+    pb_target = targets.get("PB")
+    fv_pb = pb_valuation(bvps, pb_target)
+    results["PB"] = {
+        "current_multiple": base_metrics.get("pb"),
+        "target_multiple": pb_target,
+        "fair_value": fv_pb,
+    }
 
-    revenue = base_metrics.get("revenue")
-    if revenue is None:
-        revenue = base_financials.get("revenue")
+    # EV/EBITDA
+    ebitda = base_financials.get("ebitda")
+    ev_ebitda_target = targets.get("EV_EBITDA")
+    fv_ev_ebitda = ev_ebitda_valuation(ebitda, net_debt, shares, ev_ebitda_target)
+    results["EV_EBITDA"] = {
+        "current_multiple": base_metrics.get("ev_ebitda"),
+        "target_multiple": ev_ebitda_target,
+        "fair_value": fv_ev_ebitda,
+    }
 
-    ebitda = base_metrics.get("ebitda")
-    if ebitda is None:
-        ebitda = base_financials.get("ebitda")
+    # EV/EBIT
+    ebit = base_financials.get("ebit")
+    ev_ebit_target = targets.get("EV_EBIT")
+    fv_ev_ebit = ev_ebit_valuation(ebit, net_debt, shares, ev_ebit_target)
+    results["EV_EBIT"] = {
+        "current_multiple": base_metrics.get("ev_ebit"),
+        "target_multiple": ev_ebit_target,
+        "fair_value": fv_ev_ebit,
+    }
 
+    # EV/Sales
+    revenue = base_financials.get("revenue")
+    ev_sales_target = targets.get("EV_SALES")
+    fv_ev_sales = ev_sales_valuation(revenue, net_debt, shares, ev_sales_target)
+    results["EV_SALES"] = {
+        "current_multiple": base_metrics.get("ev_sales"),
+        "target_multiple": ev_sales_target,
+        "fair_value": fv_ev_sales,
+    }
+
+    return results
+
+
+# =========================================
+# PROFIL DE QUALITÉ
+# =========================================
+
+def compute_quality_profile(company: dict, base_metrics: dict, hist_df: pd.DataFrame):
+    """
+    Identifie un style de qualité / croissance / value avec heuristiques simples.
+    Renvoie un dict {style, quality, growth, sector}.
+    """
+    style = "Core"
+    quality = "Normal"
+    growth = "Normal"
+
+    # heuristiques très simples
+    pe = base_metrics.get("pe")
+    ev_ebitda = base_metrics.get("ev_ebitda")
+    rev_cagr = compute_revenue_cagr(hist_df)
+
+    if pe is not None and pe > 30:
+        style = "Growth"
+    elif pe is not None and pe < 15:
+        style = "Value"
+
+    if ev_ebitda is not None and ev_ebitda < 8:
+        style = "Value"
+
+    if rev_cagr is not None and rev_cagr > 0.10:
+        growth = "High"
+    elif rev_cagr is not None and rev_cagr < 0.02:
+        growth = "Low"
+
+    # Qualité approximée : si marge EBIT élevée et ROE élevé
+    # On réutilise base_metrics (approx)
     ebit = base_metrics.get("ebit")
-    if ebit is None:
-        ebit = base_financials.get("ebit")
+    revenue = base_metrics.get("revenue")
+    net_income = base_metrics.get("net_income")
+    book_equity = base_metrics.get("book_equity")
 
-    current = {
-        "PE": base_metrics.get("pe"),
-        "EV_EBITDA": base_metrics.get("ev_ebitda"),
-        "EV_EBIT": base_metrics.get("ev_ebit"),
-        "EV_SALES": base_metrics.get("ev_sales"),
-        "PB": base_metrics.get("pb"),
+    ebit_margin = (ebit / revenue) if (ebit not in (None, 0) and revenue not in (None, 0)) else None
+    roe = (net_income / book_equity) if (net_income not in (None, 0) and book_equity not in (None, 0)) else None
+
+    if ebit_margin is not None and roe is not None:
+        if ebit_margin > 0.15 and roe > 0.15:
+            quality = "High"
+        elif ebit_margin < 0.05 or roe < 0.05:
+            quality = "Low"
+
+    sector = company.get("Sector")
+
+    return {
+        "style": style,
+        "quality": quality,
+        "growth": growth,
+        "sector": sector,
     }
 
-    # Nettoyage marché : on désactive uniquement les méthodes réellement non interprétables
-    targets_clean = dict(targets or {})
 
-    # PE : EPS doit être > 0
-    if eps is None or eps <= 0:
-        targets_clean["PE"] = None
+# =========================================
+# DÉTERMINATION DU PROFIL & DES MULTIPLES
+# =========================================
 
-    # PB : BVPS doit être > 0
-    if bvps is None or bvps <= 0:
-        targets_clean["PB"] = None
+def assign_profile_tags(company: dict, base_metrics: dict, hist_df: pd.DataFrame):
+    """
+    Ajoute un mini-profil "style" / "quality" / "growth" au profil existant.
+    """
+    profile = compute_quality_profile(company, base_metrics, hist_df)
+    return profile
 
-    # EV/EBITDA : EBITDA doit être > 0
-    if ebitda is None or ebitda <= 0:
-        targets_clean["EV_EBITDA"] = None
 
-    # EV/EBIT : EBIT doit être > 0
-    if ebit is None or ebit <= 0:
-        targets_clean["EV_EBIT"] = None
+def get_profile_with_tags(company: dict, base_metrics: dict, hist_df: pd.DataFrame):
+    """
+    Combine le profil "cap_size" + tags qualitatifs.
+    """
+    base_profile = classify_company_profile(company, base_metrics, hist_df)
+    tags = assign_profile_tags(company, base_metrics, hist_df)
+    base_profile.update(tags)
+    return base_profile
 
-    # EV/Sales : Revenue doit être > 0
-    if revenue is None or revenue <= 0:
-        targets_clean["EV_SALES"] = None
 
-    # Valorisations
-    fair_pe = pe_valuation(eps, targets_clean.get("PE"))
-    fair_pb = pb_valuation(bvps, targets_clean.get("PB"))
+# =========================================
+# PETIT HELPER : safe divide
+# =========================================
 
-    fair_ev_ebitda = ev_ebitda_valuation(
-        ebitda, net_debt, shares, targets_clean.get("EV_EBITDA")
-    )
-    fair_ev_ebit = ev_ebit_valuation(
-        ebit, net_debt, shares, targets_clean.get("EV_EBIT")
-    )
-    fair_ev_sales = ev_sales_valuation(
-        revenue, net_debt, shares, targets_clean.get("EV_SALES")
-    )
+def safe_div(a, b):
+    if a is None or b in (None, 0):
+        return None
+    try:
+        return a / b
+    except Exception:
+        return None
 
-    valuations = {
-        "PE": {
-            "current_multiple": current["PE"],
-            "target_multiple": targets_clean.get("PE"),
-            "fair_value": fair_pe,
-        },
-        "PB": {
-            "current_multiple": current["PB"],
-            "target_multiple": targets_clean.get("PB"),
-            "fair_value": fair_pb,
-        },
-        "EV_EBITDA": {
-            "current_multiple": current["EV_EBITDA"],
-            "target_multiple": targets_clean.get("EV_EBITDA"),
-            "fair_value": fair_ev_ebitda,
-        },
-        "EV_EBIT": {
-            "current_multiple": current["EV_EBIT"],
-            "target_multiple": targets_clean.get("EV_EBIT"),
-            "fair_value": fair_ev_ebit,
-        },
-        "EV_SALES": {
-            "current_multiple": current["EV_SALES"],
-            "target_multiple": targets_clean.get("EV_SALES"),
-            "fair_value": fair_ev_sales,
-        },
+
+# =========================================
+# API CACHING
+# =========================================
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_fundamentals_cached(ticker: str, api_key: str):
+    return fetch_fundamentals(ticker, api_key)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_eod_price_cached(ticker: str, api_key: str):
+    return fetch_eod_price(ticker, api_key)
+
+
+# =========================================
+# EXTRACTION SNAPSHOT CASH FLOW
+# =========================================
+
+def extract_cashflow_snapshot(fundamentals: dict):
+    """
+    Extrait un snapshot de cash-flow (dernier exercice annuel) : CFO, capex, FCF.
+    """
+    cf = fundamentals.get("Financials", {}).get("Cash_Flow", {}).get("yearly", {})
+    year, row = _extract_latest_year_row(cf)
+
+    def get_first(keys):
+        return pick_first_non_null(row, keys)
+
+    cfo = get_first([
+        "totalCashFromOperatingActivities",
+        "TotalCashFromOperatingActivities",
+        "NetCashProvidedByOperatingActivities",
+        "NetCashFromOperatingActivities",
+        "OperatingCashFlow",
+    ])
+    capex = get_first([
+        "capitalExpenditures",
+        "CapitalExpenditures",
+        "investmentsInPropertyPlantAndEquipment",
+        "InvestmentsInPropertyPlantAndEquipment",
+    ])
+    fcf = pick_first_non_null(row, ["freeCashFlow", "FreeCashFlow", "fcf", "FCF"])
+
+    if fcf is None and (cfo is not None and capex is not None):
+        fcf = cfo - capex
+
+    snap = {
+        "cfo": cfo,
+        "capex": capex,
+        "fcf": fcf,
     }
+    return year, snap
 
-    return valuations
+
+# =========================================
+# CALCUL D'UN FCF "NORMALISÉ"
+# =========================================
+
+def estimate_normalized_fcf_v2(hist_df: pd.DataFrame):
+    """
+    Variante plus robuste (optionnelle) :
+    - médiane des FCF positifs sur 3-5 ans
+    """
+    if hist_df is None or hist_df.empty:
+        return None
+    if "FCF (approx)" not in hist_df.columns:
+        return None
+
+    s = hist_df["FCF (approx)"].dropna()
+    s = s[s > 0]
+    if len(s) == 0:
+        return None
+
+    # médiane des 3-5 dernières années positives
+    s = s.tail(5)
+    return float(np.median(s))
 
 
+# =========================================
+# PROJECTION FCF & DCF
+# =========================================
+
+def project_fcf_linear(fcf_start: float, growth_start: float, growth_end: float, years: int):
+    """
+    Projette un FCF avec un taux de croissance linéairement décroissant de growth_start à growth_end.
+    Renvoie la liste FCF1...FCFn.
+    """
+    if years <= 0:
+        return []
+
+    growths = np.linspace(growth_start, growth_end, years)
+    fcf = fcf_start
+    projected = []
+    for g in growths:
+        fcf *= (1 + g)
+        projected.append(fcf)
+    return projected
+
+
+# =========================================
+# DCF & SENSIBILITÉS
+# =========================================
+
+def dcf_with_linear_growth(
+    fcf_start: float,
+    growth_fcf: float,
+    g_terminal: float,
+    years: int,
+    wacc: float,
+    net_debt: float,
+    shares: float,
+):
+    """
+    DCF avec croissance qui se réduit linéairement de growth_fcf à g_terminal.
+    """
+    if shares in (None, 0) or fcf_start is None:
+        return None, None, None, None, None
+
+    projected_fcfs = project_fcf_linear(fcf_start, growth_fcf, g_terminal, years)
+    discounted_fcfs, sum_discounted_fcfs = discount_cash_flows(projected_fcfs, wacc)
+
+    tv = terminal_value(projected_fcfs[-1], wacc, g_terminal)
+    if tv is None:
+        return None, None, None, None, None
+
+    tv_discounted = tv / ((1 + wacc) ** years)
+    ev = sum_discounted_fcfs + tv_discounted
+    equity_value = ev - (net_debt or 0)
+    fair_value_per_share = equity_value / shares
+
+    return fair_value_per_share, ev, equity_value, tv_discounted, sum_discounted_fcfs
+
+
+def build_sensitivity_matrix_linear(
+    fcf_start: float,
+    growth_fcf: float,
+    g_terminal: float,
+    years: int,
+    base_wacc: float,
+    net_debt: float,
+    shares: float,
+):
+    """
+    Matrice de sensibilité WACC/g pour DCF linéaire.
+    """
+    wacc_values = sorted(
+        {
+            max(0.01, base_wacc - 0.01),
+            max(0.01, base_wacc - 0.005),
+            base_wacc,
+            base_wacc + 0.005,
+            base_wacc + 0.01,
+        }
+    )
+    g_values = sorted(
+        {
+            max(0.0, g_terminal - 0.005),
+            g_terminal,
+            g_terminal + 0.005,
+        }
+    )
+
+    g_values = [g for g in g_values if g < max(wacc_values)]
+
+    data = {}
+    for g in g_values:
+        row = []
+        for w in wacc_values:
+            fv, _, _, _, _ = dcf_with_linear_growth(
+                fcf_start=fcf_start,
+                growth_fcf=growth_fcf,
+                g_terminal=g,
+                years=years,
+                wacc=w,
+                net_debt=net_debt,
+                shares=shares,
+            )
+            row.append(fv if fv is not None else float("nan"))
+        data[f"g = {g*100:.2f} %"] = row
+
+    index_labels = [f"WACC = {w*100:.2f} %" for w in wacc_values]
+    df_matrix = pd.DataFrame(data, index=index_labels)
+    return df_matrix
+
+
+# =========================================
+# DÉTERMINATION DE LA JUSTE VALEUR GLOBALE
+# =========================================
 
 def combine_global_valuation(dcf_value: float, multiples_vals: dict, weights: dict, price: float):
     """
