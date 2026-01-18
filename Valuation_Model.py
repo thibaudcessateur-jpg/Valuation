@@ -3174,6 +3174,7 @@ def analyze_company(
                 shares = None
     net_debt = get_net_debt(fundamentals)
     hist_df = build_historical_table(fundamentals, max_years=5)
+    hist_df_10 = build_historical_table(fundamentals, max_years=10)
     currency_code = get_currency_code(fundamentals)
 
     # =========================
@@ -3498,6 +3499,7 @@ def analyze_company(
         "shares": shares,
         "net_debt": net_debt,
         "hist_df": hist_df,
+        "hist_df_10": hist_df_10,
         "health": {
             "bs_year": bs_year,
             "is_year": is_year,
@@ -3600,8 +3602,8 @@ def main():
 
     use_auto_wacc = st.sidebar.checkbox("Activer WACC auto", value=True)
 
-    def render_wacc_manual_inputs():
-        return st.sidebar.number_input(
+    def render_wacc_manual_inputs(container=st.sidebar):
+        return container.number_input(
             "WACC manuelle (%)",
             min_value=3.0,
             max_value=15.0,
@@ -3609,15 +3611,15 @@ def main():
             step=0.1,
         )
 
-    def render_wacc_auto_inputs():
-        erp_us = st.sidebar.number_input(
+    def render_wacc_auto_inputs(container=st.sidebar):
+        erp_us = container.number_input(
             "Equity Risk Premium US (%)",
             min_value=0.0,
             max_value=15.0,
             value=4.3,
             step=0.1,
         )
-        erp_eur = st.sidebar.number_input(
+        erp_eur = container.number_input(
             "Equity Risk Premium EUR (%)",
             min_value=0.0,
             max_value=15.0,
@@ -3625,14 +3627,14 @@ def main():
             step=0.1,
         )
 
-        col1, col2 = st.sidebar.columns(2)
+        col1, col2 = container.columns(2)
         with col1:
-            override_beta = st.checkbox("Override Beta", value=False)
+            override_beta = col1.checkbox("Override Beta", value=False)
         with col2:
-            override_rd = st.checkbox("Override Rd", value=False)
+            override_rd = col2.checkbox("Override Rd", value=False)
 
-        beta_blend = st.sidebar.checkbox("Beta blend (EODHD + sector)", value=True)
-        beta_sector_override = st.sidebar.number_input(
+        beta_blend = container.checkbox("Beta blend (EODHD + sector)", value=True)
+        beta_sector_override = container.number_input(
             "Beta sectoriel (optionnel)",
             min_value=0.0,
             max_value=3.0,
@@ -3642,7 +3644,7 @@ def main():
 
         beta_override = None
         if override_beta:
-            beta_override = st.sidebar.number_input(
+            beta_override = container.number_input(
                 "Beta override",
                 min_value=0.0,
                 max_value=5.0,
@@ -3652,7 +3654,7 @@ def main():
 
         rd_override_pct = None
         if override_rd:
-            rd_override_pct = st.sidebar.number_input(
+            rd_override_pct = container.number_input(
                 "Rd override (%)",
                 min_value=0.0,
                 max_value=25.0,
@@ -3660,10 +3662,10 @@ def main():
                 step=0.1,
             )
 
-        override_tax = st.sidebar.checkbox("Override Tax rate", value=False)
+        override_tax = container.checkbox("Override Tax rate", value=False)
         tax_override_pct = None
         if override_tax:
-            tax_override_pct = st.sidebar.number_input(
+            tax_override_pct = container.number_input(
                 "Tax rate override (%)",
                 min_value=0.0,
                 max_value=45.0,
@@ -3671,11 +3673,11 @@ def main():
                 step=0.5,
             )
 
-        allow_heuristic_rd = st.sidebar.checkbox(
+        allow_heuristic_rd = container.checkbox(
             "Autoriser estimation Rd si interestExpense manquant",
             value=True,
         )
-        allow_tax_fallback = st.sidebar.checkbox("Autoriser fallback tax par zone", value=True)
+        allow_tax_fallback = container.checkbox("Autoriser fallback tax par zone", value=True)
 
         return {
             "erp_us": erp_us,
@@ -3707,34 +3709,34 @@ def main():
     allow_tax_fallback = True
 
     if not use_auto_wacc:
-        wacc_input = render_wacc_manual_inputs()
+        wacc_input = render_wacc_manual_inputs(st.sidebar)
 
-    def render_dcf_advanced_inputs():
-        growth_fcf_input = st.sidebar.number_input(
-            "Plafond de croissance (utilisé seulement comme limite) (%)",
+    def render_dcf_advanced_inputs(container=st.sidebar):
+        growth_fcf_input = container.number_input(
+            "Plafond de croissance (utilisé comme limite) (%)",
             min_value=-1.5,
             max_value=4.0,
             value=3.0,
             step=0.1,
         )
-        allow_negative_fcf = st.sidebar.checkbox("Autoriser DCF si FCF négatif", value=False)
+        allow_negative_fcf = container.checkbox("Autoriser DCF si FCF négatif", value=False)
         return {
             "growth_fcf_input": growth_fcf_input,
             "allow_negative_fcf": allow_negative_fcf,
         }
 
-    def render_terminal_inputs():
-        exit_method = st.sidebar.selectbox(
+    def render_terminal_inputs(container=st.sidebar):
+        exit_method = container.selectbox(
             "Méthode de valeur terminale",
             ["Gordon", "Exit multiple", "Moyenne des deux"],
             index=0,
         )
-        exit_multiple_type = st.sidebar.selectbox(
+        exit_multiple_type = container.selectbox(
             "Exit multiple type",
             ["EV/FCF", "EV/EBITDA"],
             index=0,
         )
-        exit_multiple_value = st.sidebar.number_input(
+        exit_multiple_value = container.number_input(
             "Exit multiple (0 = désactivé)",
             min_value=0.0,
             max_value=50.0,
@@ -3775,9 +3777,10 @@ def main():
         )
 
     if mode_ui == "Simple":
-        with st.sidebar.expander("Options avancées (DCF/WACC)", expanded=False):
+        adv = st.sidebar.expander("🧰 Options avancées (DCF/WACC)", expanded=False)
+        with adv:
             if use_auto_wacc:
-                auto_inputs = render_wacc_auto_inputs()
+                auto_inputs = render_wacc_auto_inputs(container=adv)
                 erp_us = auto_inputs["erp_us"]
                 erp_eur = auto_inputs["erp_eur"]
                 override_beta = auto_inputs["override_beta"]
@@ -3790,18 +3793,21 @@ def main():
                 tax_override_pct = auto_inputs["tax_override_pct"]
                 allow_heuristic_rd = auto_inputs["allow_heuristic_rd"]
                 allow_tax_fallback = auto_inputs["allow_tax_fallback"]
+            else:
+                adv.info("WACC auto désactivée : aucun paramètre avancé à afficher.")
             if prudence_hist:
-                dcf_adv = render_dcf_advanced_inputs()
+                dcf_adv = render_dcf_advanced_inputs(container=adv)
                 growth_fcf_input = dcf_adv["growth_fcf_input"]
                 allow_negative_fcf = dcf_adv["allow_negative_fcf"]
-            term_inputs = render_terminal_inputs()
+            term_inputs = render_terminal_inputs(container=adv)
             exit_method = term_inputs["exit_method"]
             exit_multiple_type = term_inputs["exit_multiple_type"]
             exit_multiple_value = term_inputs["exit_multiple_value"]
     else:
-        with st.sidebar.expander("WACC auto – Avancé", expanded=True):
+        wacc_adv = st.sidebar.expander("WACC auto – Avancé", expanded=True)
+        with wacc_adv:
             if use_auto_wacc:
-                auto_inputs = render_wacc_auto_inputs()
+                auto_inputs = render_wacc_auto_inputs(container=wacc_adv)
                 erp_us = auto_inputs["erp_us"]
                 erp_eur = auto_inputs["erp_eur"]
                 override_beta = auto_inputs["override_beta"]
@@ -3814,13 +3820,19 @@ def main():
                 tax_override_pct = auto_inputs["tax_override_pct"]
                 allow_heuristic_rd = auto_inputs["allow_heuristic_rd"]
                 allow_tax_fallback = auto_inputs["allow_tax_fallback"]
-        with st.sidebar.expander("DCF – Avancé", expanded=True):
+            else:
+                wacc_adv.info("WACC auto désactivée : paramètres avancés masqués.")
+        dcf_adv_container = st.sidebar.expander("DCF – Avancé", expanded=True)
+        with dcf_adv_container:
             if prudence_hist:
-                dcf_adv = render_dcf_advanced_inputs()
+                dcf_adv = render_dcf_advanced_inputs(container=dcf_adv_container)
                 growth_fcf_input = dcf_adv["growth_fcf_input"]
                 allow_negative_fcf = dcf_adv["allow_negative_fcf"]
-        with st.sidebar.expander("Terminal value / Exit multiple – Avancé", expanded=True):
-            term_inputs = render_terminal_inputs()
+            else:
+                dcf_adv_container.info("Croissance directe utilisée : paramètres avancés limités.")
+        term_adv = st.sidebar.expander("Terminal value / Exit multiple – Avancé", expanded=True)
+        with term_adv:
+            term_inputs = render_terminal_inputs(container=term_adv)
             exit_method = term_inputs["exit_method"]
             exit_multiple_type = term_inputs["exit_multiple_type"]
             exit_multiple_value = term_inputs["exit_multiple_value"]
@@ -3980,6 +3992,73 @@ def main():
         else:
             st.caption("Scoring basé sur des seuils génériques (aucun benchmark comparables/secteur fourni).")
 
+        hist_df_10 = result.get("hist_df_10")
+        hist_df_5 = result.get("hist_df")
+        st.markdown("#### 📈 Évolution (10 ans)")
+        df_trend_source = hist_df_10 if hist_df_10 is not None and not hist_df_10.empty else hist_df_5
+        if df_trend_source is None or df_trend_source.empty:
+            st.info("Historique long indisponible (données EODHD limitées).")
+        else:
+            df_10 = df_trend_source.copy()
+            df_10["Année"] = pd.to_numeric(df_10["Année"], errors="coerce")
+            df_10 = df_10.dropna(subset=["Année"]).sort_values("Année")
+
+            def compute_cagr_from_series(series, years):
+                values = series.dropna()
+                if values.shape[0] < 2:
+                    return None
+                start = values.iloc[0]
+                end = values.iloc[-1]
+                span = int(years.iloc[-1] - years.iloc[0]) if years is not None else values.shape[0] - 1
+                if span <= 0 or start in (None, 0) or end in (None, 0):
+                    return None
+                try:
+                    return (end / start) ** (1 / span) - 1
+                except Exception:
+                    return None
+
+            years_series = df_10["Année"]
+            revenue_cagr_10 = compute_cagr_from_series(df_10["Chiffre d'affaires"], years_series)
+            fcf_cagr_10 = compute_cagr_from_series(df_10["FCF (approx)"], years_series)
+            fcf_values = df_10["FCF (approx)"].dropna()
+            fcf_mean = fcf_values.mean() if not fcf_values.empty else None
+            fcf_std = fcf_values.std() if not fcf_values.empty else None
+            fcf_cv = (fcf_std / abs(fcf_mean)) if fcf_mean not in (None, 0) and fcf_std is not None else None
+
+            years_label = "10 ans" if hist_df_10 is not None and not hist_df_10.empty else "5 ans"
+            col_trend1, col_trend2, col_trend3 = st.columns(3)
+            with col_trend1:
+                st.metric(f"CAGR CA ({years_label})", safe_metric(revenue_cagr_10 * 100 if revenue_cagr_10 is not None else None, "{:.1f}"))
+            with col_trend2:
+                st.metric(f"CAGR FCF ({years_label})", safe_metric(fcf_cagr_10 * 100 if fcf_cagr_10 is not None else None, "{:.1f}"))
+            with col_trend3:
+                st.metric("Volatilité FCF (CV)", safe_metric(fcf_cv, "{:.2f}"))
+
+            if fcf_cv is not None and fcf_cv > 1.0:
+                st.warning("FCF très volatil : écart-type élevé vs moyenne (CV > 1).")
+
+            if hist_df_10 is None or hist_df_10.empty:
+                st.info("Graphiques 10 ans indisponibles (données limitées).")
+            else:
+                chart_df = df_10.set_index("Année")
+                cols = st.columns(2)
+                with cols[0]:
+                    st.markdown("**Chiffre d'affaires**")
+                    st.line_chart(chart_df["Chiffre d'affaires"])
+                with cols[1]:
+                    st.markdown("**Résultat net**")
+                    st.line_chart(chart_df["Résultat net"])
+
+                cols = st.columns(2)
+                with cols[0]:
+                    st.markdown("**FCF (approx)**")
+                    st.line_chart(chart_df["FCF (approx)"])
+                with cols[1]:
+                    if "EBIT" in chart_df.columns and "Chiffre d'affaires" in chart_df.columns:
+                        margin = (chart_df["EBIT"] / chart_df["Chiffre d'affaires"]) * 100
+                        st.markdown("**Marge EBIT (%)**")
+                        st.line_chart(margin)
+
         if health_df_raw is None or health_df_raw.empty:
             st.warning("Aucun ratio exploitable n'a pu être calculé avec les données disponibles.")
         else:
@@ -4055,10 +4134,13 @@ def main():
                 explanations = []
                 for warning in warnings:
                     if "TV > 80% de l'EV" in warning:
-                        explanations.append(
-                            "TV > 80% de l'EV : la majorité de la valeur vient de la valeur terminale, "
-                            "donc la valorisation est très sensible à WACC et g."
-                        )
+                        if simple_mode:
+                            explanations.append(">80% de la valeur vient de la TV ⇒ forte sensibilité à WACC et g.")
+                        else:
+                            explanations.append(
+                                "TV > 80% de l'EV : la majorité de la valeur vient de la valeur terminale, "
+                                "donc la valorisation est très sensible à WACC et g."
+                            )
                     if "EV/FCF terminal implicite > 25x" in warning:
                         if simple_mode:
                             explanations.append(
@@ -4081,21 +4163,27 @@ def main():
 
             if mode_ui == "Simple":
                 st.markdown("#### Résumé DCF (mode simple)")
-                col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+                price = result.get("price")
+                upside_pct = dcf.get("upside_pct")
+
+                col_s1, col_s2, col_s3 = st.columns(3)
                 with col_s1:
                     st.metric("Verdict", verdict)
+                    st.caption(f"MOS : {safe_metric(mos * 100 if mos is not None else None, '{:.1f}', 'N/A')} %")
                 with col_s2:
-                    st.metric("MOS", safe_metric(mos * 100 if mos is not None else None, "{:.1f}", "N/A"))
-                with col_s3:
                     st.metric("DCF (WACC base)", format_large_number(fv_base))
+                with col_s3:
+                    st.metric("Prix actuel", safe_metric(price, "{:.2f}"))
+                    st.caption(f"Upside/Downside : {safe_metric(upside_pct, '{:.1f}', 'N/A')} %")
+
+                col_s4, col_s5, col_s6 = st.columns(3)
                 with col_s4:
                     st.metric("DCF (WACC +1.0%)", format_large_number(fv_low))
-
-                col_s5, col_s6 = st.columns(2)
                 with col_s5:
-                    st.metric("DCF (WACC -0.5%)", format_large_number(fv_high))
+                    st.metric("DCF (WACC base)", format_large_number(fv_base))
                 with col_s6:
-                    st.empty()
+                    st.metric("DCF (WACC -0.5%)", format_large_number(fv_high))
+                st.caption("Bornes = sensibilité WACC : +1.0% (prudente) / -0.5% (optimiste).")
 
                 important_warnings = []
                 if any("TV > 80% de l'EV" in w for w in dcf_warnings):
@@ -4117,8 +4205,7 @@ def main():
                         st.info("Explications :\n- " + "\n- ".join(explanations))
 
                 with st.expander("Détails"):
-                    st.markdown("#### Hypothèses retenues (base case)")
-                    st.write(f"- Horizon de projection : **{years} ans**")
+                    st.markdown("#### Hypothèses utilisées")
                     st.write(
                         f"- WACC utilisée : **{format_float(dcf.get('wacc_used_pct', wacc_input), 2)} %** "
                         f"({dcf.get('wacc_source', 'manual')})"
@@ -4129,17 +4216,12 @@ def main():
                     st.write(
                         f"- g terminal utilisé : **{safe_metric(g_terminal_used * 100 if g_terminal_used is not None else None, '{:.2f}')} %**"
                     )
-                    if not prudence_hist:
-                        st.write(
-                            f"- Croissance input : **{safe_metric(g_input * 100 if g_input is not None else None, '{:.2f}')} %**"
-                        )
-                    with st.expander("Voir growth curve", expanded=False):
-                        st.write(
-                            f"- Croissance par année : {', '.join([f'{g*100:.2f}%' for g in growth_curve])}"
-                        )
+                    st.write(f"- FCF de départ : **{format_large_number(fcf_start)}**")
+                    st.write(f"- Dette nette : **{format_large_number(net_debt)}**")
                     if dcf_warnings:
-                        st.warning("Avertissements DCF :\n- " + "\n- ".join(map(str, dcf_warnings)))
-                    explanations = warning_explanations(dcf_warnings, simple_mode=True)
+                        top_warnings = dcf_warnings[:2]
+                        st.warning("Avertissements DCF :\n- " + "\n- ".join(map(str, top_warnings)))
+                    explanations = warning_explanations(dcf_warnings[:2], simple_mode=True)
                     if explanations:
                         st.info("Explications :\n- " + "\n- ".join(explanations))
             else:
@@ -4217,30 +4299,31 @@ def main():
                     if rd_det and rd_det.get("warnings"):
                         st.info("Rd (détails) :\n- " + "\n- ".join(map(str, rd_det.get("warnings"))))
 
-            with st.expander("Détails DCF (audit trail)"):
-                audit = result.get("dcf_audit", {})
-                fcf_details = dcf.get("fcf_details") or {}
-                st.write(f"- FCF_start : **{format_large_number(fcf_start)}** ({fcf_details.get('method')})")
-                if fcf_details:
-                    st.write(f"  - Années utilisées : {', '.join(map(str, fcf_details.get('years_used', [])))}")
-                    st.write(f"  - Valeurs brutes : {', '.join([format_large_number(v) for v in fcf_details.get('raw_values', [])])}")
-                    st.write(f"  - Valeurs utilisées : {', '.join([format_large_number(v) for v in fcf_details.get('used_values', [])])}")
-                st.write(f"- CAGR FCF hist. : **{safe_metric(audit.get('cagr_fcf_hist'), '{:.2%}')}**")
-                if audit.get("cagr_reason"):
-                    st.write(f"  - Raison : {audit.get('cagr_reason')}")
-                st.write(f"- g input : **{safe_metric(audit.get('g_input') * 100 if audit.get('g_input') is not None else None, '{:.2f}')} %**")
-                st.write(f"- g1 used : **{safe_metric(audit.get('g1_used') * 100 if audit.get('g1_used') is not None else None, '{:.2f}')} %**")
-                st.write(f"- prudence_hist : **{audit.get('prudence_hist')}**")
-                st.write(f"- règle appliquée : **{audit.get('g1_rule')}**")
-                st.write(f"- g terminal used : **{safe_metric(audit.get('g_terminal_used') * 100 if audit.get('g_terminal_used') is not None else None, '{:.2f}')} %**")
-                growth_list = audit.get("growth_curve", [])
-                st.write(f"- Croissance par année : {', '.join([f'{g*100:.2f}%' for g in growth_list])}")
-                st.write(f"- TV weight : **{safe_metric(audit.get('tv_weight') * 100 if audit.get('tv_weight') is not None else None, '{:.1f}')} %**")
-                st.write(f"- EV/FCF terminal implicite : **{safe_metric(audit.get('implied_ev_fcf_terminal'), '{:.1f}')}x**")
-                if audit.get("warnings"):
-                    st.write("Avertissements : " + "; ".join(audit.get("warnings")))
-                if audit.get("missing"):
-                    st.write("Donnée manquante : " + ", ".join(audit.get("missing")))
+            if mode_ui != "Simple":
+                with st.expander("Détails DCF (audit trail)"):
+                    audit = result.get("dcf_audit", {})
+                    fcf_details = dcf.get("fcf_details") or {}
+                    st.write(f"- FCF_start : **{format_large_number(fcf_start)}** ({fcf_details.get('method')})")
+                    if fcf_details:
+                        st.write(f"  - Années utilisées : {', '.join(map(str, fcf_details.get('years_used', [])))}")
+                        st.write(f"  - Valeurs brutes : {', '.join([format_large_number(v) for v in fcf_details.get('raw_values', [])])}")
+                        st.write(f"  - Valeurs utilisées : {', '.join([format_large_number(v) for v in fcf_details.get('used_values', [])])}")
+                    st.write(f"- CAGR FCF hist. : **{safe_metric(audit.get('cagr_fcf_hist'), '{:.2%}')}**")
+                    if audit.get("cagr_reason"):
+                        st.write(f"  - Raison : {audit.get('cagr_reason')}")
+                    st.write(f"- g input : **{safe_metric(audit.get('g_input') * 100 if audit.get('g_input') is not None else None, '{:.2f}')} %**")
+                    st.write(f"- g1 used : **{safe_metric(audit.get('g1_used') * 100 if audit.get('g1_used') is not None else None, '{:.2f}')} %**")
+                    st.write(f"- prudence_hist : **{audit.get('prudence_hist')}**")
+                    st.write(f"- règle appliquée : **{audit.get('g1_rule')}**")
+                    st.write(f"- g terminal used : **{safe_metric(audit.get('g_terminal_used') * 100 if audit.get('g_terminal_used') is not None else None, '{:.2f}')} %**")
+                    growth_list = audit.get("growth_curve", [])
+                    st.write(f"- Croissance par année : {', '.join([f'{g*100:.2f}%' for g in growth_list])}")
+                    st.write(f"- TV weight : **{safe_metric(audit.get('tv_weight') * 100 if audit.get('tv_weight') is not None else None, '{:.1f}')} %**")
+                    st.write(f"- EV/FCF terminal implicite : **{safe_metric(audit.get('implied_ev_fcf_terminal'), '{:.1f}')}x**")
+                    if audit.get("warnings"):
+                        st.write("Avertissements : " + "; ".join(audit.get("warnings")))
+                    if audit.get("missing"):
+                        st.write("Donnée manquante : " + ", ".join(audit.get("missing")))
 
             st.info(
                 "Ce résumé présente le scénario central (base case). "
