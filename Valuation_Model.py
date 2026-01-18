@@ -3582,6 +3582,8 @@ def main():
     # Sidebar
     st.sidebar.header("⚙️ Paramètres généraux")
 
+    mode_ui = st.sidebar.radio("Mode d'affichage", ["Simple", "Avancé"], index=0)
+
     api_key = get_api_key()
 
     query = st.sidebar.text_input(
@@ -3599,88 +3601,227 @@ def main():
         value=5,
         step=1,
     )
-        # WACC manuelle (fallback ou mode manuel)
-    wacc_input = st.sidebar.number_input(
-        "WACC manuelle (%)",
-        min_value=3.0,
-        max_value=15.0,
-        value=6.8,
-        step=0.1,
-    )
 
-    st.sidebar.markdown("### WACC automatique (EODHD)")
     use_auto_wacc = st.sidebar.checkbox("Activer WACC auto", value=True)
 
-    # ERP par zone (en %)
-    erp_us = st.sidebar.number_input("Equity Risk Premium US (%)", min_value=0.0, max_value=15.0, value=4.3, step=0.1)
-    erp_eur = st.sidebar.number_input("Equity Risk Premium EUR (%)", min_value=0.0, max_value=15.0, value=5.5, step=0.1)
+    def render_wacc_manual_inputs():
+        return st.sidebar.number_input(
+            "WACC manuelle (%)",
+            min_value=3.0,
+            max_value=15.0,
+            value=6.8,
+            step=0.1,
+        )
 
-    # Overrides optionnels
-    col1, col2 = st.sidebar.columns(2)
-    with col1:
-        override_beta = st.checkbox("Override Beta", value=False)
-    with col2:
-        override_rd = st.checkbox("Override Rd", value=False)
+    def render_wacc_auto_inputs():
+        st.sidebar.markdown("### WACC automatique (EODHD)")
+        erp_us = st.sidebar.number_input(
+            "Equity Risk Premium US (%)",
+            min_value=0.0,
+            max_value=15.0,
+            value=4.3,
+            step=0.1,
+        )
+        erp_eur = st.sidebar.number_input(
+            "Equity Risk Premium EUR (%)",
+            min_value=0.0,
+            max_value=15.0,
+            value=5.5,
+            step=0.1,
+        )
 
-    beta_blend = st.sidebar.checkbox("Beta blend (EODHD + sector)", value=True)
-    beta_sector_override = st.sidebar.number_input(
-        "Beta sectoriel (optionnel)",
-        min_value=0.0,
-        max_value=3.0,
-        value=0.0,
-        step=0.05,
-    )
+        col1, col2 = st.sidebar.columns(2)
+        with col1:
+            override_beta = st.checkbox("Override Beta", value=False)
+        with col2:
+            override_rd = st.checkbox("Override Rd", value=False)
 
+        beta_blend = st.sidebar.checkbox("Beta blend (EODHD + sector)", value=True)
+        beta_sector_override = st.sidebar.number_input(
+            "Beta sectoriel (optionnel)",
+            min_value=0.0,
+            max_value=3.0,
+            value=0.0,
+            step=0.05,
+        )
+
+        beta_override = None
+        if override_beta:
+            beta_override = st.sidebar.number_input(
+                "Beta override",
+                min_value=0.0,
+                max_value=5.0,
+                value=1.0,
+                step=0.05,
+            )
+
+        rd_override_pct = None
+        if override_rd:
+            rd_override_pct = st.sidebar.number_input(
+                "Rd override (%)",
+                min_value=0.0,
+                max_value=25.0,
+                value=4.5,
+                step=0.1,
+            )
+
+        override_tax = st.sidebar.checkbox("Override Tax rate", value=False)
+        tax_override_pct = None
+        if override_tax:
+            tax_override_pct = st.sidebar.number_input(
+                "Tax rate override (%)",
+                min_value=0.0,
+                max_value=45.0,
+                value=25.0,
+                step=0.5,
+            )
+
+        allow_heuristic_rd = st.sidebar.checkbox(
+            "Autoriser estimation Rd si interestExpense manquant",
+            value=True,
+        )
+        allow_tax_fallback = st.sidebar.checkbox("Autoriser fallback tax par zone", value=True)
+
+        return {
+            "erp_us": erp_us,
+            "erp_eur": erp_eur,
+            "override_beta": override_beta,
+            "override_rd": override_rd,
+            "beta_blend": beta_blend,
+            "beta_sector_override": beta_sector_override,
+            "beta_override": beta_override,
+            "rd_override_pct": rd_override_pct,
+            "override_tax": override_tax,
+            "tax_override_pct": tax_override_pct,
+            "allow_heuristic_rd": allow_heuristic_rd,
+            "allow_tax_fallback": allow_tax_fallback,
+        }
+
+    wacc_input = 6.8
+    erp_us = 4.3
+    erp_eur = 5.5
+    override_beta = False
+    override_rd = False
+    beta_blend = True
+    beta_sector_override = 0.0
     beta_override = None
-    if override_beta:
-        beta_override = st.sidebar.number_input("Beta override", min_value=0.0, max_value=5.0, value=1.0, step=0.05)
-
     rd_override_pct = None
-    if override_rd:
-        rd_override_pct = st.sidebar.number_input("Rd override (%)", min_value=0.0, max_value=25.0, value=4.5, step=0.1)
-
-    override_tax = st.sidebar.checkbox("Override Tax rate", value=False)
+    override_tax = False
     tax_override_pct = None
-    if override_tax:
-        tax_override_pct = st.sidebar.number_input("Tax rate override (%)", min_value=0.0, max_value=45.0, value=25.0, step=0.5)
+    allow_heuristic_rd = True
+    allow_tax_fallback = True
 
-    allow_heuristic_rd = st.sidebar.checkbox("Autoriser estimation Rd si interestExpense manquant", value=True)
-    allow_tax_fallback = st.sidebar.checkbox("Autoriser fallback tax par zone", value=True)
+    if mode_ui == "Simple":
+        with st.sidebar.expander("Paramètres WACC", expanded=False):
+            if use_auto_wacc:
+                auto_inputs = render_wacc_auto_inputs()
+                erp_us = auto_inputs["erp_us"]
+                erp_eur = auto_inputs["erp_eur"]
+                override_beta = auto_inputs["override_beta"]
+                override_rd = auto_inputs["override_rd"]
+                beta_blend = auto_inputs["beta_blend"]
+                beta_sector_override = auto_inputs["beta_sector_override"]
+                beta_override = auto_inputs["beta_override"]
+                rd_override_pct = auto_inputs["rd_override_pct"]
+                override_tax = auto_inputs["override_tax"]
+                tax_override_pct = auto_inputs["tax_override_pct"]
+                allow_heuristic_rd = auto_inputs["allow_heuristic_rd"]
+                allow_tax_fallback = auto_inputs["allow_tax_fallback"]
+            else:
+                wacc_input = render_wacc_manual_inputs()
+    else:
+        if use_auto_wacc:
+            auto_inputs = render_wacc_auto_inputs()
+            erp_us = auto_inputs["erp_us"]
+            erp_eur = auto_inputs["erp_eur"]
+            override_beta = auto_inputs["override_beta"]
+            override_rd = auto_inputs["override_rd"]
+            beta_blend = auto_inputs["beta_blend"]
+            beta_sector_override = auto_inputs["beta_sector_override"]
+            beta_override = auto_inputs["beta_override"]
+            rd_override_pct = auto_inputs["rd_override_pct"]
+            override_tax = auto_inputs["override_tax"]
+            tax_override_pct = auto_inputs["tax_override_pct"]
+            allow_heuristic_rd = auto_inputs["allow_heuristic_rd"]
+            allow_tax_fallback = auto_inputs["allow_tax_fallback"]
+        else:
+            wacc_input = render_wacc_manual_inputs()
+    def render_dcf_inputs():
+        growth_fcf_input = st.sidebar.number_input(
+            "Croissance annuelle FCF (%)",
+            min_value=-1.5,
+            max_value=4.0,
+            value=3.0,
+            step=0.1,
+        )
+        constant_growth = st.sidebar.checkbox("Croissance constante", value=False)
+        allow_negative_fcf = st.sidebar.checkbox("Autoriser DCF si FCF négatif", value=False)
+        prudence_hist = st.sidebar.checkbox("Prudence historique renforcée", value=True)
+        g_terminal_input = st.sidebar.number_input(
+            "Croissance long terme g (%)",
+            min_value=1.0,
+            max_value=2.0,
+            value=1.75,
+            step=0.05,
+        )
+        exit_method = st.sidebar.selectbox(
+            "Méthode de valeur terminale",
+            ["Gordon", "Exit multiple", "Moyenne des deux"],
+            index=0,
+        )
+        exit_multiple_type = st.sidebar.selectbox(
+            "Exit multiple type",
+            ["EV/FCF", "EV/EBITDA"],
+            index=0,
+        )
+        exit_multiple_value = st.sidebar.number_input(
+            "Exit multiple (0 = désactivé)",
+            min_value=0.0,
+            max_value=50.0,
+            value=0.0,
+            step=0.5,
+        )
+        return {
+            "growth_fcf_input": growth_fcf_input,
+            "constant_growth": constant_growth,
+            "allow_negative_fcf": allow_negative_fcf,
+            "prudence_hist": prudence_hist,
+            "g_terminal_input": g_terminal_input,
+            "exit_method": exit_method,
+            "exit_multiple_type": exit_multiple_type,
+            "exit_multiple_value": exit_multiple_value,
+        }
 
-    growth_fcf_input = st.sidebar.number_input(
-        "Croissance annuelle FCF (%)",
-        min_value=-1.5,
-        max_value=4.0,
-        value=3.0,
-        step=0.1,
-    )
-    constant_growth = st.sidebar.checkbox("Croissance constante", value=False)
-    allow_negative_fcf = st.sidebar.checkbox("Autoriser DCF si FCF négatif", value=False)
-    prudence_hist = st.sidebar.checkbox("Prudence historique renforcée", value=True)
-    g_terminal_input = st.sidebar.number_input(
-        "Croissance long terme g (%)",
-        min_value=1.0,
-        max_value=2.0,
-        value=1.75,
-        step=0.05,
-    )
-    exit_method = st.sidebar.selectbox(
-        "Méthode de valeur terminale",
-        ["Gordon", "Exit multiple", "Moyenne des deux"],
-        index=0,
-    )
-    exit_multiple_type = st.sidebar.selectbox(
-        "Exit multiple type",
-        ["EV/FCF", "EV/EBITDA"],
-        index=0,
-    )
-    exit_multiple_value = st.sidebar.number_input(
-        "Exit multiple (0 = désactivé)",
-        min_value=0.0,
-        max_value=50.0,
-        value=0.0,
-        step=0.5,
-    )
+    growth_fcf_input = 3.0
+    constant_growth = False
+    allow_negative_fcf = False
+    prudence_hist = True
+    g_terminal_input = 1.75
+    exit_method = "Gordon"
+    exit_multiple_type = "EV/FCF"
+    exit_multiple_value = 0.0
+
+    if mode_ui == "Simple":
+        with st.sidebar.expander("Paramètres DCF", expanded=False):
+            dcf_inputs = render_dcf_inputs()
+        growth_fcf_input = dcf_inputs["growth_fcf_input"]
+        constant_growth = dcf_inputs["constant_growth"]
+        allow_negative_fcf = dcf_inputs["allow_negative_fcf"]
+        prudence_hist = dcf_inputs["prudence_hist"]
+        g_terminal_input = dcf_inputs["g_terminal_input"]
+        exit_method = dcf_inputs["exit_method"]
+        exit_multiple_type = dcf_inputs["exit_multiple_type"]
+        exit_multiple_value = dcf_inputs["exit_multiple_value"]
+    else:
+        dcf_inputs = render_dcf_inputs()
+        growth_fcf_input = dcf_inputs["growth_fcf_input"]
+        constant_growth = dcf_inputs["constant_growth"]
+        allow_negative_fcf = dcf_inputs["allow_negative_fcf"]
+        prudence_hist = dcf_inputs["prudence_hist"]
+        g_terminal_input = dcf_inputs["g_terminal_input"]
+        exit_method = dcf_inputs["exit_method"]
+        exit_multiple_type = dcf_inputs["exit_multiple_type"]
+        exit_multiple_value = dcf_inputs["exit_multiple_value"]
 
     wacc = wacc_input / 100.0
 
@@ -3902,21 +4043,127 @@ def main():
                 st.metric("Juste valeur / action", safe_metric(fair_value_per_share, "{:,.2f}"))
                 st.metric("Nombre d'actions", format_large_number(shares))
 
-            st.markdown("#### Hypothèses retenues (base case)")
-            st.write(f"- Horizon de projection : **{years} ans**")
-            st.write(f"- WACC utilisée : **{format_float(dcf.get('wacc_used_pct', wacc_input), 2)} %** ({dcf.get('wacc_source', 'manual')})")
-            st.write(f"- Croissance FCF : **{safe_metric(growth_fcf_input, '{:.2f}')} % par an**")
-            st.write(f"- g de long terme : **{safe_metric(g_terminal_input, '{:.2f}')} %**")
-            st.write(f"- Dette nette utilisée : **{format_large_number(net_debt)}**")
-            st.write(f"- FCF de départ estimé : **{format_large_number(fcf_start)}**")
+            audit = result.get("dcf_audit", {}) or {}
+            g_input = audit.get("g_input")
+            g1_used = audit.get("g1_used")
+            g_terminal_used = audit.get("g_terminal_used")
+            growth_curve = audit.get("growth_curve", [])
+
+            def warning_explanations(warnings):
+                explanations = []
+                for warning in warnings:
+                    if "TV > 80% de l'EV" in warning:
+                        explanations.append(
+                            "TV > 80% de l'EV : la majorité de la valeur vient de la valeur terminale, "
+                            "donc la valorisation est très sensible à WACC et g."
+                        )
+                    if "EV/FCF terminal implicite > 25x" in warning:
+                        explanations.append(
+                            "EV/FCF terminal implicite > 25x : ce multiple correspond au prix implicite payé "
+                            "pour le FCF à long terme selon Gordon: (1+g)/(WACC-g). "
+                            "Multiple élevé = hypothèses terminales ambitieuses."
+                        )
+                return explanations
+
             mos = result.get("mos")
             verdict = result.get("verdict", "N/A")
-            st.write(
-                f"- Verdict : **{verdict}** (MOS : **{safe_metric(mos * 100, '{:.1f}', 'N/A')} %**)"
-            )
+            fv_base = result.get("fv_base")
+            fv_low = result.get("fv_low")
+            fv_high = result.get("fv_high")
             dcf_warnings = dcf.get("dcf_warnings") or []
-            if dcf_warnings:
-                st.warning("Avertissements DCF :\n- " + "\n- ".join(map(str, dcf_warnings)))
+
+            if mode_ui == "Simple":
+                st.markdown("#### Résumé DCF (mode simple)")
+                col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+                with col_s1:
+                    st.metric("Verdict", verdict)
+                with col_s2:
+                    st.metric("MOS", safe_metric(mos * 100 if mos is not None else None, "{:.1f}", "N/A"))
+                with col_s3:
+                    st.metric("Juste valeur DCF (base)", format_large_number(fv_base))
+                with col_s4:
+                    if fv_low is not None and fv_high is not None:
+                        st.metric("Fourchette DCF", f"{format_large_number(fv_low)} – {format_large_number(fv_high)}")
+                    else:
+                        st.metric("Fourchette DCF", "N/A")
+
+                important_warnings = []
+                if any("TV > 80% de l'EV" in w for w in dcf_warnings):
+                    important_warnings.append("TV > 80% de l'EV")
+                if any("EV/FCF terminal implicite > 25x" in w for w in dcf_warnings):
+                    important_warnings.append("EV/FCF terminal implicite > 25x")
+                if (
+                    audit.get("wacc_used") is not None
+                    and g_terminal_used is not None
+                    and (audit.get("wacc_used") - g_terminal_used) < 0.025
+                ):
+                    important_warnings.append("WACC - g terminal < 2.5% (sensibilité accrue).")
+                important_warnings = important_warnings[:3]
+
+                if important_warnings:
+                    st.warning("Avertissements DCF (prioritaires) :\n- " + "\n- ".join(important_warnings))
+                    explanations = warning_explanations(important_warnings)
+                    if explanations:
+                        st.info("Explications :\n- " + "\n- ".join(explanations))
+
+                with st.expander("Détails"):
+                    st.markdown("#### Hypothèses retenues (base case)")
+                    st.write(f"- Horizon de projection : **{years} ans**")
+                    st.write(
+                        f"- WACC utilisée : **{format_float(dcf.get('wacc_used_pct', wacc_input), 2)} %** "
+                        f"({dcf.get('wacc_source', 'manual')})"
+                    )
+                    growth_label = "Croissance (input plafond)" if prudence_hist else "Croissance (input utilisée)"
+                    st.write(
+                        f"- {growth_label} : **{safe_metric(g_input * 100 if g_input is not None else None, '{:.2f}')} %**"
+                    )
+                    st.write(
+                        f"- Croissance retenue (g1_used) : **{safe_metric(g1_used * 100 if g1_used is not None else None, '{:.2f}')} %**"
+                    )
+                    st.write(
+                        f"- g terminal utilisé : **{safe_metric(g_terminal_used * 100 if g_terminal_used is not None else None, '{:.2f}')} %**"
+                    )
+                    st.write(
+                        f"- Croissance par année : {', '.join([f'{g*100:.2f}%' for g in growth_curve])}"
+                    )
+                    st.write(f"- Dette nette utilisée : **{format_large_number(net_debt)}**")
+                    st.write(f"- FCF de départ estimé : **{format_large_number(fcf_start)}**")
+                    if dcf_warnings:
+                        st.warning("Avertissements DCF :\n- " + "\n- ".join(map(str, dcf_warnings)))
+                    explanations = warning_explanations(dcf_warnings)
+                    if explanations:
+                        st.info("Explications :\n- " + "\n- ".join(explanations))
+            else:
+                st.markdown("#### Hypothèses retenues (base case)")
+                st.write(f"- Horizon de projection : **{years} ans**")
+                st.write(
+                    f"- WACC utilisée : **{format_float(dcf.get('wacc_used_pct', wacc_input), 2)} %** "
+                    f"({dcf.get('wacc_source', 'manual')})"
+                )
+                growth_label = "Croissance (input plafond)" if prudence_hist else "Croissance (input utilisée)"
+                st.write(
+                    f"- {growth_label} : **{safe_metric(g_input * 100 if g_input is not None else None, '{:.2f}')} %**"
+                )
+                st.write(
+                    f"- Croissance retenue (g1_used) : **{safe_metric(g1_used * 100 if g1_used is not None else None, '{:.2f}')} %**"
+                )
+                st.write(
+                    f"- g terminal utilisé : **{safe_metric(g_terminal_used * 100 if g_terminal_used is not None else None, '{:.2f}')} %**"
+                )
+                st.write(
+                    f"- Croissance par année : {', '.join([f'{g*100:.2f}%' for g in growth_curve])}"
+                )
+                st.write(f"- Dette nette utilisée : **{format_large_number(net_debt)}**")
+                st.write(f"- FCF de départ estimé : **{format_large_number(fcf_start)}**")
+                st.write(
+                    f"- Verdict : **{verdict}** (MOS : **{safe_metric(mos * 100, '{:.1f}', 'N/A')} %**)"
+                )
+                if dcf_warnings:
+                    st.warning("Avertissements DCF :\n- " + "\n- ".join(map(str, dcf_warnings)))
+                    with st.expander("Explications des avertissements"):
+                        explanations = warning_explanations(dcf_warnings)
+                        if explanations:
+                            st.info("Explications :\n- " + "\n- ".join(explanations))
             # Détail WACC automatique (audit trail)
             wacc_details = dcf.get("wacc_details") if isinstance(dcf, dict) else None
             if wacc_details:
