@@ -1,5 +1,7 @@
 import os
 import math
+import json
+from datetime import datetime
 import requests
 import pandas as pd
 import numpy as np
@@ -10,6 +12,8 @@ import streamlit as st
 # =========================================
 
 EODHD_BASE_URL = "https://eodhd.com/api"
+RISK_FREE_CACHE_FILE = "risk_free_cache.json"
+RISK_FREE_CACHE_MAX_DAYS = 180
 
 
 # =========================================
@@ -640,156 +644,13 @@ def extract_base_financials(fundamentals: dict):
             "totalEquity",
             "total_equity",
             "totalEquityGrossMinorityInterest",
-            "totalEquityAndMinorityInterest",
-        )
-        if equity is not None and equity not in (0.0,):
-            book_equity = equity
-
-        # Fallback : book_equity = totalAssets - totalLiab 
-        if book_equity is None:
-            total_assets = _get_float("totalAssets", "total_assets", "totalAssetsReported", "assets")
-            total_liab = _get_float(
-                "totalLiab",
-                "total_liab",
-                "total_liabilities",
-                "totalLiabilitiesNetMinorityInterest",
-                "totalLiabilities",
-                "liabilities",
-            )
-
-            # si totalLiab absent mais assets+equity présents : totalLiab = assets - equity
-            if total_liab is None and total_assets is not None and equity is not None:
-                total_liab = total_assets - equity
-
-            if total_assets is not None and total_liab is not None:
-                try:
-                    book_equity = float(total_assets) - float(total_liab)
-                except Exception:
-                    book_equity = None
-
-    return {
-        "revenue": revenue,
-        "ebitda": ebitda,
-        "ebit": ebit,
-        "net_income": net_income,
-        "book_equity": book_equity,
-    }
-
-
-def extract_base_financials(fundamentals: dict):
-    """
-    Extrait les valeurs de base (dernière année annuelle) nécessaires aux multiples :
-    - revenue
-    - ebitda
-    - ebit
-    - net_income
-    - book_equity (fonds propres comptables)
-
-    Bonnes pratiques EODHD : certaines clés diffèrent selon les exchanges (camelCase vs variantes). 
-    """
-    inc = fundamentals.get("Financials", {}).get("Income_Statement", {}).get("yearly", {})
-    bs = fundamentals.get("Financials", {}).get("Balance_Sheet", {}).get("yearly", {})
-
-    revenue = ebitda = ebit = net_income = book_equity = None
-
-    # ============================================================
-    #                   INCOME STATEMENT
-    # ============================================================
-    if isinstance(inc, dict) and inc:
-        years_inc = sorted(inc.keys())
-        last_year_inc = years_inc[-1]
-        row_inc = inc.get(last_year_inc, {}) or {}
-
-        revenue = pick_first_non_null(
-            row_inc,
-            ["totalRevenue", "TotalRevenue", "revenue", "Revenue", "SalesRevenueNet", "Sales"],
-        )
-
-        ebitda = pick_first_non_null(
-            row_inc,
-            ["ebitda", "EBITDA", "Ebitda", "OperatingIncomeBeforeDepreciation"],
-        )
-
-        ebit = pick_first_non_null(
-            row_inc,
-            ["ebit", "EBIT", "operatingIncome", "OperatingIncome", "OperatingIncomeLoss"],
-        )
-
-        net_income = pick_first_non_null(
-            row_inc,
-            [
-                "netIncome",
-                "NetIncome",
-                "net_income",
-                "NetIncomeCommonStockholders",
-                "NetIncomeIncludingNoncontrollingInterests",
-            ],
-        )
-
-    # ============================================================
-    #                     BALANCE SHEET
-    # ============================================================
-    if isinstance(bs, dict) and bs:
-        years_bs = sorted(bs.keys())
-        last_year_bs = years_bs[-1]
-        row_bs = bs.get(last_year_bs, {}) or {}
-
-        # Normaliser les clés (insensible à la casse + suppression _ / espaces / tirets)
-        def _norm_key(k: str) -> str:
-            return str(k).strip().lower().replace("_", "").replace(" ", "").replace("-", "")
-
-        normalized = {_norm_key(k): v for k, v in row_bs.items()}
-
-        def _get_float(*keys):
-            for k in keys:
-                v = normalized.get(_norm_key(k))
-                if v is None:
-                    continue
-                try:
-                    return float(v)
-                except Exception:
-                    continue
-            return None
-
-        # Equity direct (plusieurs variantes)
-        equity = _get_float(
-            "totalStockholderEquity",
-            "totalStockholdersEquity",
-            "totalstockholderequity",
-            "totalStockholdersequity",
-            "totalShareholdersEquity",
-            "commonStockEquity",
-            "stockholdersEquity",
-            "shareholdersEquity",
-            "totalEquity",
-            "total_equity",
             "totalEquityGrossMinorityInterest",
-            "totalEquityAndMinorityInterest",
+            "totalEquityIncludingMinorityInterest",
+            "totalEquityNetMinorityInterest",
         )
-        if equity is not None and equity not in (0.0,):
+
+        if equity is not None:
             book_equity = equity
-
-        # Fallback : book_equity = totalAssets - totalLiab 
-        if book_equity is None:
-            total_assets = _get_float("totalAssets", "total_assets", "totalAssetsReported", "assets")
-            total_liab = _get_float(
-                "totalLiab",
-                "total_liab",
-                "total_liabilities",
-                "totalLiabilitiesNetMinorityInterest",
-                "totalLiabilities",
-                "liabilities",
-            )
-
-            # si totalLiab absent mais assets+equity présents : totalLiab = assets - equity
-            if total_liab is None and total_assets is not None and equity is not None:
-                total_liab = total_assets - equity
-
-            if total_assets is not None and total_liab is not None:
-                try:
-                    book_equity = float(total_assets) - float(total_liab)
-                except Exception:
-                    book_equity = None
 
     return {
         "revenue": revenue,
@@ -800,321 +661,106 @@ def extract_base_financials(fundamentals: dict):
     }
 
 
-def safe_div(num, den):
-    """
-    Division sécurisée :
-    - renvoie None si num ou den est None
-    - renvoie None si den = 0
-    - évite les erreurs de type
-    """
-    if num is None or den in (None, 0):
-        return None
-    try:
-        return float(num) / float(den)
-    except Exception:
-        return None
+# =========================================
+# MULTIPLES
+# =========================================
 
-def compute_base_multiples(price, shares, net_debt, base_financials: dict):
+def compute_base_multiples(price: float, shares: float, net_debt: float, base_financials: dict):
     """
-    Calcule les métriques de base pour les méthodes par multiples :
-    - EPS, BVPS
-    - Market cap, EV
-    - P/E, P/B, EV/EBITDA, EV/EBIT, EV/Sales
+    Calcule les multiples 'courants' de la société, basés sur le dernier exercice annuel.
+    Renvoie un dict : pe, pb, ev_ebitda, ev_sales, ev_ebit, etc.
     """
+    if shares is None or shares == 0:
+        return {}
+
+    market_cap = price * shares
+    net_debt_used = net_debt if net_debt is not None else 0
+    ev = market_cap + net_debt_used
+
     revenue = base_financials.get("revenue")
     ebitda = base_financials.get("ebitda")
     ebit = base_financials.get("ebit")
     net_income = base_financials.get("net_income")
     book_equity = base_financials.get("book_equity")
 
-    metrics = {}
+    pe = (price / (net_income / shares)) if net_income not in (None, 0) else None
+    pb = (price / (book_equity / shares)) if book_equity not in (None, 0) else None
+    ev_ebitda = (ev / ebitda) if ebitda not in (None, 0) else None
+    ev_ebit = (ev / ebit) if ebit not in (None, 0) else None
+    ev_sales = (ev / revenue) if revenue not in (None, 0) else None
 
-    eps = None
-    bvps = None
-    market_cap = None
-    ev = None
-
-    if price is not None and shares not in (None, 0):
-        market_cap = price * shares
-
-    if shares not in (None, 0):
-        if net_income is not None:
-            eps = net_income / shares
-        if book_equity is not None:
-            bvps = book_equity / shares
-
-    if market_cap is not None:
-        ev = market_cap + (net_debt or 0)
-
-    metrics["revenue"] = revenue
-    metrics["ebitda"] = ebitda
-    metrics["ebit"] = ebit
-    metrics["net_income"] = net_income
-    metrics["book_equity"] = book_equity
-    metrics["eps"] = eps
-    metrics["bvps"] = bvps
-    metrics["market_cap"] = market_cap
-    metrics["ev"] = ev
-
-    # Multiples courants
-    metrics["pe"] = safe_div(price, eps)
-    metrics["pb"] = safe_div(price, bvps)
-    metrics["ev_ebitda"] = safe_div(ev, ebitda)
-    metrics["ev_ebit"] = safe_div(ev, ebit)
-    metrics["ev_sales"] = safe_div(ev, revenue)
-
-    return metrics
-
+    return {
+        "market_cap": market_cap,
+        "ev": ev,
+        "pe": pe,
+        "pb": pb,
+        "ev_ebitda": ev_ebitda,
+        "ev_ebit": ev_ebit,
+        "ev_sales": ev_sales,
+        "revenue": revenue,
+        "ebit": ebit,
+        "ebitda": ebitda,
+        "net_income": net_income,
+        "book_equity": book_equity,
+        "eps": (net_income / shares) if net_income not in (None, 0) else None,
+        "bvps": (book_equity / shares) if book_equity not in (None, 0) else None,
+    }
 
 
 # =========================================
-# FUNDAMENTALS HEALTH TABLE (RATIOS + SCORE)
+# HELPERS : EXTRACTION DERNIER EXERCICE
 # =========================================
 
-@st.cache_data(show_spinner=False, ttl=24*3600)
-def fetch_fundamentals_cached(ticker: str, api_key: str):
-    return fetch_fundamentals(ticker, api_key)
-
-@st.cache_data(show_spinner=False, ttl=6*3600)
-def fetch_eod_price_cached(ticker: str, api_key: str):
-    return fetch_eod_price(ticker, api_key)
-
-
-def _extract_latest_year_row(section: dict):
+def _extract_latest_year_row(yearly_dict: dict):
     """
-    section attendu sous forme de dict {year: {...}}.
-    Retourne (year, row) du dernier exercice disponible.
+    Renvoie (year, row) pour la dernière année disponible.
     """
-    if not isinstance(section, dict) or not section:
+    if not isinstance(yearly_dict, dict) or not yearly_dict:
         return None, {}
-    years = sorted(section.keys())
+    years = sorted(yearly_dict.keys())
     last_year = years[-1]
-    return last_year, (section.get(last_year, {}) or {})
+    return last_year, yearly_dict[last_year] or {}
 
 
 def extract_balance_sheet_snapshot(fundamentals: dict):
     """
-    Extrait un snapshot de bilan (dernier exercice annuel) avec des clés standardisées.
-    Retourne aussi l'année du snapshot.
-
-    Notes EODHD (glossaire Fundamentals):
-    - totalAssets, totalLiab, totalStockholderEquity 
-    - cash vs cashAndEquivalents : peut varier selon l'exchange 
+    Extrait un snapshot de bilan (dernière année annuelle).
+    Renvoie (year, snapshot_dict).
     """
     bs = fundamentals.get("Financials", {}).get("Balance_Sheet", {}).get("yearly", {})
     year, row = _extract_latest_year_row(bs)
 
-    if not row or not isinstance(row, dict):
-        return year, {}
-
-    def _norm_key(k: str) -> str:
-        return str(k).strip().lower().replace("_", "").replace(" ", "").replace("-", "")
-
-    normalized = {_norm_key(k): v for k, v in row.items()}
-
     def get_first(keys):
-        for k in keys:
-            v = normalized.get(_norm_key(k))
-            if v is None:
-                continue
-            try:
-                return float(v)
-            except Exception:
-                continue
-        return None
+        return pick_first_non_null(row, keys)
 
-    total_assets = get_first(["totalAssets", "total_assets", "totalassets", "totalAssetsReported", "assets"])
-
-    # EODHD utilise souvent totalLiab (et non totalLiabilities) 
-    total_liabilities = get_first(
-        [
-            "totalLiab",
-            "total_liab",
-            "total_liabilities",
-            "totalLiabilitiesNetMinorityInterest",
-            "totalLiabilities",
-            "liabilities",
-        ]
-    )
-
-    # Equity (si dispo en direct)
-    total_equity_direct = get_first(
-        [
-            "totalStockholderEquity",
-            "total_stockholder_equity",
-            "totalStockholdersEquity",
-            "totalEquity",
-            "total_equity",
-            "commonStockEquity",
-            "stockholdersEquity",
-            "shareholdersEquity",
-        ]
-    )
-
-    # Si liabilities est manquant mais assets+equity sont dispo :
-    # totalLiab = totalAssets - totalStockholderEquity 
-    if total_liabilities is None and total_assets is not None and total_equity_direct is not None:
-        total_liabilities = total_assets - total_equity_direct
-
-    # Dette totale
-    total_debt = get_first(
-        [
-            "shortLongTermDebtTotal",
-            "totalDebt",
-            "total_debt",
-            "totalDebtGrossMinorityInterest",
-            "debt",
-        ]
-    )
-    if total_debt is None:
-        st_debt = get_first(["shortTermDebt", "short_term_debt", "currentDebt", "current_debt", "shortLongTermDebt"])
-        lt_debt = get_first(
-            [
-                "longTermDebtTotal",
-                "longTermDebt",
-                "long_term_debt_total",
-                "long_term_debt",
-                "longTermDebtNonCurrent",
-                "longtermdebtnoncurrent",
-                "longTermDebtAndCapitalLeaseObligation",
-                "nonCurrentDebt",
-            ]
-        )
-        if st_debt is not None or lt_debt is not None:
-            total_debt = (st_debt or 0.0) + (lt_debt or 0.0)
-
-    cash = get_first(
-        [
-            "cashAndEquivalents",
-            "cashAndCashEquivalents",
-            "cashAndCashEquivalentsAndShortTermInvestments",
-            "cashAndShortTermInvestments",
-            "cash",
-        ]
-    )
-
-    current_assets = get_first(["totalCurrentAssets", "currentAssets", "current_assets"])
-    current_liabilities = get_first(["totalCurrentLiabilities", "currentLiabilities", "current_liabilities"])
-
-    goodwill = get_first(["goodWill", "goodwill"])
-    intangibles = get_first(["intangibleAssets", "intangible_assets", "intangibles", "intangibleAssetsExcludingGoodwill"])
-
-    # Equity : on réutilise la logique robuste de extract_base_financials (inclut plusieurs clés + fallback)
-    book_equity = None
-    try:
-        book_equity = extract_base_financials(fundamentals).get("book_equity")
-        if book_equity is not None:
-            book_equity = float(book_equity)
-    except Exception:
-        book_equity = None
-
-    # Fallback final equity si toujours None
-    if book_equity is None and total_equity_direct is not None:
-        book_equity = total_equity_direct
-
-    if book_equity is None and total_assets is not None and total_liabilities is not None:
-        book_equity = total_assets - total_liabilities
-
-    return year, {
-        "total_assets": total_assets,
-        "total_liabilities": total_liabilities,
-        "total_equity": book_equity,
-        "total_debt": total_debt,
-        "cash": cash,
-        "current_assets": current_assets,
-        "current_liabilities": current_liabilities,
-        "goodwill": goodwill,
-        "intangibles": intangibles,
+    snap = {
+        "total_assets": get_first(["totalAssets", "TotalAssets"]),
+        "total_equity": get_first(["totalStockholderEquity", "totalStockholdersEquity", "TotalStockholderEquity", "TotalStockholdersEquity", "totalEquity"]),
+        "total_debt": get_first(["shortLongTermDebtTotal", "totalDebt", "TotalDebt", "shortLongTermDebt", "total_debt"]),
+        "cash": get_first(["cash", "cashAndEquivalents", "CashAndCashEquivalents"]),
+        "current_assets": get_first(["totalCurrentAssets", "TotalCurrentAssets", "currentAssets"]),
+        "current_liabilities": get_first(["totalCurrentLiabilities", "TotalCurrentLiabilities", "currentLiabilities"]),
+        "goodwill": get_first(["goodWill", "Goodwill", "goodwill"]),
+        "intangibles": get_first(["intangibleAssets", "IntangibleAssets", "intangibleAssetsNet", "Intangibles", "intangible_assets"]),
     }
-
-
-def extract_cashflow_snapshot(fundamentals: dict):
-    """
-    Extrait un snapshot de cash-flow (dernier exercice annuel) : CFO, capex, FCF.
-    Retourne aussi l'année.
-
-    Conventions EODHD (glossaire Fundamentals):
-    - totalCashFromOperatingActivities, capitalExpenditures, freeCashFlow 
-    """
-    cf = fundamentals.get("Financials", {}).get("Cash_Flow", {}).get("yearly", {})
-    year, row = _extract_latest_year_row(cf)
-    if not row:
-        return year, {}
-
-    ocf = pick_first_non_null(
-        row,
-        [
-            "totalCashFromOperatingActivities",
-            "TotalCashFromOperatingActivities",
-            "NetCashProvidedByOperatingActivities",
-            "cashFromOperatingActivities",
-            "cfo",
-            "CFO",
-        ],
-    )
-    capex = pick_first_non_null(
-        row,
-        [
-            "capitalExpenditures",
-            "CapitalExpenditures",
-            "investmentsInPropertyPlantAndEquipment",
-            "InvestmentsInPropertyPlantAndEquipment",
-            "capex",
-            "CAPEX",
-        ],
-    )
-    fcf = pick_first_non_null(row, ["freeCashFlow", "FreeCashFlow", "fcf", "FCF"])
-
-    if fcf is None and ocf is not None and capex is not None:
-        fcf = ocf - capex
-
-    return year, {"cfo": ocf, "capex": capex, "fcf": fcf}
+    return year, snap
 
 
 def extract_income_snapshot(fundamentals: dict):
     """
-    Extrait un snapshot compte de résultat (dernier exercice annuel) avec des clés standardisées.
-    Inclut aussi les champs nécessaires au calcul d'une WACC (Rd via interestExpense, et ETR via pretax/tax).
-
-    Retourne (year, snapshot_dict)
-
-    Conventions EODHD (glossaire Fundamentals):
-    - totalRevenue, grossProfit, ebit, ebitda, netIncome
-    - interestExpense (ou variantes), incomeBeforeTax (pretax), incomeTaxExpense / taxProvision
+    Extrait un snapshot d'Income Statement (dernière année annuelle).
+    Renvoie (year, snapshot_dict).
     """
     inc = fundamentals.get("Financials", {}).get("Income_Statement", {}).get("yearly", {})
     year, row = _extract_latest_year_row(inc)
-    if not row or not isinstance(row, dict):
-        return year, {}
-
-    # Normalisation simple des clés -> permet de gérer les variations de casse/underscore
-    def _norm_key(k: str) -> str:
-        return "".join(ch.lower() for ch in str(k) if ch.isalnum())
-
-    normalized = {}
-    for k, v in row.items():
-        normalized[_norm_key(k)] = v
 
     def get_first(keys):
-        for k in keys:
-            v = normalized.get(_norm_key(k))
-            if v is None:
-                continue
-            try:
-                return float(v)
-            except Exception:
-                continue
-        return None
+        return pick_first_non_null(row, keys)
 
-    revenue = get_first(["totalRevenue", "revenue", "TotalRevenue", "Revenue", "SalesRevenueNet", "Sales"])
+    revenue = get_first(["totalRevenue", "TotalRevenue", "revenue", "Revenue", "SalesRevenueNet"])
     ebitda = get_first(["ebitda", "EBITDA", "Ebitda", "OperatingIncomeBeforeDepreciation"])
-    ebit = get_first(["ebit", "EBIT", "operatingIncome", "OperatingIncome", "OperatingIncomeLoss"])
-    net_income = get_first([
-        "netIncome",
-        "NetIncome",
-        "NetIncomeCommonStockholders",
-        "NetIncomeIncludingNoncontrollingInterests",
-    ])
+    ebit = get_first(["operatingIncome", "OperatingIncome", "OperatingIncomeLoss", "ebit", "EBIT"])
+    net_income = get_first(["netIncome", "NetIncome", "NetIncomeCommonStockholders"])
     gross_profit = get_first(["grossProfit", "GrossProfit", "gross_profit"])
 
     # Champs WACC / fiscalité
@@ -1199,6 +845,62 @@ def fetch_latest_eod_close(ticker: str, api_key: str):
             return None
     except Exception:
         return None
+
+
+def load_risk_free_cache(path: str = RISK_FREE_CACHE_FILE):
+    if not os.path.exists(path):
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def save_risk_free_cache(cache: dict, path: str = RISK_FREE_CACHE_FILE):
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+    except Exception:
+        pass
+
+
+def get_cached_risk_free_rate(ticker: str, max_days: int = RISK_FREE_CACHE_MAX_DAYS):
+    cache = load_risk_free_cache()
+    entry = cache.get(ticker)
+    if not entry or not isinstance(entry, dict):
+        return None, None
+    try:
+        value = float(entry.get("value"))
+        date_str = entry.get("date")
+        if not date_str:
+            return None, None
+        date_val = datetime.strptime(date_str, "%Y-%m-%d").date()
+        age_days = (datetime.utcnow().date() - date_val).days
+        if age_days <= max_days:
+            return value, age_days
+    except Exception:
+        return None, None
+    return None, None
+
+
+def fetch_risk_free_rate_with_cache(ticker: str, api_key: str):
+    rf_close = fetch_latest_eod_close(ticker, api_key)
+    if rf_close is not None:
+        cache = load_risk_free_cache()
+        cache[ticker] = {
+            "value": float(rf_close),
+            "date": datetime.utcnow().strftime("%Y-%m-%d"),
+        }
+        save_risk_free_cache(cache)
+        return rf_close, "api", None
+
+    cached_value, age_days = get_cached_risk_free_rate(ticker)
+    if cached_value is not None:
+        return cached_value, "cache", age_days
+
+    return None, None, None
 
 
 def get_currency_code(fundamentals: dict):
@@ -1318,8 +1020,8 @@ def compute_effective_tax_rate(fundamentals: dict, max_years: int = 5):
         etr = tax / pretax
         if etr is None:
             continue
-        # clamp raisonnable
-        etr = max(0.0, min(0.45, float(etr)))
+        # clamp raisonnable (winsorisation)
+        etr = max(0.0, min(0.40, float(etr)))
         etrs.append(etr)
         used.append(y)
 
@@ -1358,6 +1060,10 @@ def estimate_cost_of_debt(
             rd = float(rd_override_pct) / 100.0
             details["source"] = "override"
             details["inputs"]["rd_override_pct"] = float(rd_override_pct)
+            floor = (rf_decimal or 0.0) + 0.005
+            if rd < floor:
+                details["warnings"].append("Rd override < rf + 0.5% → plancher appliqué.")
+                rd = floor
             return rd, details
         except Exception:
             details["warnings"].append("Rd override invalide (non numérique).")
@@ -1391,6 +1097,10 @@ def estimate_cost_of_debt(
         rd = interest / avg_debt
         # clamp raisonnable
         rd = max(0.0, min(0.25, float(rd)))
+        floor = (rf_decimal or 0.0) + 0.005
+        if rd < floor:
+            details["warnings"].append("Rd relevé au plancher rf + 0.5%.")
+            rd = floor
         details["source"] = "interestExpense/avgDebt"
         return rd, details
 
@@ -1399,7 +1109,7 @@ def estimate_cost_of_debt(
         details["warnings"].append("Rd non calculable (interestExpense ou dette manquante) et heuristique désactivée.")
         return None, details
 
-    # Heuristique leverage-based: spread selon NetDebt/EBITDA
+    # Heuristique leverage-based: spread selon NetDebt/EBITDA (grille explicite)
     ebitda = is_snap.get("ebitda") if isinstance(is_snap, dict) else None
     lev = None
     if net_debt is not None and ebitda is not None and ebitda > 0:
@@ -1420,12 +1130,17 @@ def estimate_cost_of_debt(
         elif lev < 4.0:
             spread = 0.035
         else:
-            spread = 0.050
+            spread = 0.060
         details["warnings"].append("Rd estimé via spread basé sur NetDebt/EBITDA (heuristique).")
 
-    rd = max(0.0, min(0.25, float(rf_decimal + spread)))
+    rd = max(0.0, min(0.25, float((rf_decimal or 0.0) + spread)))
     details["source"] = "heuristic_rf_plus_spread"
     details["inputs"]["spread_used"] = spread
+    # Plancher : Rd >= rf + 0.5%
+    floor = (rf_decimal or 0.0) + 0.005
+    if rd < floor:
+        details["warnings"].append("Rd relevé au plancher rf + 0.5%.")
+        rd = floor
     return rd, details
 
 
@@ -1456,21 +1171,15 @@ def compute_wacc_auto(
     details["inputs"]["country_iso"] = ci
 
     # 1) Risk-free via GBOND (close = yield %)
-    rf_map = {
-        "EUR": "DE10Y.GBOND",
-        "USD": "US10Y.GBOND",
-        "GBP": "UK10Y.GBOND",
-        "CHF": "SW10Y.GBOND",
-        "JPY": "JP10Y.GBOND",
-        "CAD": "CA10Y.GBOND",
-        "AUD": "AU10Y.GBOND",
-    }
-    rf_ticker = rf_map.get(cc, "US10Y.GBOND")
-    rf_close = fetch_latest_eod_close(rf_ticker, api_key)
+    rf_ticker = "DE10Y.GBOND" if cc == "EUR" else "US10Y.GBOND"
+    rf_close, rf_source, rf_cache_age = fetch_risk_free_rate_with_cache(rf_ticker, api_key)
     if rf_close is None:
         details["missing"].append("risk_free_rate")
     else:
-        details["sources"]["risk_free_rate"] = f"EODHD EOD close {rf_ticker}"
+        if rf_source == "api":
+            details["sources"]["risk_free_rate"] = f"EODHD EOD close {rf_ticker}"
+        elif rf_source == "cache":
+            details["sources"]["risk_free_rate"] = f"cache_local ({rf_ticker}, {rf_cache_age}j)"
         details["inputs"]["rf_ticker"] = rf_ticker
         details["inputs"]["rf_close_pct"] = rf_close
 
@@ -1498,26 +1207,52 @@ def compute_wacc_auto(
 
     # 3) Beta
     beta_override = config.get("beta_override")
+    beta_sector_override = config.get("beta_sector_override")
+    beta_blend = bool(config.get("beta_blend", True))
     beta = None
+    beta_used = None
     if beta_override is not None:
         try:
             beta = float(beta_override)
+            beta_used = beta
             details["sources"]["beta"] = "override"
         except Exception:
             details["warnings"].append("Beta override invalide.")
             beta = None
-    if beta is None:
+
+    if beta_used is None:
         beta = get_beta(fundamentals)
         if beta is not None:
             details["sources"]["beta"] = "EODHD Technicals.Beta"
-    if beta is None:
+
+        if beta is not None and beta_blend and beta_sector_override is not None:
+            try:
+                beta_sector = float(beta_sector_override)
+                beta_used = (beta + beta_sector) / 2.0
+                details["sources"]["beta_blend"] = "blend_eodhd_sector"
+                details["inputs"]["beta_sector_override"] = beta_sector
+            except Exception:
+                details["warnings"].append("Beta sector override invalide.")
+                beta_used = beta
+        else:
+            beta_used = beta
+
+    if beta_used is None:
         details["missing"].append("beta")
-    details["inputs"]["beta"] = beta
+    else:
+        if beta_used < 0.7:
+            details["warnings"].append("Beta clampé au minimum 0.7.")
+            beta_used = 0.7
+        if beta_used > 2.0:
+            details["warnings"].append("Beta clampé au maximum 2.0.")
+            beta_used = 2.0
+
+    details["inputs"]["beta"] = beta_used
 
     # 4) Cost of equity Re
     re_decimal = None
-    if rf_decimal is not None and beta is not None and erp_decimal is not None:
-        re_decimal = rf_decimal + beta * erp_decimal
+    if rf_decimal is not None and beta_used is not None and erp_decimal is not None:
+        re_decimal = rf_decimal + beta_used * erp_decimal
         details["results"]["cost_of_equity_pct"] = re_decimal * 100.0
     else:
         details["missing"].append("cost_of_equity")
@@ -1550,7 +1285,7 @@ def compute_wacc_auto(
 
     if tax_override_pct is not None:
         try:
-            tax_decimal = max(0.0, min(0.45, float(tax_override_pct) / 100.0))
+            tax_decimal = max(0.0, min(0.40, float(tax_override_pct) / 100.0))
             tax_details["source"] = "override"
         except Exception:
             tax_details["warnings"].append("Tax override invalide.")
@@ -1564,19 +1299,22 @@ def compute_wacc_auto(
             tax_details["etr_details"] = etr_details
 
     if tax_decimal is None and allow_tax_fallback:
-        # fallback simple par pays/currency (proxy)
+        # fallback simple par zone (proxy)
         if ci == "US" or cc == "USD":
-            tax_decimal = 0.258  # proxy combiné moyen (fédéral + états)
-            tax_details["source"] = "regional_default_US"
-        elif ci == "FR":
             tax_decimal = 0.25
-            tax_details["source"] = "statutory_FR"
+            tax_details["source"] = "proxy_US"
+        elif ci == "GB" or cc == "GBP":
+            tax_decimal = 0.22
+            tax_details["source"] = "proxy_UK"
+        elif ci == "CH" or cc == "CHF":
+            tax_decimal = 0.18
+            tax_details["source"] = "proxy_CH"
         elif cc == "EUR":
             tax_decimal = 0.25
-            tax_details["source"] = "regional_default_EUR"
+            tax_details["source"] = "proxy_EUR"
         else:
             tax_decimal = 0.25
-            tax_details["source"] = "regional_default_generic"
+            tax_details["source"] = "proxy_generic"
 
     details["inputs"]["tax_details"] = tax_details
     if tax_decimal is None:
@@ -1642,10 +1380,19 @@ def compute_wacc_auto(
     d_w = debt_val / (debt_val + equity_val)
     e_w = equity_val / (debt_val + equity_val)
 
+    if debt_val is not None and equity_val is not None and equity_val > 0 and debt_val > 0:
+        de_ratio = debt_val / equity_val
+        details["inputs"]["de_ratio"] = de_ratio
+        if de_ratio > 5:
+            details["warnings"].append("D/E très élevé → vérifier la cohérence des pondérations.")
+
     wacc_decimal = e_w * re_decimal + d_w * rd_decimal * (1.0 - tax_decimal)
     details["results"]["weights"] = {"D": d_w, "E": e_w}
     details["results"]["wacc_pct"] = wacc_decimal * 100.0
     details["sources"]["wacc"] = "computed"
+
+    if rf_decimal is not None and wacc_decimal < (rf_decimal + 0.02):
+        details["warnings"].append("WACC < risk-free + 2% (cohérence à vérifier).")
 
     return wacc_decimal, details
 
@@ -1819,62 +1566,60 @@ HEALTH_METRICS = [
     {"pillar": "Cash-flow", "key": "cfo_to_net_income", "label": "CFO / Net Income", "higher_better": True, "score_low": 0.80, "score_high": 1.50, "fmt": "x"},
     {"pillar": "Cash-flow", "key": "fcf_to_net_income", "label": "FCF / Net Income", "higher_better": True, "score_low": 0.60, "score_high": 1.20, "fmt": "x"},
     {"pillar": "Cash-flow", "key": "fcf_margin", "label": "FCF Margin", "higher_better": True, "score_low": 0.02, "score_high": 0.15, "fmt": "pct"},
-    {"pillar": "Cash-flow", "key": "capex_to_revenue", "label": "Capex / Revenue", "higher_better": False, "score_low": 0.02, "score_high": 0.15, "fmt": "pct"},
+    {"pillar": "Cash-flow", "key": "capex_to_revenue", "label": "Capex / Revenue", "higher_better": False, "score_low": 0.00, "score_high": 0.12, "fmt": "pct"},
 
-    # Historique
-    {"pillar": "Croissance", "key": "revenue_cagr_5y", "label": "Revenue CAGR (approx, 5y)", "higher_better": True, "score_low": 0.00, "score_high": 0.12, "fmt": "pct"},
+    # Croissance
+    {"pillar": "Croissance", "key": "revenue_cagr_5y", "label": "CAGR CA (5y)", "higher_better": True, "score_low": 0.00, "score_high": 0.12, "fmt": "pct"},
     {"pillar": "Croissance", "key": "fcf_negative_years_pct", "label": "% années FCF négatif (hist.)", "higher_better": False, "score_low": 0.00, "score_high": 0.50, "fmt": "pct"},
 ]
 
 
-def _format_metric_value(value, fmt):
-    if value is None:
+def _format_metric_value(val, fmt="num"):
+    if val is None:
         return None
     try:
-        x = float(value)
+        v = float(val)
     except Exception:
         return None
+
     if fmt == "pct":
-        return x * 100.0
-    return x
+        return f"{v*100:.1f} %"
+    if fmt == "x":
+        return f"{v:.2f}x"
+    return f"{v:.2f}"
 
 
-def build_health_table(company_ratios: dict, peer_distribution: dict | None = None) -> pd.DataFrame:
+def build_health_table(company_ratios: dict, peer_distribution: dict = None):
     """
-    Construit le tableau Health.
-    - Si peer_distribution est fourni (dict key -> list[values]) : score = percentile sectoriel (comparables).
-    - Sinon : score = basé sur des seuils génériques (non sectorisés).
+    Construit un DataFrame des ratios + score par métrique.
+    - Si peer_distribution fourni, score basé sur percentile.
+    - Sinon score basé sur seuils génériques définis dans HEALTH_METRICS.
     """
     rows = []
     for m in HEALTH_METRICS:
         key = m["key"]
         val = company_ratios.get(key)
 
-        median_peer = None
-        percentile = None
-        score = None
-        scoring_method = None
-
         if peer_distribution and key in peer_distribution and peer_distribution[key]:
-            values = [v for v in peer_distribution[key] if v is not None]
-            values = [float(v) for v in values if not (isinstance(v, float) and math.isnan(v))]
-            if values and val is not None:
-                values_sorted = sorted(values)
-                median_peer = values_sorted[len(values_sorted)//2]
-                # percentile
-                pct = 100.0 * (sum(1 for x in values_sorted if x <= val) / len(values_sorted))
-                if not m["higher_better"]:
-                    pct = 100.0 - pct
-                percentile = pct
-                score = max(0.0, min(10.0, pct / 10.0))
-                scoring_method = "Comparables (percentile)"
+            dist = [x for x in peer_distribution[key] if x is not None]
+            if len(dist) > 0 and val is not None:
+                # percentile vs comparables
+                pct = np.mean([1 if v <= val else 0 for v in dist])
+                score = pct * 10
+                percentile = pct * 100
+                scoring_method = "Comparables percentile"
+            else:
+                score = None
+                percentile = None
+                scoring_method = "Comparables percentile"
         else:
             score = _linear_score(
-                value=val,
+                val,
                 low=m.get("score_low"),
                 high=m.get("score_high"),
                 higher_better=m.get("higher_better", True),
             )
+            percentile = None
             scoring_method = "Seuils génériques (non sectorisé)"
 
         rows.append({
@@ -1979,17 +1724,70 @@ def style_health_table(df: pd.DataFrame):
 # MOTEUR DCF
 # =========================================
 
-def project_fcf(fcf_start: float, growth_rate: float, years: int):
-    """
-    Projette un FCF sur 'years' années avec une croissance annuelle constante.
-    Retourne la liste FCF1...FCFn.
-    """
-    fcfs = []
-    current_fcf = fcf_start
-    for _ in range(1, years + 1):
-        current_fcf *= (1 + growth_rate)
-        fcfs.append(current_fcf)
-    return fcfs
+def compute_mad(values):
+    if not values:
+        return 0.0
+    arr = np.array(values, dtype=float)
+    med = float(np.median(arr))
+    return float(np.median(np.abs(arr - med)))
+
+
+def compute_fcf_start_from_history(hist_df: pd.DataFrame, allow_negative: bool):
+    details = {
+        "method": None,
+        "years_used": [],
+        "raw_values": [],
+        "clamped_values": [],
+        "warnings": [],
+        "negative_majority": False,
+    }
+
+    if hist_df is None or hist_df.empty or "FCF (approx)" not in hist_df.columns:
+        return None, details
+
+    df = hist_df.dropna(subset=["FCF (approx)"]).sort_values("Année")
+    if df.empty:
+        return None, details
+
+    window = 5 if len(df) >= 5 else (3 if len(df) >= 3 else len(df))
+    df_window = df.tail(window)
+    years_used = df_window["Année"].tolist()
+    raw_values = df_window["FCF (approx)"].astype(float).tolist()
+
+    med = float(np.median(raw_values))
+    mad = compute_mad(raw_values)
+    if mad > 0:
+        lower = med - 3 * mad
+        upper = med + 3 * mad
+        clamped_values = [min(max(v, lower), upper) for v in raw_values]
+    else:
+        clamped_values = raw_values
+
+    positives = [v for v in clamped_values if v > 0]
+    negative_ratio = 1.0 - (len(positives) / len(clamped_values)) if clamped_values else 1.0
+    if negative_ratio >= 0.5:
+        details["negative_majority"] = True
+
+    fcf_start = None
+    if positives:
+        fcf_start = float(np.mean(positives))
+        details["method"] = "mean_positive_fcf"
+        if len(positives) < min(3, len(clamped_values)):
+            details["warnings"].append("Seulement 1-2 années de FCF positif disponibles.")
+    else:
+        if allow_negative:
+            fcf_start = float(np.mean(clamped_values))
+            details["method"] = "mean_all_fcf_negative_allowed"
+            details["warnings"].append("FCF majoritairement négatif → moyenne des FCF retenue (autorisé).")
+        else:
+            details["warnings"].append("FCF majoritairement négatif → DCF désactivée sans autorisation.")
+            fcf_start = None
+
+    details["years_used"] = years_used
+    details["raw_values"] = raw_values
+    details["clamped_values"] = clamped_values
+
+    return fcf_start, details
 
 
 def discount_cash_flows(fcfs, wacc: float):
@@ -2015,7 +1813,66 @@ def terminal_value(last_fcf: float, wacc: float, g: float):
     return fcf_next / (wacc - g)
 
 
-def dcf_fair_value_per_share(
+def build_fcf_projection(
+    fcf_start: float,
+    growth_fcf: float,
+    g_terminal: float,
+    years: int,
+    constant_growth: bool,
+):
+    if fcf_start is None or years <= 0:
+        return [], []
+
+    if constant_growth or years == 1:
+        growths = [growth_fcf for _ in range(years)]
+    else:
+        growths = [
+            growth_fcf + (g_terminal - growth_fcf) * (i / (years - 1))
+            for i in range(years)
+        ]
+
+    fcfs = []
+    current_fcf = fcf_start
+    for g in growths:
+        current_fcf *= (1 + g)
+        fcfs.append(current_fcf)
+
+    return growths, fcfs
+
+
+def compute_terminal_values(
+    projected_fcfs: list,
+    wacc: float,
+    g_terminal: float,
+    exit_multiple_value: float,
+    exit_multiple_type: str,
+    base_financials: dict,
+):
+    warnings = []
+    tv_gordon = None
+    tv_multiple = None
+
+    if projected_fcfs:
+        last_fcf = projected_fcfs[-1]
+        if wacc > g_terminal:
+            tv_gordon = terminal_value(last_fcf, wacc, g_terminal)
+        else:
+            warnings.append("WACC <= g terminal → TV Gordon indisponible.")
+
+        if exit_multiple_value and exit_multiple_value > 0:
+            if exit_multiple_type == "EV/FCF":
+                tv_multiple = last_fcf * exit_multiple_value
+            elif exit_multiple_type == "EV/EBITDA":
+                ebitda = (base_financials or {}).get("ebitda")
+                if ebitda is not None:
+                    tv_multiple = ebitda * exit_multiple_value
+                else:
+                    warnings.append("EBITDA indisponible → TV multiple EV/EBITDA impossible.")
+
+    return tv_gordon, tv_multiple, warnings
+
+
+def compute_dcf_valuation(
     fcf_start: float,
     growth_fcf: float,
     years: int,
@@ -2023,29 +1880,76 @@ def dcf_fair_value_per_share(
     g_terminal: float,
     net_debt: float,
     shares: float,
+    constant_growth: bool,
+    exit_multiple_value: float,
+    exit_multiple_type: str,
+    exit_method: str,
+    base_financials: dict,
 ):
-    """
-    Calcule une juste valeur par action pour un ensemble de paramètres DCF.
-    Retourne (fair_value_per_share, EV, equity_value, tv_discounted, sum_discounted_fcfs).
-    """
     if shares is None or shares <= 0 or fcf_start is None:
-        return None, None, None, None, None
+        return None, None, None, None, None, [], [], [], None, None, None, []
 
-    projected_fcfs = project_fcf(fcf_start, growth_fcf, years)
+    growths, projected_fcfs = build_fcf_projection(
+        fcf_start=fcf_start,
+        growth_fcf=growth_fcf,
+        g_terminal=g_terminal,
+        years=years,
+        constant_growth=constant_growth,
+    )
+    if not projected_fcfs:
+        return None, None, None, None, None, growths, projected_fcfs, [], None, None, None, []
+
     discounted_fcfs, sum_discounted_fcfs = discount_cash_flows(projected_fcfs, wacc)
+    tv_gordon, tv_multiple, tv_warnings = compute_terminal_values(
+        projected_fcfs=projected_fcfs,
+        wacc=wacc,
+        g_terminal=g_terminal,
+        exit_multiple_value=exit_multiple_value,
+        exit_multiple_type=exit_multiple_type,
+        base_financials=base_financials,
+    )
 
-    tv = terminal_value(projected_fcfs[-1], wacc, g_terminal)
-    if tv is None:
-        return None, None, None, None, None
+    tv_selected = None
+    tv_method_used = None
+    if exit_method == "Exit multiple":
+        tv_selected = tv_multiple
+        tv_method_used = "exit_multiple"
+    elif exit_method == "Moyenne des deux":
+        if tv_gordon is not None and tv_multiple is not None:
+            tv_selected = (tv_gordon + tv_multiple) / 2.0
+            tv_method_used = "average_gordon_multiple"
+        else:
+            tv_selected = tv_gordon if tv_gordon is not None else tv_multiple
+            tv_method_used = "fallback_single_method"
+            tv_warnings.append("Moyenne indisponible → méthode unique utilisée.")
+    else:
+        tv_selected = tv_gordon
+        tv_method_used = "gordon"
 
-    tv_discounted = tv / ((1 + wacc) ** years)
+    if tv_selected is None:
+        return None, None, None, None, None, growths, projected_fcfs, discounted_fcfs, tv_gordon, tv_multiple, tv_method_used, tv_warnings
+
+    tv_discounted = tv_selected / ((1 + wacc) ** years)
     ev = sum_discounted_fcfs + tv_discounted
 
     net_debt_used = net_debt if net_debt is not None else 0.0
     equity_value = ev - net_debt_used
     fair_value_per_share = equity_value / shares
 
-    return fair_value_per_share, ev, equity_value, tv_discounted, sum_discounted_fcfs
+    return (
+        fair_value_per_share,
+        ev,
+        equity_value,
+        tv_discounted,
+        sum_discounted_fcfs,
+        growths,
+        projected_fcfs,
+        discounted_fcfs,
+        tv_gordon,
+        tv_multiple,
+        tv_method_used,
+        tv_warnings,
+    )
 
 
 def build_sensitivity_matrix(
@@ -2056,49 +1960,140 @@ def build_sensitivity_matrix(
     base_g: float,
     net_debt: float,
     shares: float,
+    constant_growth: bool,
+    exit_multiple_value: float,
+    exit_multiple_type: str,
+    exit_method: str,
+    base_financials: dict,
 ):
     """
-    Construit une matrice de sensibilité DCF en faisant varier WACC et g.
-    Les cellules contiennent la juste valeur par action.
+    Matrice standard : WACC +/- 0.5% et g = 1.0%, 1.5%, 2.0%.
+    Toujours renvoyée, même si valeurs None.
     """
-    wacc_values = sorted(
-        {
-            max(0.01, base_wacc - 0.01),
-            max(0.01, base_wacc - 0.005),
-            base_wacc,
-            base_wacc + 0.005,
-            base_wacc + 0.01,
-        }
-    )
-    g_values = sorted(
-        {
-            max(0.0, base_g - 0.005),
-            base_g,
-            base_g + 0.005,
-        }
-    )
-
-    g_values = [g for g in g_values if g < max(wacc_values)]
+    wacc_values = [
+        None if base_wacc is None else max(0.0001, base_wacc - 0.005),
+        base_wacc,
+        None if base_wacc is None else base_wacc + 0.005,
+    ]
+    g_values = [0.01, 0.015, 0.02]
 
     data = {}
     for g in g_values:
         row = []
         for w in wacc_values:
-            fv, _, _, _, _ = dcf_fair_value_per_share(
+            if w is None or fcf_start is None or shares in (None, 0) or years <= 0:
+                row.append(float("nan"))
+                continue
+            g_adj = min(g, max(0.0, w - 0.002)) if g >= w else g
+            fv, _, _, _, _, _, _, _, _, _, _, _ = compute_dcf_valuation(
                 fcf_start=fcf_start,
                 growth_fcf=growth_fcf,
                 years=years,
                 wacc=w,
-                g_terminal=g,
+                g_terminal=g_adj,
                 net_debt=net_debt,
                 shares=shares,
+                constant_growth=constant_growth,
+                exit_multiple_value=exit_multiple_value,
+                exit_multiple_type=exit_multiple_type,
+                exit_method=exit_method,
+                base_financials=base_financials,
             )
             row.append(fv if fv is not None else float("nan"))
         data[f"g = {g*100:.2f} %"] = row
 
-    index_labels = [f"WACC = {w*100:.2f} %" for w in wacc_values]
+    index_labels = [
+        f"WACC = {w*100:.2f} %" if w is not None else "WACC = N/A"
+        for w in wacc_values
+    ]
     df_matrix = pd.DataFrame(data, index=index_labels)
     return df_matrix
+
+
+def build_tornado_table(
+    base_fair_value: float,
+    fcf_start: float,
+    growth_fcf: float,
+    years: int,
+    wacc: float,
+    g_terminal: float,
+    net_debt: float,
+    shares: float,
+    constant_growth: bool,
+    exit_multiple_value: float,
+    exit_multiple_type: str,
+    exit_method: str,
+    base_financials: dict,
+):
+    if base_fair_value is None:
+        return pd.DataFrame()
+
+    scenarios = [
+        ("Croissance +0.5%", growth_fcf + 0.005, wacc, g_terminal, fcf_start),
+        ("Croissance -0.5%", growth_fcf - 0.005, wacc, g_terminal, fcf_start),
+        ("WACC +0.5%", growth_fcf, wacc + 0.005, g_terminal, fcf_start),
+        ("WACC -0.5%", growth_fcf, max(0.0001, wacc - 0.005), g_terminal, fcf_start),
+        ("g terminal +0.25%", growth_fcf, wacc, g_terminal + 0.0025, fcf_start),
+        ("g terminal -0.25%", growth_fcf, wacc, max(0.0, g_terminal - 0.0025), fcf_start),
+        ("FCF_start +10%", growth_fcf, wacc, g_terminal, fcf_start * 1.10 if fcf_start is not None else None),
+        ("FCF_start -10%", growth_fcf, wacc, g_terminal, fcf_start * 0.90 if fcf_start is not None else None),
+    ]
+
+    rows = []
+    for label, g_rate, w_rate, g_term, fcf_base in scenarios:
+        fv, _, _, _, _, _, _, _, _, _, _, _ = compute_dcf_valuation(
+            fcf_start=fcf_base,
+            growth_fcf=g_rate,
+            years=years,
+            wacc=w_rate,
+            g_terminal=g_term,
+            net_debt=net_debt,
+            shares=shares,
+            constant_growth=constant_growth,
+            exit_multiple_value=exit_multiple_value,
+            exit_multiple_type=exit_multiple_type,
+            exit_method=exit_method,
+            base_financials=base_financials,
+        )
+        impact = None if fv is None else fv - base_fair_value
+        rows.append({"Hypothèse": label, "Fair value / action": fv, "Impact vs base": impact})
+
+    return pd.DataFrame(rows)
+
+
+def validate_inputs_and_data(
+    profile: dict,
+    fcf_start: float,
+    fcf_details: dict,
+    shares: float,
+    net_debt: float,
+    wacc_used: float,
+    g_terminal: float,
+    allow_negative_fcf: bool,
+):
+    missing = []
+    warnings = []
+
+    if fcf_start is None:
+        missing.append("fcf_start")
+    if shares in (None, 0):
+        missing.append("shares")
+    if net_debt is None:
+        missing.append("net_debt")
+    if wacc_used in (None, 0):
+        missing.append("wacc")
+    if (wacc_used not in (None, 0)) and (g_terminal is not None) and (wacc_used <= g_terminal):
+        missing.append("wacc<=g_terminal")
+
+    if fcf_details and fcf_details.get("negative_majority") and not allow_negative_fcf:
+        missing.append("fcf_negative_majority")
+
+    if profile.get("cap_size") == "SmallCap":
+        warnings.append("DCF neutralisée pour SmallCap (profil).")
+
+    dcf_allowed = (profile.get("cap_size") != "SmallCap") and len(missing) == 0
+
+    return dcf_allowed, missing, warnings
 
 
 # =========================================
@@ -2358,165 +2353,392 @@ def default_target_multiples(profile: dict, base_metrics: dict):
     # -> On ancre sur le courant si exploitable, sinon on fallback sur une cible "absolue"
     # -----------------------------
     # PE
-    if safe_positive(pe_current):
-        targets["PE"] = clamp(pe_current * m["PE"], *pe_bounds)
+    if pe_current is not None and pe_current > 0:
+        pe_tgt = pe_current * m["PE"]
     else:
-        base_pe = 14 if tier in ("value", "low_quality") else 18
-        if tier in ("growth", "quality_growth"):
-            base_pe = 24 if software_like else 20
-        targets["PE"] = clamp(base_pe, *pe_bounds)
+        pe_tgt = 15 * m["PE"]
+    pe_tgt = clamp(pe_tgt, pe_bounds[0], pe_bounds[1])
+    targets["PE"] = pe_tgt
 
     # PB
-    if safe_positive(pb_current):
-        targets["PB"] = clamp(pb_current * m["PB"], *pb_bounds)
+    if pb_current is not None and pb_current > 0:
+        pb_tgt = pb_current * m["PB"]
     else:
-        base_pb = 1.2 if tier in ("value", "low_quality") else 1.8
-        if tier in ("growth", "quality_growth"):
-            base_pb = 4.5 if software_like else 2.5
-        targets["PB"] = clamp(base_pb, *pb_bounds)
+        pb_tgt = 2.0 * m["PB"]
+    pb_tgt = clamp(pb_tgt, pb_bounds[0], pb_bounds[1])
+    targets["PB"] = pb_tgt
 
     # EV/EBITDA
-    if safe_positive(ev_ebitda_current):
-        targets["EV_EBITDA"] = clamp(ev_ebitda_current * m["EV_EBITDA"], *ev_ebitda_bounds)
+    if ev_ebitda_current is not None and ev_ebitda_current > 0:
+        ebitda_tgt = ev_ebitda_current * m["EV_EBITDA"]
     else:
-        base = 9 if tier in ("value", "low_quality") else 12
-        if tier in ("growth", "quality_growth"):
-            base = 20 if software_like else 15
-        targets["EV_EBITDA"] = clamp(base, *ev_ebitda_bounds)
+        ebitda_tgt = 10 * m["EV_EBITDA"]
+    ebitda_tgt = clamp(ebitda_tgt, ev_ebitda_bounds[0], ev_ebitda_bounds[1])
+    targets["EV_EBITDA"] = ebitda_tgt
 
     # EV/EBIT
-    if safe_positive(ev_ebit_current):
-        targets["EV_EBIT"] = clamp(ev_ebit_current * m["EV_EBIT"], *ev_ebit_bounds)
+    if ev_ebit_current is not None and ev_ebit_current > 0:
+        ebit_tgt = ev_ebit_current * m["EV_EBIT"]
     else:
-        base = 11 if tier in ("value", "low_quality") else 14
-        if tier in ("growth", "quality_growth"):
-            base = 24 if software_like else 17
-        targets["EV_EBIT"] = clamp(base, *ev_ebit_bounds)
+        ebit_tgt = 12 * m["EV_EBIT"]
+    ebit_tgt = clamp(ebit_tgt, ev_ebit_bounds[0], ev_ebit_bounds[1])
+    targets["EV_EBIT"] = ebit_tgt
 
     # EV/Sales
-    if safe_positive(ev_sales_current):
-        targets["EV_SALES"] = clamp(ev_sales_current * m["EV_SALES"], *ev_sales_bounds)
+    if ev_sales_current is not None and ev_sales_current > 0:
+        ev_sales_tgt = ev_sales_current * m["EV_SALES"]
     else:
-        base = 1.4 if tier in ("value", "low_quality") else 2.0
-        if tier in ("growth", "quality_growth"):
-            base = 6.0 if software_like else 3.0
-        targets["EV_SALES"] = clamp(base, *ev_sales_bounds)
+        ev_sales_tgt = 2.0 * m["EV_SALES"]
+    ev_sales_tgt = clamp(ev_sales_tgt, ev_sales_bounds[0], ev_sales_bounds[1])
+    targets["EV_SALES"] = ev_sales_tgt
 
     return targets
 
 
+# =========================================
+# MÉTHODES DE VALORISATION VIA MULTIPLES
+# =========================================
 
-
-def compute_multiples_valuations(base_metrics: dict, net_debt, shares, targets: dict, base_financials: dict = None):
+def compute_multiples_valuations(base_metrics: dict, net_debt: float, shares: float, targets: dict, base_financials: dict):
     """
-    Calcule les fair values par méthode de multiples en utilisant les cibles.
-    Retourne un dict par méthode : multiple courant, multiple cible, fair value.
-
-    IMPORTANT :
-    - base_metrics = ratios déjà calculés (PE, EV/EBITDA, EV/Sales, PB...)
-    - base_financials = agrégats comptables bruts (revenue, ebitda, ebit, net_income, book_equity)
-      -> utilisé pour décider si un multiple est interprétable.
+    Calcule des fair values par action à partir des multiples cibles.
+    Renvoie un dict clé -> {target_multiple, fair_value, current_multiple}.
     """
+    results = {}
 
-    price = None
-    if base_metrics.get("market_cap") is not None and shares not in (None, 0):
-        price = base_metrics["market_cap"] / shares
-
-    # Agrégats : on prend en priorité base_metrics s'ils existent,
-    # sinon fallback sur base_financials (cas le plus fréquent chez toi)
-    base_financials = base_financials or {}
-
+    # P/E
     eps = base_metrics.get("eps")
+    pe_target = targets.get("PE")
+    fv_pe = pe_valuation(eps, pe_target)
+    results["PE"] = {
+        "current_multiple": base_metrics.get("pe"),
+        "target_multiple": pe_target,
+        "fair_value": fv_pe,
+    }
+
+    # P/B
     bvps = base_metrics.get("bvps")
+    pb_target = targets.get("PB")
+    fv_pb = pb_valuation(bvps, pb_target)
+    results["PB"] = {
+        "current_multiple": base_metrics.get("pb"),
+        "target_multiple": pb_target,
+        "fair_value": fv_pb,
+    }
 
-    revenue = base_metrics.get("revenue")
-    if revenue is None:
-        revenue = base_financials.get("revenue")
+    # EV/EBITDA
+    ebitda = base_financials.get("ebitda")
+    ev_ebitda_target = targets.get("EV_EBITDA")
+    fv_ev_ebitda = ev_ebitda_valuation(ebitda, net_debt, shares, ev_ebitda_target)
+    results["EV_EBITDA"] = {
+        "current_multiple": base_metrics.get("ev_ebitda"),
+        "target_multiple": ev_ebitda_target,
+        "fair_value": fv_ev_ebitda,
+    }
 
-    ebitda = base_metrics.get("ebitda")
-    if ebitda is None:
-        ebitda = base_financials.get("ebitda")
+    # EV/EBIT
+    ebit = base_financials.get("ebit")
+    ev_ebit_target = targets.get("EV_EBIT")
+    fv_ev_ebit = ev_ebit_valuation(ebit, net_debt, shares, ev_ebit_target)
+    results["EV_EBIT"] = {
+        "current_multiple": base_metrics.get("ev_ebit"),
+        "target_multiple": ev_ebit_target,
+        "fair_value": fv_ev_ebit,
+    }
 
+    # EV/Sales
+    revenue = base_financials.get("revenue")
+    ev_sales_target = targets.get("EV_SALES")
+    fv_ev_sales = ev_sales_valuation(revenue, net_debt, shares, ev_sales_target)
+    results["EV_SALES"] = {
+        "current_multiple": base_metrics.get("ev_sales"),
+        "target_multiple": ev_sales_target,
+        "fair_value": fv_ev_sales,
+    }
+
+    return results
+
+
+# =========================================
+# PROFIL DE QUALITÉ
+# =========================================
+
+def compute_quality_profile(company: dict, base_metrics: dict, hist_df: pd.DataFrame):
+    """
+    Identifie un style de qualité / croissance / value avec heuristiques simples.
+    Renvoie un dict {style, quality, growth, sector}.
+    """
+    style = "Core"
+    quality = "Normal"
+    growth = "Normal"
+
+    # heuristiques très simples
+    pe = base_metrics.get("pe")
+    ev_ebitda = base_metrics.get("ev_ebitda")
+    rev_cagr = compute_revenue_cagr(hist_df)
+
+    if pe is not None and pe > 30:
+        style = "Growth"
+    elif pe is not None and pe < 15:
+        style = "Value"
+
+    if ev_ebitda is not None and ev_ebitda < 8:
+        style = "Value"
+
+    if rev_cagr is not None and rev_cagr > 0.10:
+        growth = "High"
+    elif rev_cagr is not None and rev_cagr < 0.02:
+        growth = "Low"
+
+    # Qualité approximée : si marge EBIT élevée et ROE élevé
+    # On réutilise base_metrics (approx)
     ebit = base_metrics.get("ebit")
-    if ebit is None:
-        ebit = base_financials.get("ebit")
+    revenue = base_metrics.get("revenue")
+    net_income = base_metrics.get("net_income")
+    book_equity = base_metrics.get("book_equity")
 
-    current = {
-        "PE": base_metrics.get("pe"),
-        "EV_EBITDA": base_metrics.get("ev_ebitda"),
-        "EV_EBIT": base_metrics.get("ev_ebit"),
-        "EV_SALES": base_metrics.get("ev_sales"),
-        "PB": base_metrics.get("pb"),
+    ebit_margin = (ebit / revenue) if (ebit not in (None, 0) and revenue not in (None, 0)) else None
+    roe = (net_income / book_equity) if (net_income not in (None, 0) and book_equity not in (None, 0)) else None
+
+    if ebit_margin is not None and roe is not None:
+        if ebit_margin > 0.15 and roe > 0.15:
+            quality = "High"
+        elif ebit_margin < 0.05 or roe < 0.05:
+            quality = "Low"
+
+    sector = company.get("Sector")
+
+    return {
+        "style": style,
+        "quality": quality,
+        "growth": growth,
+        "sector": sector,
     }
 
-    # Nettoyage marché : on désactive uniquement les méthodes réellement non interprétables
-    targets_clean = dict(targets or {})
 
-    # PE : EPS doit être > 0
-    if eps is None or eps <= 0:
-        targets_clean["PE"] = None
+# =========================================
+# DÉTERMINATION DU PROFIL & DES MULTIPLES
+# =========================================
 
-    # PB : BVPS doit être > 0
-    if bvps is None or bvps <= 0:
-        targets_clean["PB"] = None
+def assign_profile_tags(company: dict, base_metrics: dict, hist_df: pd.DataFrame):
+    """
+    Ajoute un mini-profil "style" / "quality" / "growth" au profil existant.
+    """
+    profile = compute_quality_profile(company, base_metrics, hist_df)
+    return profile
 
-    # EV/EBITDA : EBITDA doit être > 0
-    if ebitda is None or ebitda <= 0:
-        targets_clean["EV_EBITDA"] = None
 
-    # EV/EBIT : EBIT doit être > 0
-    if ebit is None or ebit <= 0:
-        targets_clean["EV_EBIT"] = None
+def get_profile_with_tags(company: dict, base_metrics: dict, hist_df: pd.DataFrame):
+    """
+    Combine le profil "cap_size" + tags qualitatifs.
+    """
+    base_profile = classify_company_profile(company, base_metrics, hist_df)
+    tags = assign_profile_tags(company, base_metrics, hist_df)
+    base_profile.update(tags)
+    return base_profile
 
-    # EV/Sales : Revenue doit être > 0
-    if revenue is None or revenue <= 0:
-        targets_clean["EV_SALES"] = None
 
-    # Valorisations
-    fair_pe = pe_valuation(eps, targets_clean.get("PE"))
-    fair_pb = pb_valuation(bvps, targets_clean.get("PB"))
+# =========================================
+# PETIT HELPER : safe divide
+# =========================================
 
-    fair_ev_ebitda = ev_ebitda_valuation(
-        ebitda, net_debt, shares, targets_clean.get("EV_EBITDA")
-    )
-    fair_ev_ebit = ev_ebit_valuation(
-        ebit, net_debt, shares, targets_clean.get("EV_EBIT")
-    )
-    fair_ev_sales = ev_sales_valuation(
-        revenue, net_debt, shares, targets_clean.get("EV_SALES")
-    )
+def safe_div(a, b):
+    if a is None or b in (None, 0):
+        return None
+    try:
+        return a / b
+    except Exception:
+        return None
 
-    valuations = {
-        "PE": {
-            "current_multiple": current["PE"],
-            "target_multiple": targets_clean.get("PE"),
-            "fair_value": fair_pe,
-        },
-        "PB": {
-            "current_multiple": current["PB"],
-            "target_multiple": targets_clean.get("PB"),
-            "fair_value": fair_pb,
-        },
-        "EV_EBITDA": {
-            "current_multiple": current["EV_EBITDA"],
-            "target_multiple": targets_clean.get("EV_EBITDA"),
-            "fair_value": fair_ev_ebitda,
-        },
-        "EV_EBIT": {
-            "current_multiple": current["EV_EBIT"],
-            "target_multiple": targets_clean.get("EV_EBIT"),
-            "fair_value": fair_ev_ebit,
-        },
-        "EV_SALES": {
-            "current_multiple": current["EV_SALES"],
-            "target_multiple": targets_clean.get("EV_SALES"),
-            "fair_value": fair_ev_sales,
-        },
+
+# =========================================
+# API CACHING
+# =========================================
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_fundamentals_cached(ticker: str, api_key: str):
+    return fetch_fundamentals(ticker, api_key)
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_eod_price_cached(ticker: str, api_key: str):
+    return fetch_eod_price(ticker, api_key)
+
+
+# =========================================
+# EXTRACTION SNAPSHOT CASH FLOW
+# =========================================
+
+def extract_cashflow_snapshot(fundamentals: dict):
+    """
+    Extrait un snapshot de cash-flow (dernier exercice annuel) : CFO, capex, FCF.
+    """
+    cf = fundamentals.get("Financials", {}).get("Cash_Flow", {}).get("yearly", {})
+    year, row = _extract_latest_year_row(cf)
+
+    def get_first(keys):
+        return pick_first_non_null(row, keys)
+
+    cfo = get_first([
+        "totalCashFromOperatingActivities",
+        "TotalCashFromOperatingActivities",
+        "NetCashProvidedByOperatingActivities",
+        "NetCashFromOperatingActivities",
+        "OperatingCashFlow",
+    ])
+    capex = get_first([
+        "capitalExpenditures",
+        "CapitalExpenditures",
+        "investmentsInPropertyPlantAndEquipment",
+        "InvestmentsInPropertyPlantAndEquipment",
+    ])
+    fcf = pick_first_non_null(row, ["freeCashFlow", "FreeCashFlow", "fcf", "FCF"])
+
+    if fcf is None and (cfo is not None and capex is not None):
+        fcf = cfo - capex
+
+    snap = {
+        "cfo": cfo,
+        "capex": capex,
+        "fcf": fcf,
     }
+    return year, snap
 
-    return valuations
+
+# =========================================
+# CALCUL D'UN FCF "NORMALISÉ"
+# =========================================
+
+def estimate_normalized_fcf_v2(hist_df: pd.DataFrame):
+    """
+    Variante plus robuste (optionnelle) :
+    - médiane des FCF positifs sur 3-5 ans
+    """
+    if hist_df is None or hist_df.empty:
+        return None
+    if "FCF (approx)" not in hist_df.columns:
+        return None
+
+    s = hist_df["FCF (approx)"].dropna()
+    s = s[s > 0]
+    if len(s) == 0:
+        return None
+
+    # médiane des 3-5 dernières années positives
+    s = s.tail(5)
+    return float(np.median(s))
 
 
+# =========================================
+# PROJECTION FCF & DCF
+# =========================================
+
+def project_fcf_linear(fcf_start: float, growth_start: float, growth_end: float, years: int):
+    """
+    Projette un FCF avec un taux de croissance linéairement décroissant de growth_start à growth_end.
+    Renvoie la liste FCF1...FCFn.
+    """
+    if years <= 0:
+        return []
+
+    growths = np.linspace(growth_start, growth_end, years)
+    fcf = fcf_start
+    projected = []
+    for g in growths:
+        fcf *= (1 + g)
+        projected.append(fcf)
+    return projected
+
+
+# =========================================
+# DCF & SENSIBILITÉS
+# =========================================
+
+def dcf_with_linear_growth(
+    fcf_start: float,
+    growth_fcf: float,
+    g_terminal: float,
+    years: int,
+    wacc: float,
+    net_debt: float,
+    shares: float,
+):
+    """
+    DCF avec croissance qui se réduit linéairement de growth_fcf à g_terminal.
+    """
+    if shares in (None, 0) or fcf_start is None:
+        return None, None, None, None, None
+
+    projected_fcfs = project_fcf_linear(fcf_start, growth_fcf, g_terminal, years)
+    discounted_fcfs, sum_discounted_fcfs = discount_cash_flows(projected_fcfs, wacc)
+
+    tv = terminal_value(projected_fcfs[-1], wacc, g_terminal)
+    if tv is None:
+        return None, None, None, None, None
+
+    tv_discounted = tv / ((1 + wacc) ** years)
+    ev = sum_discounted_fcfs + tv_discounted
+    equity_value = ev - (net_debt or 0)
+    fair_value_per_share = equity_value / shares
+
+    return fair_value_per_share, ev, equity_value, tv_discounted, sum_discounted_fcfs
+
+
+def build_sensitivity_matrix_linear(
+    fcf_start: float,
+    growth_fcf: float,
+    g_terminal: float,
+    years: int,
+    base_wacc: float,
+    net_debt: float,
+    shares: float,
+):
+    """
+    Matrice de sensibilité WACC/g pour DCF linéaire.
+    """
+    wacc_values = sorted(
+        {
+            max(0.01, base_wacc - 0.01),
+            max(0.01, base_wacc - 0.005),
+            base_wacc,
+            base_wacc + 0.005,
+            base_wacc + 0.01,
+        }
+    )
+    g_values = sorted(
+        {
+            max(0.0, g_terminal - 0.005),
+            g_terminal,
+            g_terminal + 0.005,
+        }
+    )
+
+    g_values = [g for g in g_values if g < max(wacc_values)]
+
+    data = {}
+    for g in g_values:
+        row = []
+        for w in wacc_values:
+            fv, _, _, _, _ = dcf_with_linear_growth(
+                fcf_start=fcf_start,
+                growth_fcf=growth_fcf,
+                g_terminal=g,
+                years=years,
+                wacc=w,
+                net_debt=net_debt,
+                shares=shares,
+            )
+            row.append(fv if fv is not None else float("nan"))
+        data[f"g = {g*100:.2f} %"] = row
+
+    index_labels = [f"WACC = {w*100:.2f} %" for w in wacc_values]
+    df_matrix = pd.DataFrame(data, index=index_labels)
+    return df_matrix
+
+
+# =========================================
+# DÉTERMINATION DE LA JUSTE VALEUR GLOBALE
+# =========================================
 
 def combine_global_valuation(dcf_value: float, multiples_vals: dict, weights: dict, price: float):
     """
@@ -2590,7 +2812,16 @@ def combine_global_valuation(dcf_value: float, multiples_vals: dict, weights: di
 # =========================================
 # PIPELINE PRINCIPAL POUR UNE SOCIÉTÉ
 # =========================================
-def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fcf: float, g_terminal: float, wacc_cfg: dict = None):
+def analyze_company(
+    query: str,
+    api_key: str,
+    years: int,
+    wacc: float,
+    growth_fcf: float,
+    g_terminal: float,
+    wacc_cfg: dict = None,
+    dcf_cfg: dict = None,
+):
     """
     Pipeline complet :
     - Recherche par nom/ticker
@@ -2717,10 +2948,14 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     # =========================
     # Estimation du FCF de départ (pour DCF éventuel)
     # =========================
-    fcf_last = estimate_starting_fcf(fundamentals)
-    fcf_norm = estimate_normalized_fcf(hist_df)
-
-    fcf_start = fcf_norm if fcf_norm is not None else fcf_last
+    allow_negative_fcf = bool((dcf_cfg or {}).get("allow_negative_fcf", False))
+    fcf_start, fcf_details = compute_fcf_start_from_history(hist_df, allow_negative_fcf)
+    if fcf_start is None:
+        fcf_last = estimate_starting_fcf(fundamentals)
+        if fcf_last is not None:
+            fcf_start = fcf_last
+            if fcf_details:
+                fcf_details["warnings"].append("Fallback sur dernier FCF disponible (année la plus récente).")
 
     # =========================
     # DCF : seulement si la société n'est PAS small cap et si données suffisantes
@@ -2731,29 +2966,52 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
     tv_discounted = None
     sum_disc_fcfs = None
     upside_dcf = None
-    proj_df = None
-    sens_matrix = None
+    proj_df = pd.DataFrame()
+    sens_matrix = pd.DataFrame()
+    tornado_df = pd.DataFrame()
+    tv_gordon = None
+    tv_multiple = None
+    tv_method_used = None
 
     # =========================
-    dcf_missing = []
-    if fcf_start is None:
-        dcf_missing.append('fcf_start')
-    if shares in (None, 0):
-        dcf_missing.append('shares')
-    if net_debt is None:
-        dcf_missing.append('net_debt')
-    if wacc_used in (None, 0):
-        dcf_missing.append('wacc')
-    if (wacc_used not in (None, 0)) and (g_terminal is not None) and (wacc_used <= g_terminal):
-        dcf_missing.append('wacc<=g_terminal')
-
-    dcf_allowed = (
-        profile.get('cap_size') != 'SmallCap'
-        and len(dcf_missing) == 0
+    dcf_allowed, dcf_missing, dcf_warnings = validate_inputs_and_data(
+        profile=profile,
+        fcf_start=fcf_start,
+        fcf_details=fcf_details,
+        shares=shares,
+        net_debt=net_debt,
+        wacc_used=wacc_used,
+        g_terminal=g_terminal,
+        allow_negative_fcf=allow_negative_fcf,
     )
+    if fcf_details:
+        dcf_warnings.extend(fcf_details.get("warnings", []))
+    if wacc_used is not None and g_terminal is not None and (wacc_used - g_terminal) < 0.02:
+        dcf_warnings.append("WACC - g terminal < 2% (cohérence à vérifier).")
+
+    constant_growth = bool((dcf_cfg or {}).get("constant_growth", False))
+    exit_multiple_value = float((dcf_cfg or {}).get("exit_multiple_value", 0.0) or 0.0)
+    exit_multiple_type = (dcf_cfg or {}).get("exit_multiple_type", "EV/FCF")
+    exit_method = (dcf_cfg or {}).get("exit_method", "Gordon")
+    if exit_multiple_value <= 0 and exit_method != "Gordon":
+        dcf_warnings.append("Exit multiple non renseigné → Gordon utilisé par défaut.")
+        exit_method = "Gordon"
 
     if dcf_allowed:
-        fv_dcf, ev, equity_value, tv_discounted, sum_disc_fcfs = dcf_fair_value_per_share(
+        (
+            fv_dcf,
+            ev,
+            equity_value,
+            tv_discounted,
+            sum_disc_fcfs,
+            growths,
+            projected_fcfs,
+            discounted_fcfs,
+            tv_gordon,
+            tv_multiple,
+            tv_method_used,
+            tv_warnings,
+        ) = compute_dcf_valuation(
             fcf_start=fcf_start,
             growth_fcf=growth_fcf,
             years=years,
@@ -2761,7 +3019,13 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             g_terminal=g_terminal,
             net_debt=net_debt,
             shares=shares,
+            constant_growth=constant_growth,
+            exit_multiple_value=exit_multiple_value,
+            exit_multiple_type=exit_multiple_type,
+            exit_method=exit_method,
+            base_financials=base_financials,
         )
+        dcf_warnings.extend(tv_warnings)
 
         if fv_dcf is not None and price not in (None, 0):
             upside_dcf = (fv_dcf / price - 1) * 100
@@ -2769,11 +3033,10 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             upside_dcf = None
 
         # Projections FCF & sensibilité
-        projected_fcfs = project_fcf(fcf_start, growth_fcf, years)
-        discounted_fcfs, _ = discount_cash_flows(projected_fcfs, wacc_used)
         proj_df = pd.DataFrame(
             {
                 "Année": [f"Année {i}" for i in range(1, years + 1)],
+                "Croissance appliquée": [g for g in growths],
                 "FCF projeté": projected_fcfs,
                 "FCF actualisé": discounted_fcfs,
             }
@@ -2787,6 +3050,27 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             base_g=g_terminal,
             net_debt=net_debt,
             shares=shares,
+            constant_growth=constant_growth,
+            exit_multiple_value=exit_multiple_value,
+            exit_multiple_type=exit_multiple_type,
+            exit_method=exit_method,
+            base_financials=base_financials,
+        )
+
+        tornado_df = build_tornado_table(
+            base_fair_value=fv_dcf,
+            fcf_start=fcf_start,
+            growth_fcf=growth_fcf,
+            years=years,
+            wacc=wacc_used,
+            g_terminal=g_terminal,
+            net_debt=net_debt,
+            shares=shares,
+            constant_growth=constant_growth,
+            exit_multiple_value=exit_multiple_value,
+            exit_multiple_type=exit_multiple_type,
+            exit_method=exit_method,
+            base_financials=base_financials,
         )
     else:
         # DCF non pertinent ou impossible → on neutralise toutes les sorties DCF
@@ -2797,7 +3081,21 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
         sum_disc_fcfs = None
         upside_dcf = None
         proj_df = pd.DataFrame()
-        sens_matrix = pd.DataFrame()
+        sens_matrix = build_sensitivity_matrix(
+            fcf_start=fcf_start,
+            growth_fcf=growth_fcf,
+            years=years,
+            base_wacc=wacc_used,
+            base_g=g_terminal,
+            net_debt=net_debt,
+            shares=shares,
+            constant_growth=constant_growth,
+            exit_multiple_value=exit_multiple_value,
+            exit_multiple_type=exit_multiple_type,
+            exit_method=exit_method,
+            base_financials=base_financials,
+        )
+        tornado_df = pd.DataFrame()
 
     # =========================
     # Multiples : cibles & valorisations (INCHANGÉ)
@@ -2840,14 +3138,24 @@ def analyze_company(query: str, api_key: str, years: int, wacc: float, growth_fc
             "wacc_source": wacc_source,
             "wacc_details": wacc_details,
             "dcf_missing": dcf_missing,
+            "dcf_warnings": dcf_warnings,
             "fair_value_per_share": fv_dcf,
             "ev": ev,
             "equity_value": equity_value,
             "tv_discounted": tv_discounted,
             "sum_disc_fcfs": sum_disc_fcfs,
             "upside_pct": upside_dcf,
+            "fcf_details": fcf_details,
+            "constant_growth": constant_growth,
+            "exit_multiple_type": exit_multiple_type,
+            "exit_multiple_value": exit_multiple_value,
+            "exit_method": exit_method,
+            "tv_gordon": tv_gordon if dcf_allowed else None,
+            "tv_multiple": tv_multiple if dcf_allowed else None,
+            "tv_method_used": tv_method_used if dcf_allowed else None,
         },
         "sensitivity": sens_matrix,
+        "tornado_df": tornado_df,
         "base_financials": base_financials,
         "base_metrics": base_metrics,
         "profile": profile,
@@ -2930,6 +3238,15 @@ def main():
     with col2:
         override_rd = st.checkbox("Override Rd", value=False)
 
+    beta_blend = st.sidebar.checkbox("Beta blend (EODHD + sector)", value=True)
+    beta_sector_override = st.sidebar.number_input(
+        "Beta sectoriel (optionnel)",
+        min_value=0.0,
+        max_value=3.0,
+        value=0.0,
+        step=0.05,
+    )
+
     beta_override = None
     if override_beta:
         beta_override = st.sidebar.number_input("Beta override", min_value=0.0, max_value=5.0, value=1.0, step=0.05)
@@ -2953,12 +3270,31 @@ def main():
         value=3.0,
         step=0.1,
     )
+    constant_growth = st.sidebar.checkbox("Croissance constante", value=False)
+    allow_negative_fcf = st.sidebar.checkbox("Autoriser DCF si FCF négatif", value=False)
     g_terminal_input = st.sidebar.number_input(
         "Croissance long terme g (%)",
         min_value=1.0,
         max_value=2.0,
         value=1.75,
         step=0.05,
+    )
+    exit_method = st.sidebar.selectbox(
+        "Méthode de valeur terminale",
+        ["Gordon", "Exit multiple", "Moyenne des deux"],
+        index=0,
+    )
+    exit_multiple_type = st.sidebar.selectbox(
+        "Exit multiple type",
+        ["EV/FCF", "EV/EBITDA"],
+        index=0,
+    )
+    exit_multiple_value = st.sidebar.number_input(
+        "Exit multiple (0 = désactivé)",
+        min_value=0.0,
+        max_value=50.0,
+        value=0.0,
+        step=0.5,
     )
 
     wacc = wacc_input / 100.0
@@ -2998,6 +3334,8 @@ def main():
                 "erp_eur_pct": float(erp_eur),
                 "erp_default_pct": float(erp_us),
                 "beta_override": beta_override,
+                "beta_blend": bool(beta_blend),
+                "beta_sector_override": (beta_sector_override if beta_sector_override > 0 else None),
                 "rd_override_pct": rd_override_pct,
                 "tax_override_pct": tax_override_pct,
                 "allow_heuristic_rd": bool(allow_heuristic_rd),
@@ -3012,6 +3350,13 @@ def main():
                 growth_fcf,
                 g_terminal,
                 wacc_cfg=wacc_cfg,
+                dcf_cfg={
+                    "constant_growth": bool(constant_growth),
+                    "allow_negative_fcf": bool(allow_negative_fcf),
+                    "exit_multiple_value": float(exit_multiple_value),
+                    "exit_multiple_type": exit_multiple_type,
+                    "exit_method": exit_method,
+                },
             )
 
     except Exception as e:
@@ -3140,7 +3485,7 @@ def main():
             missing = dcf.get('dcf_missing') or []
             if missing:
                 st.warning(
-                    "DCF non calculable avec les données actuelles. Champs manquants / bloquants : "
+                    "DCF non calculable avec les données actuelles. Donnée manquante : "
                     + ", ".join(missing)
                 )
             else:
@@ -3178,6 +3523,9 @@ def main():
             st.write(f"- g de long terme : **{g_terminal_input:.2f} %**")
             st.write(f"- Dette nette utilisée : **{format_large_number(net_debt)}**")
             st.write(f"- FCF de départ estimé : **{format_large_number(fcf_start)}**")
+            dcf_warnings = dcf.get("dcf_warnings") or []
+            if dcf_warnings:
+                st.warning("Avertissements DCF :\n- " + "\n- ".join(map(str, dcf_warnings)))
             # Détail WACC automatique (audit trail)
             wacc_details = dcf.get("wacc_details") if isinstance(dcf, dict) else None
             if wacc_details:
@@ -3194,6 +3542,7 @@ def main():
                     rows.append({"Champ": "Risk-free ticker", "Valeur": inputs.get("rf_ticker"), "Source": sources.get("risk_free_rate")})
                     rows.append({"Champ": "Risk-free (close, %)", "Valeur": inputs.get("rf_close_pct"), "Source": sources.get("risk_free_rate")})
                     rows.append({"Champ": "Beta", "Valeur": inputs.get("beta"), "Source": sources.get("beta")})
+                    rows.append({"Champ": "Beta blend", "Valeur": inputs.get("beta_sector_override"), "Source": sources.get("beta_blend")})
                     rows.append({"Champ": "ERP (%)", "Valeur": inputs.get("erp_pct"), "Source": sources.get("equity_risk_premium")})
                     rd_det = inputs.get("rd_details", {})
                     rows.append({"Champ": "Rd method", "Valeur": rd_det.get("source"), "Source": sources.get("cost_of_debt")})
@@ -3220,6 +3569,35 @@ def main():
                         st.warning("Avertissements :\n- " + "\n- ".join(map(str, warnings)))
                     if rd_det and rd_det.get("warnings"):
                         st.info("Rd (détails) :\n- " + "\n- ".join(map(str, rd_det.get("warnings"))))
+
+            with st.expander("Résumé DCF (audit trail)"):
+                fcf_details = dcf.get("fcf_details") or {}
+                st.write(f"- Risk-free : **{format_float((wacc_details or {}).get('inputs', {}).get('rf_close_pct'), 3)} %**")
+                st.write(f"- Beta utilisé : **{format_float((wacc_details or {}).get('inputs', {}).get('beta'), 2)}**")
+                st.write(f"- ERP : **{format_float((wacc_details or {}).get('inputs', {}).get('erp_pct'), 2)} %**")
+                st.write(f"- Coût des fonds propres (Re) : **{format_float((wacc_details or {}).get('results', {}).get('cost_of_equity_pct'), 2)} %**")
+                st.write(f"- Rd : **{format_float((wacc_details or {}).get('results', {}).get('cost_of_debt_pct'), 2)} %**")
+                st.write(f"- Tax rate : **{format_float((wacc_details or {}).get('results', {}).get('tax_rate_pct'), 2)} %**")
+                weights = (wacc_details or {}).get("results", {}).get("weights", {}) or {}
+                st.write(f"- Poids D/E : **D {format_float(weights.get('D'), 2)} / E {format_float(weights.get('E'), 2)}**")
+                st.write(f"- WACC finale : **{format_float(dcf.get('wacc_used_pct'), 2)} %** ({dcf.get('wacc_source')})")
+                st.write(f"- FCF_start : **{format_large_number(fcf_start)}** ({fcf_details.get('method')})")
+                if fcf_details:
+                    st.write(f"  - Années utilisées : {', '.join(map(str, fcf_details.get('years_used', [])))}")
+                    st.write(f"  - Valeurs brutes : {', '.join([format_large_number(v) for v in fcf_details.get('raw_values', [])])}")
+                    st.write(f"  - Valeurs après clamp : {', '.join([format_large_number(v) for v in fcf_details.get('clamped_values', [])])}")
+                proj_df_local = result.get("proj_df")
+                growth_list = []
+                if isinstance(proj_df_local, pd.DataFrame) and not proj_df_local.empty and "Croissance appliquée" in proj_df_local.columns:
+                    growth_list = proj_df_local["Croissance appliquée"].tolist()
+                st.write(f"- Croissance par année : {', '.join([f'{g*100:.2f}%' for g in growth_list])}")
+                st.write(f"- TV Gordon : **{format_large_number(dcf.get('tv_gordon'))}**")
+                st.write(f"- TV multiple : **{format_large_number(dcf.get('tv_multiple'))}**")
+                st.write(f"- Méthode TV retenue : **{dcf.get('tv_method_used') or 'N/A'}**")
+                if dcf.get("dcf_missing"):
+                    st.write("Donnée manquante : " + ", ".join(dcf.get("dcf_missing")))
+                if dcf.get("dcf_warnings"):
+                    st.write("Avertissements : " + "; ".join(dcf.get("dcf_warnings")))
 
             st.info(
                 "Ce résumé présente le scénario central (base case). "
@@ -3254,7 +3632,7 @@ def main():
             missing = dcf.get('dcf_missing') or []
             if missing:
                 st.warning(
-                    "Projections FCF indisponibles car la DCF n'a pas pu être calculée (" + ", ".join(missing) + ")."
+                    "Projections FCF indisponibles. Donnée manquante : " + ", ".join(missing) + "."
                 )
             else:
                 st.warning(
@@ -3267,10 +3645,11 @@ def main():
             proj_df["FCF actualisé"] = proj_df["FCF actualisé"].round(0)
             st.dataframe(proj_df, use_container_width=True)
 
+            growth_mode_label = "croissance constante" if dcf.get("constant_growth") else "décroissance linéaire vers g terminal"
             st.markdown(
                 "Les projections sont basées sur un FCF de départ estimé à partir du dernier "
-                "**Operating Cash Flow - Capex**, et une croissance constante de "
-                f"**{growth_fcf_input:.2f} %/an**."
+                "**Operating Cash Flow - Capex**, avec une "
+                f"{growth_mode_label} (g1 = **{growth_fcf_input:.2f} %**, g terminal = **{g_terminal_input:.2f} %**)."
             )
 
     # ----- TAB 4 : DCF & Sensibilité -----
@@ -3283,7 +3662,7 @@ def main():
             missing = dcf.get('dcf_missing') or []
             if missing:
                 st.warning(
-                    "Matrice de sensibilité indisponible car la DCF n'a pas pu être calculée (" + ", ".join(missing) + ")."
+                    "Matrice de sensibilité indisponible. Donnée manquante : " + ", ".join(missing) + "."
                 )
             else:
                 st.warning(
@@ -3308,6 +3687,16 @@ def main():
         st.write(f"- g base : **{g_terminal_input:.2f} %**")
         st.write(f"- Croissance FCF : **{growth_fcf_input:.2f} %/an**")
         st.write(f"- Horizon : **{years} ans**")
+
+        st.markdown("#### Tornado (impact sur la fair value)")
+        tornado_df = result.get("tornado_df")
+        if dcf_active and isinstance(tornado_df, pd.DataFrame) and not tornado_df.empty:
+            df_tornado = tornado_df.copy()
+            df_tornado["Fair value / action"] = df_tornado["Fair value / action"].round(2)
+            df_tornado["Impact vs base"] = df_tornado["Impact vs base"].round(2)
+            st.dataframe(df_tornado, use_container_width=True)
+        else:
+            st.warning("Tornado indisponible : pas de fair value DCF de base.")
 
         st.info(
             "Le DCF reste la méthode intrinsèque principale pour les sociétés matures "
