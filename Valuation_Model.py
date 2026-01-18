@@ -2112,29 +2112,63 @@ def compute_mad(values):
 
 def compute_fcf_cagr(fcf_values, years):
     warnings = []
+    reason = None
     if fcf_values is None or years is None:
-        return None, warnings
+        return None, warnings, "données indisponibles"
 
-    try:
-        pairs = [(float(v), int(y)) for v, y in zip(fcf_values, years) if v is not None]
-    except Exception:
-        return None, warnings
+    def year_to_int(y):
+        if y is None:
+            return None
+        if isinstance(y, (int, np.integer)):
+            return int(y)
+        if isinstance(y, (datetime, pd.Timestamp)):
+            return int(y.year)
+        if isinstance(y, str):
+            s = y.strip()
+            if len(s) >= 4 and s[:4].isdigit():
+                return int(s[:4])
+            try:
+                parsed = pd.to_datetime(s, errors="coerce")
+                if not pd.isna(parsed):
+                    return int(parsed.year)
+            except Exception:
+                return None
+        return None
 
-    pairs = [(v, y) for v, y in pairs if v > 0]
+    pairs = []
+    for v, y in zip(fcf_values, years):
+        if v is None:
+            continue
+        try:
+            v_float = float(v)
+        except Exception:
+            continue
+        if v_float <= 0:
+            continue
+        pairs.append((v_float, year_to_int(y)))
+
     if len(pairs) < 2:
-        return None, warnings
+        return None, warnings, "moins de 2 FCF positifs"
 
-    pairs = sorted(pairs, key=lambda x: x[1])
-    first_v, first_y = pairs[0]
-    last_v, last_y = pairs[-1]
-    n_years = last_y - first_y
+    has_years = all(p[1] is not None for p in pairs)
+    if has_years:
+        pairs = sorted(pairs, key=lambda x: x[1])
+        first_v, first_y = pairs[0]
+        last_v, last_y = pairs[-1]
+        n_years = last_y - first_y
+    else:
+        first_v, _ = pairs[0]
+        last_v, _ = pairs[-1]
+        n_years = len(pairs) - 1
+        reason = "years non parsable -> fallback periods"
+
     if n_years <= 0 or first_v <= 0:
-        return None, warnings
+        return None, warnings, "période insuffisante"
 
     try:
         cagr = (last_v / first_v) ** (1 / n_years) - 1
     except Exception:
-        return None, warnings
+        return None, warnings, "erreur calcul CAGR"
 
     if cagr < -0.20:
         warnings.append("CAGR FCF clampé au plancher -20%.")
@@ -2143,23 +2177,38 @@ def compute_fcf_cagr(fcf_values, years):
         warnings.append("CAGR FCF clampé au plafond +20%.")
         cagr = 0.20
 
-    return cagr, warnings
+    return cagr, warnings, reason
 
 
-def compute_g1_used(g_input: float, cagr_fcf: float | None):
+def compute_g1_used(g_input: float, cagr_fcf: float | None, prudence_hist: bool):
     warnings = []
+    rule = "input"
     if g_input is None:
-        return None, warnings
+        return None, warnings, rule
 
-    if cagr_fcf is not None:
-        g1_used = min(g_input, cagr_fcf + 0.01, 0.06)
+    if not prudence_hist:
+        if cagr_fcf is not None:
+            g1_used = min(g_input, cagr_fcf + 0.01, 0.06)
+            rule = "cagr+1% cap 6%"
+        else:
+            g1_used = min(g_input, 0.04)
+            rule = "fallback 4%"
     else:
-        g1_used = min(g_input, 0.04)
+        if cagr_fcf is not None:
+            cagr_prudent = 0.75 * cagr_fcf
+            cagr_prudent_plus = cagr_prudent + 0.005
+            g1_used = min(g_input, cagr_prudent_plus, 0.06)
+            warnings.append("Croissance contrainte par l’historique (haircut 25%).")
+            rule = "cagr_prudent +0.5% cap 6%"
+        else:
+            g1_used = min(g_input, 0.03)
+            warnings.append("CAGR historique indisponible → plafond prudence 3%.")
+            rule = "fallback 3%"
 
     if g1_used < g_input:
-        warnings.append("Croissance réduite par prudence.")
+        warnings.append("Croissance réduite vs input.")
 
-    return g1_used, warnings
+    return g1_used, warnings, rule
 
 
 def growth_path(g1_used: float, g_terminal: float, years: int, constant_growth: bool):
@@ -3236,13 +3285,17 @@ def analyze_company(
     if exit_multiple_value <= 0 and exit_method != "Gordon":
         dcf_warnings.append("Exit multiple non renseigné → Gordon utilisé par défaut.")
         exit_method = "Gordon"
-    cagr_fcf_hist, cagr_warnings = compute_fcf_cagr(
+    prudence_hist = bool((dcf_cfg or {}).get("prudence_hist", True))
+    cagr_fcf_hist, cagr_warnings, cagr_reason = compute_fcf_cagr(
         fcf_details.get("used_values", []),
         fcf_details.get("years_used", []),
     )
     dcf_warnings.extend(cagr_warnings)
-    g1_used, g1_warnings = compute_g1_used(growth_fcf, cagr_fcf_hist)
+    g1_used, g1_warnings, g1_rule = compute_g1_used(growth_fcf, cagr_fcf_hist, prudence_hist)
     dcf_warnings.extend(g1_warnings)
+    if cagr_fcf_hist is not None and prudence_hist and growth_fcf is not None and growth_fcf > 0.01:
+        if g1_used is not None and abs(g1_used - growth_fcf) < 1e-6:
+            dcf_warnings.append("Attention: g1_used == g_input malgré CAGR dispo (vérifier contrainte).")
 
     if dcf_allowed:
         (
@@ -3408,8 +3461,11 @@ def analyze_company(
         "raw_fcf": (fcf_details or {}).get("raw_values", []),
         "used_fcf": (fcf_details or {}).get("used_values", []),
         "cagr_fcf_hist": cagr_fcf_hist,
+        "cagr_reason": cagr_reason,
         "g_input": growth_fcf,
         "g1_used": g1_used,
+        "prudence_hist": prudence_hist,
+        "g1_rule": g1_rule,
         "growth_curve": (proj_df.get("Croissance appliquée").tolist() if not proj_df.empty else []),
         "wacc_used": wacc_used,
         "g_terminal_used": g_terminal_used,
@@ -3600,6 +3656,7 @@ def main():
     )
     constant_growth = st.sidebar.checkbox("Croissance constante", value=False)
     allow_negative_fcf = st.sidebar.checkbox("Autoriser DCF si FCF négatif", value=False)
+    prudence_hist = st.sidebar.checkbox("Prudence historique renforcée", value=True)
     g_terminal_input = st.sidebar.number_input(
         "Croissance long terme g (%)",
         min_value=1.0,
@@ -3681,6 +3738,7 @@ def main():
                 dcf_cfg={
                     "constant_growth": bool(constant_growth),
                     "allow_negative_fcf": bool(allow_negative_fcf),
+                    "prudence_hist": bool(prudence_hist),
                     "exit_multiple_value": float(exit_multiple_value),
                     "exit_multiple_type": exit_multiple_type,
                     "exit_method": exit_method,
@@ -3912,8 +3970,12 @@ def main():
                     st.write(f"  - Valeurs brutes : {', '.join([format_large_number(v) for v in fcf_details.get('raw_values', [])])}")
                     st.write(f"  - Valeurs utilisées : {', '.join([format_large_number(v) for v in fcf_details.get('used_values', [])])}")
                 st.write(f"- CAGR FCF hist. : **{safe_metric(audit.get('cagr_fcf_hist'), '{:.2%}')}**")
+                if audit.get("cagr_reason"):
+                    st.write(f"  - Raison : {audit.get('cagr_reason')}")
                 st.write(f"- g input : **{safe_metric(audit.get('g_input') * 100 if audit.get('g_input') is not None else None, '{:.2f}')} %**")
                 st.write(f"- g1 used : **{safe_metric(audit.get('g1_used') * 100 if audit.get('g1_used') is not None else None, '{:.2f}')} %**")
+                st.write(f"- prudence_hist : **{audit.get('prudence_hist')}**")
+                st.write(f"- règle appliquée : **{audit.get('g1_rule')}**")
                 st.write(f"- g terminal used : **{safe_metric(audit.get('g_terminal_used') * 100 if audit.get('g_terminal_used') is not None else None, '{:.2f}')} %**")
                 growth_list = audit.get("growth_curve", [])
                 st.write(f"- Croissance par année : {', '.join([f'{g*100:.2f}%' for g in growth_list])}")
